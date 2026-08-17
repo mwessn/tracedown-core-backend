@@ -1,0 +1,77 @@
+// Grafana integration CRUD lifecycle: create, get, update, regenerate token, delete.
+// Integrations are per-project (one per project), addressed by projectId.
+
+// Login
+post("$baseUrl/api/v1/auth/login", {
+  body: json({ email: "$adminEmail", password: "$adminPassword" })
+})
+.expect(status: 200)
+.store({ "$$token": this.body.token })
+
+// Create a workspace + project to host the integration
+post("$baseUrl/api/v1/workspaces", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ name: "GrafanaWs" })
+})
+.expect(status: 200)
+.store({ "$$wsId": this.body.id })
+
+post("$baseUrl/api/v1/projects", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ workspaceId: "$$wsId", name: "GrafanaProj" })
+})
+.expect(status: 200)
+.store({ "$$projId": this.body.id })
+
+// Create the project's Grafana integration
+post("$baseUrl/api/v1/projects/$$projId/integrations/grafana", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({
+    name: "Prod Metrics",
+    scope: { type: "all" },
+    enabled: true
+  })
+})
+.expect(status: 201)
+.assert({
+  expect: [
+    this.body.name eq "Prod Metrics",
+    this.body.token neq null,
+    this.body.enabled eq true
+  ]
+})
+
+// Get the project's integration (token redacted)
+get("$baseUrl/api/v1/projects/$$projId/integrations/grafana", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 200)
+.assert({
+  expect: [
+    this.body.integration.name eq "Prod Metrics",
+    this.body.integration.enabled eq true
+  ]
+})
+
+// Update the integration
+patch("$baseUrl/api/v1/projects/$$projId/integrations/grafana", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ name: "Updated Metrics" })
+})
+.expect(status: 200)
+.assert({ expect: [this.body.name eq "Updated Metrics"] })
+
+// Regenerate token
+post("$baseUrl/api/v1/projects/$$projId/integrations/grafana/regenerate-token", {
+  headers: { Authorization: "Bearer $$token", "Content-Type": "application/json" },
+  body: json({})
+})
+.expect(status: 200)
+.assert({ expect: [this.body.token neq null] })
+
+// Delete the integration
+delete("$baseUrl/api/v1/projects/$$projId/integrations/grafana", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 200)
+.assert({ expect: [this.body.ok eq true] })

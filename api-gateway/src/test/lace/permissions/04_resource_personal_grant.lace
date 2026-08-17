@@ -1,0 +1,56 @@
+// Test: member user has no org-level workspace access.
+// Admin grants read on a specific workspace via user permissions. Member can see that one but not others.
+
+// Login as admin
+post("$baseUrl/api/v1/auth/login", {
+  body: json({ email: "$adminEmail", password: "$adminPassword" })
+})
+.expect(status: 200)
+.store({ "$$adminToken": this.body.token })
+
+// Create two workspaces
+post("$baseUrl/api/v1/workspaces", {
+  headers: { Authorization: "Bearer $$adminToken" },
+  body: json({ name: "VisibleWs" })
+})
+.expect(status: 200)
+.store({ "$$visibleWsId": this.body.id })
+
+post("$baseUrl/api/v1/workspaces", {
+  headers: { Authorization: "Bearer $$adminToken" },
+  body: json({ name: "HiddenWs" })
+})
+.expect(status: 200)
+.store({ "$$hiddenWsId": this.body.id })
+
+// Grant member read on VisibleWs via PATCH user permissions
+patch("$baseUrl/api/v1/users/$memberId/permissions", {
+  headers: { Authorization: "Bearer $$adminToken" },
+  body: json({
+    resources: [
+      { resourceType: "workspace", resourceId: "$$visibleWsId", permissions: 1 }
+    ]
+  })
+})
+.expect(status: 200)
+
+// Login as member
+post("$baseUrl/api/v1/auth/login", {
+  body: json({ email: "$memberEmail", password: "$memberPassword" })
+})
+.expect(status: 200)
+.store({ "$$memberToken": this.body.token })
+
+// Member CAN access the granted workspace
+get("$baseUrl/api/v1/workspaces/$$visibleWsId", {
+  headers: { Authorization: "Bearer $$memberToken" }
+})
+.expect(status: 200)
+.assert({ expect: [this.body.name eq "VisibleWs"] })
+
+// Member CANNOT access the hidden workspace (404 — no grant = not found)
+get("$baseUrl/api/v1/workspaces/$$hiddenWsId", {
+  headers: { Authorization: "Bearer $$memberToken" }
+})
+.expect(status: 404)
+

@@ -1,0 +1,54 @@
+// Test: restricted user gets workspace access through a group's resource grant.
+
+// Login as admin
+post("$baseUrl/api/v1/auth/login", {
+  body: json({ email: "$adminEmail", password: "$adminPassword" })
+})
+.expect(status: 200)
+.store({ "$$adminToken": this.body.token })
+
+// Create a workspace
+post("$baseUrl/api/v1/workspaces", {
+  headers: { Authorization: "Bearer $$adminToken" },
+  body: json({ name: "GroupGrantWs" })
+})
+.expect(status: 200)
+.store({ "$$wsId": this.body.id })
+
+// Create a group and add restricted user
+post("$baseUrl/api/v1/groups", {
+  headers: { Authorization: "Bearer $$adminToken" },
+  body: json({ name: "WsReaders" })
+})
+.expect(status: 200)
+.store({ "$$groupId": this.body.id })
+
+post("$baseUrl/api/v1/groups/$$groupId/members", {
+  headers: { Authorization: "Bearer $$adminToken" },
+  body: json({ userId: "$restrictedId" })
+})
+.expect(status: 200)
+
+// Grant the GROUP read on the workspace via group permissions
+patch("$baseUrl/api/v1/groups/$$groupId/permissions", {
+  headers: { Authorization: "Bearer $$adminToken" },
+  body: json({
+    resources: [
+      { resourceType: "workspace", resourceId: "$$wsId", permissions: 1 }
+    ]
+  })
+})
+.expect(status: 200)
+
+// Login as restricted — should see the workspace via group grant
+post("$baseUrl/api/v1/auth/login", {
+  body: json({ email: "$restrictedEmail", password: "$restrictedPassword" })
+})
+.expect(status: 200)
+.store({ "$$restrictedToken": this.body.token })
+
+get("$baseUrl/api/v1/workspaces/$$wsId", {
+  headers: { Authorization: "Bearer $$restrictedToken" }
+})
+.expect(status: 200)
+.assert({ expect: [this.body.name eq "GroupGrantWs"] })

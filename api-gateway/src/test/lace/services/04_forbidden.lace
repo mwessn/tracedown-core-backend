@@ -1,0 +1,48 @@
+// Test: restricted user with no grants cannot access services
+
+// Login as admin — create hierarchy
+post("$baseUrl/api/v1/auth/login", {
+  body: json({ email: "$adminEmail", password: "$adminPassword" })
+})
+.expect(status: 200)
+.store({ "$$adminToken": this.body.token })
+
+post("$baseUrl/api/v1/workspaces", {
+  headers: { Authorization: "Bearer $$adminToken" },
+  body: json({ name: "ForbiddenWs" })
+})
+.expect(status: 200)
+.store({ "$$wsId": this.body.id })
+
+post("$baseUrl/api/v1/projects", {
+  headers: { Authorization: "Bearer $$adminToken" },
+  body: json({ workspaceId: "$$wsId", name: "ForbiddenProj" })
+})
+.expect(status: 200)
+.store({ "$$projId": this.body.id })
+
+post("$baseUrl/api/v1/services", {
+  headers: { Authorization: "Bearer $$adminToken" },
+  body: json({ projectId: "$$projId", name: "ForbiddenSvc" })
+})
+.expect(status: 200)
+.store({ "$$svcId": this.body.id })
+
+// Login as restricted (no permissions)
+post("$baseUrl/api/v1/auth/login", {
+  body: json({ email: "$restrictedEmail", password: "$restrictedPassword" })
+})
+.expect(status: 200)
+.store({ "$$restrictedToken": this.body.token })
+
+// Cannot list services
+get("$baseUrl/api/v1/services?projectId=$$projId", {
+  headers: { Authorization: "Bearer $$restrictedToken" }
+})
+.expect(status: 404)
+
+// Cannot get service
+get("$baseUrl/api/v1/services/$$svcId", {
+  headers: { Authorization: "Bearer $$restrictedToken" }
+})
+.expect(status: 404)

@@ -1,0 +1,93 @@
+// Notification silence CRUD lifecycle
+
+// Login
+post("$baseUrl/api/v1/auth/login", {
+  body: json({ email: "$adminEmail", password: "$adminPassword" })
+})
+.expect(status: 200)
+.store({ "$$token": this.body.token })
+
+// Create workspace for scoped silence
+post("$baseUrl/api/v1/workspaces", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ name: "SilenceWs" })
+})
+.expect(status: 200)
+.store({ "$$wsId": this.body.id })
+
+// Create org-wide silence (no resource scope)
+post("$baseUrl/api/v1/silences", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ channel: "all" })
+})
+.expect(status: 200)
+.assert({
+  expect: [
+    this.body.channel eq "all",
+    this.body.workspaceId eq null,
+    this.body.projectId eq null,
+    this.body.serviceId eq null,
+    this.body.quietHours eq null
+  ]
+})
+.store({ "$$silenceId": this.body.id })
+
+// Create workspace-scoped silence with quiet hours
+post("$baseUrl/api/v1/silences", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ channel: "email", workspaceId: "$$wsId", quietHours: "FREQ=DAILY;BYHOUR=22;BYMINUTE=0/540" })
+})
+.expect(status: 200)
+.assert({
+  expect: [
+    this.body.channel eq "email",
+    this.body.workspaceId eq "$$wsId"
+  ]
+})
+.store({ "$$silenceId2": this.body.id })
+
+// List silences — PFS response
+get("$baseUrl/api/v1/silences", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 200)
+.assert({
+  expect: [
+    this.body.total eq 2,
+    this.body.page eq 1
+  ]
+})
+
+// Get single silence
+get("$baseUrl/api/v1/silences/$$silenceId", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 200)
+.assert({ expect: [this.body.channel eq "all"] })
+
+// Update silence channel
+patch("$baseUrl/api/v1/silences/$$silenceId", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ channel: "webhook" })
+})
+.expect(status: 200)
+.assert({ expect: [this.body.channel eq "webhook"] })
+
+// Delete silence
+delete("$baseUrl/api/v1/silences/$$silenceId2", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 200)
+
+// Verify deleted
+get("$baseUrl/api/v1/silences/$$silenceId2", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 404)
+
+// Verify list count decreased
+get("$baseUrl/api/v1/silences", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 200)
+.assert({ expect: [this.body.total eq 1] })

@@ -1,0 +1,322 @@
+# Backend development stack.
+#
+# Usage:
+#   docker compose up --build
+#
+# Nginx exposes ${NGINX_PORT} (default 20714, the t7n branded port) - the
+# single entry point for the frontend.
+
+name: tracedown
+
+x-db-env: &db-env
+  DATABASE_URL: jdbc:postgresql://tracedown-postgres:5432/${DB_NAME}
+  DATABASE_USER: ${DB_USER}
+  DATABASE_PASSWORD: ${DB_PASSWORD}
+
+x-redis-env: &redis-env
+  REDIS_A_URL: ${REDIS_A_URL}
+  REDIS_B_URL: ${REDIS_B_URL}
+  REDIS_C_URL: ${REDIS_C_URL}
+
+networks:
+  tracedown-net:
+
+services:
+  # ── Infrastructure ──
+
+  tracedown-postgres:
+    image: timescale/timescaledb:latest-pg16
+    container_name: tracedown-postgres
+    networks: [tracedown-net]
+    environment:
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: ${DB_NAME}
+      # timescaledb-tune runs at initdb and derives max_connections from
+      # available memory — on small hosts it lands below what the service
+      # connection pools need (8 JVM services x 10) and the stack can't boot.
+      TS_TUNE_MAX_CONNS: "100"
+    volumes:
+      - tracedown-pgdata:/var/lib/postgresql/data
+    ports:
+      - "5555:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER}"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  # By default, a single Redis instance handles all three roles by default
+  # (operational queue + cache + sessions). REDIS_{A,B,C}_URL in .env all
+  # point here. For most deployments, it would be enough.
+  # For larger environments, the architecture supports splitting them out - see the commented blocks below.
+  tracedown-redis-a:
+    image: redis:7-alpine
+    container_name: tracedown-redis-a
+    networks: [tracedown-net]
+    command: redis-server --appendonly yes
+    volumes:
+      - tracedown-redis-a-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 5
+
+  # Optional split-out Redis instances. Uncomment the blocks below (and
+  # repoint REDIS_B_URL / REDIS_C_URL in .env at the new hosts) once your
+  # deployment hits roughly:
+  #   • > ~1k probe results / minute sustained, or
+  #   • you need failure isolation (cache eviction shouldn't risk
+  #     dropping queued results / outbox events), or
+  #   • you want to tune persistence (AOF) and eviction (allkeys-lru)
+  #     independently.
+  # Until then a single Redis is fine - the role separation lives at the
+  # URL layer, not the data layer.
+
+#  tracedown-redis-b:
+#    image: redis:7-alpine
+#    container_name: tracedown-redis-b
+#    networks: [tracedown-net]
+#    command: redis-server --save "" --maxmemory 64mb --maxmemory-policy allkeys-lru
+#    healthcheck:
+#      test: ["CMD", "redis-cli", "ping"]
+#      interval: 3s
+#      timeout: 3s
+#      retries: 5
+#
+#  tracedown-redis-c:
+#    image: redis:7-alpine
+#    container_name: tracedown-redis-c
+#    networks: [tracedown-net]
+#    command: redis-server --save "" --maxmemory 128mb --maxmemory-policy allkeys-lru
+#    healthcheck:
+#      test: ["CMD", "redis-cli", "ping"]
+#      interval: 3s
+#      timeout: 3s
+#      retries: 5
+
+  # ── Schema migration (runs once, then exits) ──
+
+  tracedown-migrator:
+    build:
+      context: ../../..
+      dockerfile: core/tracedown-core-backend/docker/Dockerfile
+      target: migrator
+    container_name: tracedown-migrator
+    networks: [tracedown-net]
+    environment:
+      <<: *db-env
+    depends_on:
+      tracedown-postgres:
+        condition: service_healthy
+
+  # ── CA bootstrap (seeds the CA root key so the scheduler can start) ──
+
+  tracedown-ca-init:
+    build:
+      context: ../../..
+      dockerfile: core/tracedown-core-backend/docker/Dockerfile
+      target: gateway
+    container_name: tracedown-ca-init
+    networks: [tracedown-net]
+    command: ["./bin/api-gateway", "--agent-bootstrap", "dev-agent"]
+    environment:
+      <<: *db-env
+      PLATFORM_AES_KEY: ${PLATFORM_AES_KEY}
+    depends_on:
+      tracedown-migrator:
+        condition: service_completed_successfully
+
+  # ── Application services ──
+
+  tracedown-gateway:
+    build:
+      context: ../../..
+      dockerfile: core/tracedown-core-backend/docker/Dockerfile
+      target: gateway
+    container_name: tracedown-gateway
+    networks: [tracedown-net]
+    volumes:
+      - tracedown-bodies:/data/bodies
+    environment:
+      <<: [*db-env, *redis-env]
+      PLATFORM_AES_KEY: ${PLATFORM_AES_KEY}
+      JWT_SECRET: ${JWT_SECRET}
+      SINGLE_ORG_MODE: "true"
+      DEMO_USER_EMAIL: admin@tracedown.dev
+      DEMO_USER_PASSWORD: "Down2trace!"
+      EMAIL_PROVIDER: console
+      PORT: 20714
+    depends_on:
+      tracedown-ca-init:
+        condition: service_completed_successfully
+      tracedown-redis-a:
+        condition: service_healthy
+#      tracedown-redis-b:
+#        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://localhost:20714/ping || exit 1"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  tracedown-scheduler:
+    build:
+      context: ../../..
+      dockerfile: core/tracedown-core-backend/docker/Dockerfile
+      target: scheduler
+    container_name: tracedown-scheduler
+    networks: [tracedown-net]
+    environment:
+      <<: *db-env
+      REDIS_A_URL: ${REDIS_A_URL}
+      PLATFORM_AES_KEY: ${PLATFORM_AES_KEY}
+      GATEWAY_URL: http://tracedown-gateway:20714
+      SCHEDULER_SWEEP_INTERVAL: "10"
+      SCHEDULER_THREAD_POOL_SIZE: "4"
+      PORT: 20810
+    depends_on:
+      tracedown-gateway:
+        condition: service_healthy
+
+  tracedown-ingestor:
+    build:
+      context: ../../..
+      dockerfile: core/tracedown-core-backend/docker/Dockerfile
+      target: ingestor
+    container_name: tracedown-ingestor
+    networks: [tracedown-net]
+    volumes:
+      # Same bodies volume the gateway and agent mount — the ingestor
+      # relocates agent-written bodies under this root as results land.
+      - tracedown-bodies:/data/bodies
+    environment:
+      <<: *db-env
+      REDIS_A_URL: ${REDIS_A_URL}
+      PORT: 20820
+    depends_on:
+      tracedown-migrator:
+        condition: service_completed_successfully
+      tracedown-redis-a:
+        condition: service_healthy
+
+  tracedown-dispatcher:
+    build:
+      context: ../../..
+      dockerfile: core/tracedown-core-backend/docker/Dockerfile
+      target: dispatcher
+    container_name: tracedown-dispatcher
+    networks: [tracedown-net]
+    environment:
+      <<: [*db-env, *redis-env]
+      # Decrypts org variables referenced from webhook URLs ($o.key) — must
+      # match the gateway's key that encrypted them.
+      PLATFORM_AES_KEY: ${PLATFORM_AES_KEY}
+      PORT: 20830
+    depends_on:
+      tracedown-migrator:
+        condition: service_completed_successfully
+      tracedown-redis-a:
+        condition: service_healthy
+#      tracedown-redis-b:
+#        condition: service_healthy
+
+  tracedown-email:
+    build:
+      context: ../../..
+      dockerfile: core/tracedown-core-backend/docker/Dockerfile
+      target: email
+    container_name: tracedown-email
+    networks: [tracedown-net]
+    environment:
+      <<: *redis-env
+      EMAIL_PROVIDER: console
+      # The console transport writes attachments here; the bind mount below puts
+      # them on the host so they can actually be opened.
+      EMAIL_CONSOLE_ATTACHMENT_DIR: /data/email-attachments
+      PORT: 20840
+    volumes:
+      - ./email-attachments:/data/email-attachments
+    depends_on:
+      tracedown-redis-a:
+        condition: service_healthy
+
+  tracedown-metrics:
+    build:
+      context: ../../..
+      dockerfile: core/tracedown-core-backend/docker/Dockerfile
+      target: metrics
+    container_name: tracedown-metrics
+    networks: [tracedown-net]
+    environment:
+      <<: [*db-env, *redis-env]
+      PORT: 20850
+    depends_on:
+      tracedown-migrator:
+        condition: service_completed_successfully
+      tracedown-redis-a:
+        condition: service_healthy
+#      tracedown-redis-b:
+#        condition: service_healthy
+
+  tracedown-worker:
+    build:
+      context: ../../..
+      dockerfile: core/tracedown-core-backend/docker/Dockerfile
+      target: worker
+    container_name: tracedown-worker
+    networks: [tracedown-net]
+    environment:
+      <<: [*db-env, *redis-env]
+      RESULT_RETENTION_DAYS: "90"
+      WORKER_INTERVAL_HOURLY_AGGREGATION: "300"
+      WORKER_INTERVAL_DAILY_AGGREGATION: "600"
+      WORKER_INTERVAL_RETENTION: "3600"
+      WORKER_INTERVAL_PURGE: "3600"
+      WORKER_INTERVAL_SESSION_CLEANUP: "600"
+      PORT: 20860
+    depends_on:
+      tracedown-migrator:
+        condition: service_completed_successfully
+      tracedown-redis-a:
+        condition: service_healthy
+#      tracedown-redis-b:
+#        condition: service_healthy
+
+  tracedown-realtime:
+    build:
+      context: ../../..
+      dockerfile: core/tracedown-core-backend/docker/Dockerfile
+      target: realtime
+    container_name: tracedown-realtime
+    networks: [tracedown-net]
+    environment:
+      <<: *db-env
+      REDIS_A_URL: ${REDIS_A_URL}
+      PORT: 20870
+    depends_on:
+      tracedown-migrator:
+        condition: service_completed_successfully
+      tracedown-redis-a:
+        condition: service_healthy
+
+  # ── Nginx reverse proxy ──
+
+  tracedown-nginx:
+    image: nginx:alpine
+    container_name: tracedown-nginx
+    networks: [tracedown-net]
+    ports:
+      - "${NGINX_PORT}:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      tracedown-gateway:
+        condition: service_healthy
+
+volumes:
+  tracedown-pgdata:
+  tracedown-redis-a-data:
+  tracedown-bodies:

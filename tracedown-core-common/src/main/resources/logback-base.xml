@@ -1,0 +1,116 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Shared logging configuration for every Tracedown service. A service's own
+  logback.xml sets the SERVICE_NAME property and includes this file:
+
+      <configuration>
+          <property name="SERVICE_NAME" value="api-gateway"/>
+          <include resource="logback-base.xml"/>
+      </configuration>
+
+  Behaviour is environment-driven (all optional):
+
+      LOG_FORMAT          STDOUT (default) | JSON     which console appender the root uses
+      LOG_LEVEL           INFO (default)              root log level
+      LOG_TO_FILE         false (default) | true      also write rolling files under LOG_DIR
+      LOG_DIR             logs (default)              file destination
+      LOG_RETENTION_DAYS  30 (default)                daily rolled files kept per sink (auto-cleanup)
+      LOG_MAX_SIZE_MB     512 (default)               total on-disk cap per sink (auto-cleanup)
+
+  Org scoping: dev.tracedown.common.logging.LogContext populates the `org` MDC
+  key (plus user/ws/proj/svc). Every line carries [org=...]; the JSON encoder
+  emits them as fields; and when LOG_TO_FILE=true a SiftingAppender writes a
+  per-tenant file at ${LOG_DIR}/org/<orgId>.log. Lines without an org land in
+  the "system" bucket.
+-->
+<included>
+    <property name="SERVICE_NAME" value="${SERVICE_NAME:-tracedown}"/>
+    <property name="LOG_DIR" value="${LOG_DIR:-logs}"/>
+    <property name="LOG_RETENTION_DAYS" value="${LOG_RETENTION_DAYS:-30}"/>
+    <property name="LOG_MAX_SIZE_MB" value="${LOG_MAX_SIZE_MB:-512}"/>
+
+    <!-- Docker-compose-style console line: "<service> | <ts> <level> [org=..] logger - msg" -->
+    <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder class="ch.qos.logback.classic.encoder.PatternLayoutEncoder">
+            <pattern>%-24(${SERVICE_NAME}) | %d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [org=%X{org:-system}] %logger{28} - %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <!-- Structured console line; the MDC ids ride along as first-class fields. -->
+    <appender name="JSON" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+            <customFields>{"service":"${SERVICE_NAME}"}</customFields>
+            <includeMdcKeyName>org</includeMdcKeyName>
+            <includeMdcKeyName>user</includeMdcKeyName>
+            <includeMdcKeyName>ws</includeMdcKeyName>
+            <includeMdcKeyName>proj</includeMdcKeyName>
+            <includeMdcKeyName>svc</includeMdcKeyName>
+        </encoder>
+    </appender>
+
+    <!--
+      File sinks are opt-in (LOG_TO_FILE=true). The default deploy is stdout-only
+      so Docker/Railway capture logs and the container stays stateless.
+      Retention/auto-cleanup: maxHistory prunes by age, totalSizeCap by size, and
+      cleanHistoryOnStart sweeps orphans left by a crash on the next boot.
+    -->
+    <if condition='property("LOG_TO_FILE").equalsIgnoreCase("true")'>
+        <then>
+            <!-- Combined per-service rolling file. -->
+            <appender name="FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+                <file>${LOG_DIR}/${SERVICE_NAME}.log</file>
+                <rollingPolicy class="ch.qos.logback.core.rolling.TimeBasedRollingPolicy">
+                    <fileNamePattern>${LOG_DIR}/${SERVICE_NAME}.%d{yyyy-MM-dd}.log.gz</fileNamePattern>
+                    <maxHistory>${LOG_RETENTION_DAYS}</maxHistory>
+                    <totalSizeCap>${LOG_MAX_SIZE_MB}MB</totalSizeCap>
+                    <cleanHistoryOnStart>true</cleanHistoryOnStart>
+                </rollingPolicy>
+                <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+                    <customFields>{"service":"${SERVICE_NAME}"}</customFields>
+                    <includeMdcKeyName>org</includeMdcKeyName>
+                    <includeMdcKeyName>user</includeMdcKeyName>
+                    <includeMdcKeyName>ws</includeMdcKeyName>
+                    <includeMdcKeyName>proj</includeMdcKeyName>
+                    <includeMdcKeyName>svc</includeMdcKeyName>
+                </encoder>
+            </appender>
+
+            <!-- Per-org rolling files, keyed on the `org` MDC value. -->
+            <appender name="ORG_SIFT" class="ch.qos.logback.classic.sift.SiftingAppender">
+                <discriminator>
+                    <key>org</key>
+                    <defaultValue>system</defaultValue>
+                </discriminator>
+                <sift>
+                    <appender name="ORG-${org}" class="ch.qos.logback.core.rolling.RollingFileAppender">
+                        <file>${LOG_DIR}/org/${org}.log</file>
+                        <rollingPolicy class="ch.qos.logback.core.rolling.TimeBasedRollingPolicy">
+                            <fileNamePattern>${LOG_DIR}/org/${org}.%d{yyyy-MM-dd}.log.gz</fileNamePattern>
+                            <maxHistory>${LOG_RETENTION_DAYS}</maxHistory>
+                            <totalSizeCap>${LOG_MAX_SIZE_MB}MB</totalSizeCap>
+                            <cleanHistoryOnStart>true</cleanHistoryOnStart>
+                        </rollingPolicy>
+                        <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+                            <customFields>{"service":"${SERVICE_NAME}"}</customFields>
+                            <includeMdcKeyName>user</includeMdcKeyName>
+                            <includeMdcKeyName>ws</includeMdcKeyName>
+                            <includeMdcKeyName>proj</includeMdcKeyName>
+                            <includeMdcKeyName>svc</includeMdcKeyName>
+                        </encoder>
+                    </appender>
+                </sift>
+            </appender>
+
+            <root level="${LOG_LEVEL:-INFO}">
+                <appender-ref ref="${LOG_FORMAT:-STDOUT}"/>
+                <appender-ref ref="FILE"/>
+                <appender-ref ref="ORG_SIFT"/>
+            </root>
+        </then>
+        <else>
+            <root level="${LOG_LEVEL:-INFO}">
+                <appender-ref ref="${LOG_FORMAT:-STDOUT}"/>
+            </root>
+        </else>
+    </if>
+</included>

@@ -1,0 +1,15 @@
+// Agent health endpoint: verify authenticated access returns statuses array
+
+// Login
+post("$baseUrl/api/v1/auth/login", {
+  body: json({ email: "$adminEmail", password: "$adminPassword" })
+})
+.expect(status: 200)
+.store({ "$$token": this.body.token })
+
+// Get agent health statuses
+get("$baseUrl/api/v1/agents/health", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 200)
+.assert({ expect: [this.body.statuses neq null] })

@@ -1,0 +1,50 @@
+// Full workspace CRUD lifecycle
+
+// Login
+post("$baseUrl/api/v1/auth/login", {
+  body: json({ email: "$adminEmail", password: "$adminPassword" })
+})
+.expect(status: 200)
+.store({ "$$token": this.body.token })
+
+// List — should have the bootstrap "Default" workspace
+get("$baseUrl/api/v1/workspaces", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 200)
+
+// Create — validate the full response shape against the workspace schema.
+post("$baseUrl/api/v1/workspaces", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ name: "Staging" })
+})
+.expect(status: 200, body: schema($workspaceSchema))
+.assert({ expect: [this.body.name eq "Staging"] })
+.store({ "$$wsId": this.body.id })
+
+// Get
+get("$baseUrl/api/v1/workspaces/$$wsId", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 200)
+.assert({ expect: [this.body.name eq "Staging"] })
+
+// Update
+patch("$baseUrl/api/v1/workspaces/$$wsId", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ name: "Staging v2" })
+})
+.expect(status: 200)
+.assert({ expect: [this.body.name eq "Staging v2"] })
+
+// Delete
+delete("$baseUrl/api/v1/workspaces/$$wsId", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 200)
+
+// Verify deleted
+get("$baseUrl/api/v1/workspaces/$$wsId", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 404)

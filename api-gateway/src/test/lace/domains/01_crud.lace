@@ -1,0 +1,84 @@
+// Domain CRUD lifecycle with wildcard and exceptions
+
+// Login
+post("$baseUrl/api/v1/auth/login", {
+  body: json({ email: "$adminEmail", password: "$adminPassword" })
+})
+.expect(status: 200)
+.store({ "$$token": this.body.token })
+
+// Add a domain with wildcard and exceptions
+post("$baseUrl/api/v1/domains", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({
+    domain: "example.com",
+    verificationType: "http-01",
+    wildcardEnabled: true,
+    exceptions: ["internal.example.com", "staging.example.com"]
+  })
+})
+.expect(status: 200)
+.assert({
+  expect: [
+    this.body.domain eq "example.com",
+    this.body.verificationType eq "http-01",
+    this.body.status eq "pending",
+    this.body.wildcardEnabled eq true,
+    this.body.lapsed eq false
+  ]
+})
+.store({ "$$domainId": this.body.id, "$$challenge": this.body.challenge })
+
+// Add second domain with DNS verification, no wildcard
+post("$baseUrl/api/v1/domains", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ domain: "other.com", verificationType: "dns-01", wildcardEnabled: false })
+})
+.expect(status: 200)
+.assert({
+  expect: [
+    this.body.verificationType eq "dns-01",
+    this.body.wildcardEnabled eq false
+  ]
+})
+.store({ "$$domainId2": this.body.id })
+
+// List domains
+get("$baseUrl/api/v1/domains", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 200)
+
+// Get single domain — verify exceptions are returned
+get("$baseUrl/api/v1/domains/$$domainId", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 200)
+.assert({ expect: [this.body.domain eq "example.com"] })
+
+// Update wildcard setting and exceptions
+patch("$baseUrl/api/v1/domains/$$domainId", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ wildcardEnabled: false, exceptions: ["admin.example.com"] })
+})
+.expect(status: 200)
+.assert({ expect: [this.body.wildcardEnabled eq false] })
+
+// Duplicate domain
+post("$baseUrl/api/v1/domains", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ domain: "example.com", verificationType: "http-01" })
+})
+.expect(status: 409)
+
+// Delete domain
+delete("$baseUrl/api/v1/domains/$$domainId2", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 200)
+
+// Verify deleted
+get("$baseUrl/api/v1/domains/$$domainId2", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 404)

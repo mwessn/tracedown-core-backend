@@ -1,0 +1,152 @@
+package dev.tracedown.scheduler
+
+import dev.tracedown.common.config.DatabaseFactory
+import dev.tracedown.common.redis.RedisFactory
+import dev.tracedown.common.util.VariableCrypto
+import dev.tracedown.scheduler.config.SchedulerConfig
+import dev.tracedown.scheduler.crypto.AgentMtlsClientFactory
+import dev.tracedown.scheduler.crypto.RevocationChecker
+import dev.tracedown.scheduler.crypto.SchedulerCertService
+import dev.tracedown.scheduler.dispatch.AgentDispatchService
+import dev.tracedown.scheduler.dispatch.AgentSelector
+import dev.tracedown.scheduler.dispatch.DispatchQueue
+import dev.tracedown.scheduler.dispatch.QueuePolicyManager
+import dev.tracedown.scheduler.results.ResultPublisher
+import dev.tracedown.scheduler.scheduling.HealthChallengeContext
+import dev.tracedown.scheduler.scheduling.HealthChallengeJob
+import dev.tracedown.scheduler.scheduling.ProbeJobContext
+import dev.tracedown.scheduler.scheduling.QuartzManager
+import dev.tracedown.scheduler.scheduling.ScheduleSyncService
+import io.ktor.server.application.Application
+import io.ktor.server.netty.EngineMain
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import org.slf4j.LoggerFactory
+
+private val log = LoggerFactory.getLogger("dev.tracedown.scheduler.Application")
+
+fun main(args: Array<String>) = EngineMain.main(args)
+
+/** Ktor module — wires all scheduler components and starts the probe loop. */
+fun Application.module() {
+    val config = SchedulerConfig.load(environment)
+
+    // Fail fast in production if the insecure all-zero platform key is still set.
+    // No-op in dev (see SecretGuard).
+    dev.tracedown.common.config.SecretGuard.requireSecure(
+        environment.config.propertyOrNull("deployment.environment")?.getString(),
+        "probe-scheduler",
+        mapOf("PLATFORM_AES_KEY (all-zero dev default)" to (config.aesKey == "0".repeat(64))),
+    )
+
+    // Database
+    val dataSource = DatabaseFactory.init(
+        jdbcUrl = config.database.url,
+        username = config.database.user,
+        password = config.database.password,
+    )
+
+    // Redis A
+    val redisConn = RedisFactory.createConnection(config.redisAUrl)
+    val redis = redisConn.sync()
+
+    // Variable decryption
+    VariableCrypto.init(config.aesKey)
+    dev.tracedown.common.realtime.RealtimePublisher.init { redis }
+
+    // mTLS client certificate
+    val certService = SchedulerCertService(config.aesKey)
+    certService.init()
+
+    // Enforce revoked agent certificates at the TLS trust decision.
+    val revocationChecker = RevocationChecker.fromDatabase()
+
+    // One factory of per-agent, slug-pinned mTLS clients, shared by dispatch and
+    // health challenges — every outbound call pins the peer to the intended agent.
+    val agentClientFactory = AgentMtlsClientFactory(
+        schedulerCert = certService.certificate,
+        schedulerKey = certService.privateKey,
+        caCert = certService.caCertificate,
+        trustedCas = certService.trustedCaCertificates,
+        revocationChecker = revocationChecker,
+    )
+
+    // Agent dispatch (mTLS)
+    val agentDispatch = AgentDispatchService(agentClientFactory)
+
+    // Agent selection
+    val agentSelector = AgentSelector(redis)
+
+    // Queue policy
+    val queuePolicy = QueuePolicyManager(redis)
+
+    // Result publishing
+    val resultPublisher = ResultPublisher(redis)
+
+    // Coroutine scope for async work
+    val schedulerScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+    // Quartz scheduler
+    val quartzManager = QuartzManager(config.threadPoolSize)
+    quartzManager.start()
+
+    // Dispatch queue — decouples Quartz triggers from agent HTTP dispatch
+    val dispatchQueue = DispatchQueue(
+        capacity = config.dispatchQueueSize,
+        workers = config.dispatchWorkers,
+        quartzManager = quartzManager,
+        agentSelector = agentSelector,
+        agentDispatch = agentDispatch,
+        queuePolicy = queuePolicy,
+        resultPublisher = resultPublisher,
+        probeConfig = config.probe,
+        trustedDomainMode = config.trustedDomainMode,
+    )
+    dispatchQueue.start(schedulerScope)
+
+    // ProbeJob dependencies
+    ProbeJobContext.init(dispatchQueue = dispatchQueue)
+
+    // HealthChallengeJob dependencies
+    HealthChallengeContext.init(
+        redis = redis,
+        gatewayUrl = config.gatewayUrl,
+        clientFactory = agentClientFactory,
+    )
+
+    // Schedule health challenges: every 1 minute, offset to :30 so the
+    // measurement never races the :00 probe burst (cron schedules all fire
+    // at second 0 — a challenge at the same instant reads as degraded under
+    // fleet-wide load even when the agent clears its burst fine).
+    quartzManager.scheduleSystemJob(
+        HealthChallengeJob::class.java,
+        "health-challenge",
+        "30 * * * * ?",
+    )
+
+    // Redis pub/sub for schedule nudge
+    val pubSubConn = RedisFactory.createPubSubConnection(config.redisAUrl)
+
+    // Schedule sync — bootstrap from DB, subscribe to nudge, then sweep periodically
+    val syncService = ScheduleSyncService(quartzManager, config.consistencySweepIntervalSeconds, pubSubConn)
+    syncService.bootstrap()
+    syncService.startPubSub()
+
+    syncService.startSweep(schedulerScope)
+
+    log.info("probe-scheduler started")
+
+    // Shutdown hooks
+    monitor.subscribe(io.ktor.server.application.ApplicationStopped) {
+        dispatchQueue.close()
+        syncService.stop()
+        quartzManager.shutdown()
+        // Closes every per-agent client the factory built (shared by dispatch
+        // and health challenges).
+        agentClientFactory.close()
+        redisConn.close()
+        dataSource.close()
+        log.info("probe-scheduler shut down")
+    }
+}

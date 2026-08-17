@@ -1,0 +1,38 @@
+// Probe results query: create service hierarchy, query results endpoint
+
+// Login
+post("$baseUrl/api/v1/auth/login", {
+  body: json({ email: "$adminEmail", password: "$adminPassword" })
+})
+.expect(status: 200)
+.store({ "$$token": this.body.token })
+
+// Create workspace
+post("$baseUrl/api/v1/workspaces", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ name: "ResultTestWs" })
+})
+.expect(status: 200)
+.store({ "$$wsId": this.body.id })
+
+// Create project
+post("$baseUrl/api/v1/projects", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ workspaceId: "$$wsId", name: "ResultTestProj" })
+})
+.expect(status: 200)
+.store({ "$$projId": this.body.id })
+
+// Create service
+post("$baseUrl/api/v1/services", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ projectId: "$$projId", name: "Result Test Svc" })
+})
+.expect(status: 200)
+.store({ "$$svcId": this.body.id })
+
+// Query results — empty list is fine, just verify endpoint works
+get("$baseUrl/api/v1/services/$$svcId/results", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 200)

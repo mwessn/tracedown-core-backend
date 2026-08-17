@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+    <property name="SERVICE_NAME" value="realtime-service"/>
+    <include resource="logback-base.xml"/>
+
+    <!-- Silence noisy libraries -->
+    <logger name="org.jetbrains.exposed" level="WARN" />
+    <logger name="com.zaxxer.hikari" level="WARN" />
+    <logger name="io.lettuce" level="WARN" />
+    <logger name="io.ktor" level="INFO" />
+    <logger name="io.netty" level="WARN" />
+</configuration>

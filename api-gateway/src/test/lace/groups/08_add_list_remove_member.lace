@@ -1,0 +1,40 @@
+// Login as admin
+post("$baseUrl/api/v1/auth/login", {
+  body: json({ email: "$adminEmail", password: "$adminPassword" })
+})
+.expect(status: 200)
+.store({ "$$token": this.body.token })
+
+// Create a group for member management
+post("$baseUrl/api/v1/groups", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ name: "MemberTestGroup" })
+})
+.expect(status: 200)
+.store({ "$$groupId": this.body.id })
+
+// Add member (pre-created in test setup)
+post("$baseUrl/api/v1/groups/$$groupId/members", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ userId: "$memberId" })
+})
+.expect(status: 200)
+
+// List members — should contain the member
+get("$baseUrl/api/v1/groups/$$groupId/members", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 200)
+
+// Add same member again — should conflict
+post("$baseUrl/api/v1/groups/$$groupId/members", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ userId: "$memberId" })
+})
+.expect(status: 409)
+
+// Remove member
+delete("$baseUrl/api/v1/groups/$$groupId/members/$memberId", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 200)

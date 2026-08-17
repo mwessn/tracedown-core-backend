@@ -1,0 +1,92 @@
+// Service variable CRUD with all three types + reveal
+
+// Login
+post("$baseUrl/api/v1/auth/login", {
+  body: json({ email: "$adminEmail", password: "$adminPassword" })
+})
+.expect(status: 200)
+.store({ "$$token": this.body.token })
+
+// Create workspace, project, service
+post("$baseUrl/api/v1/workspaces", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ name: "SvcVarWs" })
+})
+.expect(status: 200)
+.store({ "$$wsId": this.body.id })
+
+post("$baseUrl/api/v1/projects", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ workspaceId: "$$wsId", name: "SvcVarProj" })
+})
+.expect(status: 200)
+.store({ "$$projId": this.body.id })
+
+post("$baseUrl/api/v1/services", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ projectId: "$$projId", name: "VarService" })
+})
+.expect(status: 200)
+.store({ "$$svcId": this.body.id })
+
+// Create variable type
+post("$baseUrl/api/v1/services/$$svcId/variables", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ key: "API_URL", value: "https://api.example.com", type: "variable" })
+})
+.expect(status: 200)
+.assert({
+  expect: [
+    this.body.type eq "variable",
+    this.body.value eq "••••••"
+  ]
+})
+.store({ "$$varId": this.body.id })
+
+// Create secret
+post("$baseUrl/api/v1/services/$$svcId/variables", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ key: "API_KEY", value: "sk-123", type: "secret" })
+})
+.expect(status: 200)
+.assert({ expect: [this.body.type eq "secret"] })
+.store({ "$$secretId": this.body.id })
+
+// Create metric
+post("$baseUrl/api/v1/services/$$svcId/variables", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ key: "LATENCY_P99", value: "42", type: "metric" })
+})
+.expect(status: 200)
+.assert({
+  expect: [
+    this.body.type eq "metric",
+    this.body.value eq "42"
+  ]
+})
+
+// Reveal variable — decrypted
+get("$baseUrl/api/v1/services/$$svcId/variables/$$varId/reveal", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 200)
+.assert({ expect: [this.body.value eq "https://api.example.com"] })
+
+// Reveal secret — rejected
+get("$baseUrl/api/v1/services/$$svcId/variables/$$secretId/reveal", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 400)
+
+// Update variable
+patch("$baseUrl/api/v1/services/$$svcId/variables/$$varId", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ value: "https://api-v2.example.com" })
+})
+.expect(status: 200)
+
+// Delete variable
+delete("$baseUrl/api/v1/services/$$svcId/variables/$$varId", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 200)

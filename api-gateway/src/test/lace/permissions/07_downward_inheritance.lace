@@ -1,0 +1,48 @@
+// Test: granting read on a workspace gives access to projects within it.
+
+// Login as admin
+post("$baseUrl/api/v1/auth/login", {
+  body: json({ email: "$adminEmail", password: "$adminPassword" })
+})
+.expect(status: 200)
+.store({ "$$adminToken": this.body.token })
+
+// Create workspace and project inside it
+post("$baseUrl/api/v1/workspaces", {
+  headers: { Authorization: "Bearer $$adminToken" },
+  body: json({ name: "InheritanceWs" })
+})
+.expect(status: 200)
+.store({ "$$wsId": this.body.id })
+
+post("$baseUrl/api/v1/projects", {
+  headers: { Authorization: "Bearer $$adminToken" },
+  body: json({ workspaceId: "$$wsId", name: "ChildProject" })
+})
+.expect(status: 200)
+.store({ "$$projId": this.body.id })
+
+// Grant member read on the WORKSPACE only (no explicit project grant)
+patch("$baseUrl/api/v1/users/$memberId/permissions", {
+  headers: { Authorization: "Bearer $$adminToken" },
+  body: json({
+    resources: [
+      { resourceType: "workspace", resourceId: "$$wsId", permissions: 1 }
+    ]
+  })
+})
+.expect(status: 200)
+
+// Login as member
+post("$baseUrl/api/v1/auth/login", {
+  body: json({ email: "$memberEmail", password: "$memberPassword" })
+})
+.expect(status: 200)
+.store({ "$$memberToken": this.body.token })
+
+// Member should see the project (inherited from workspace read)
+get("$baseUrl/api/v1/projects/$$projId", {
+  headers: { Authorization: "Bearer $$memberToken" }
+})
+.expect(status: 200)
+.assert({ expect: [this.body.name eq "ChildProject"] })

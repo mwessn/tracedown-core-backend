@@ -1,0 +1,51 @@
+// Domain validation errors
+
+// Login
+post("$baseUrl/api/v1/auth/login", {
+  body: json({ email: "$adminEmail", password: "$adminPassword" })
+})
+.expect(status: 200)
+.store({ "$$token": this.body.token })
+
+// Empty domain
+post("$baseUrl/api/v1/domains", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ domain: "", verificationType: "http-01" })
+})
+.expect(status: 400)
+
+// Invalid domain format
+post("$baseUrl/api/v1/domains", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ domain: "not a domain!", verificationType: "http-01" })
+})
+.expect(status: 400)
+
+// Invalid verification type
+post("$baseUrl/api/v1/domains", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ domain: "valid.com", verificationType: "ftp-01" })
+})
+.expect(status: 400)
+
+// Exception not a subdomain of parent
+post("$baseUrl/api/v1/domains", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({
+    domain: "company.com",
+    verificationType: "http-01",
+    exceptions: ["evil.other.com"]
+  })
+})
+.expect(status: 400)
+
+// Blank exception entry
+post("$baseUrl/api/v1/domains", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({
+    domain: "company.com",
+    verificationType: "http-01",
+    exceptions: [""]
+  })
+})
+.expect(status: 400)

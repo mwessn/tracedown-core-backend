@@ -1,0 +1,91 @@
+// Audit log: entries appear after mutations, PFS filtering works
+
+// Login
+post("$baseUrl/api/v1/auth/login", {
+  body: json({ email: "$adminEmail", password: "$adminPassword" })
+})
+.expect(status: 200)
+.store({ "$$token": this.body.token })
+
+// Perform a mutation that generates an audit entry
+post("$baseUrl/api/v1/workspaces", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ name: "AuditTestWs" })
+})
+.expect(status: 200)
+.store({ "$$wsId": this.body.id })
+
+// Create a webhook too (different entity type)
+post("$baseUrl/api/v1/webhooks", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ name: "AuditHook", url: "https://example.com/hook" })
+})
+.expect(status: 200)
+.store({ "$$whId": this.body.id })
+
+// List audit log — should have entries with PFS response shape
+get("$baseUrl/api/v1/audit-log", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 200)
+.assert({
+  expect: [
+    this.body.total gt 0,
+    this.body.page eq 1,
+    this.body.pageSize eq 50
+  ]
+})
+
+// Filter by action using PFS filters param (URL-encoded JSON)
+get("$baseUrl/api/v1/audit-log?filters=[{%22table%22:%22org_audit_log%22,%22column%22:%22action%22,%22operator%22:%22eq%22,%22value%22:%22create.workspace%22}]", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 200)
+.assert({ expect: [this.body.total gt 0] })
+
+// Filter by entity type
+get("$baseUrl/api/v1/audit-log?filters=[{%22table%22:%22org_audit_log%22,%22column%22:%22entity_type%22,%22operator%22:%22eq%22,%22value%22:%22webhook%22}]", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 200)
+.assert({ expect: [this.body.total gt 0] })
+
+// Filter by non-existent action
+get("$baseUrl/api/v1/audit-log?filters=[{%22table%22:%22org_audit_log%22,%22column%22:%22action%22,%22operator%22:%22eq%22,%22value%22:%22nonexistent%22}]", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 200)
+.assert({ expect: [this.body.total eq 0] })
+
+// Pagination
+get("$baseUrl/api/v1/audit-log?page=1&pageSize=1", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 200)
+.assert({ expect: [this.body.pageSize eq 1] })
+
+// Update workspace — generates update audit entry
+patch("$baseUrl/api/v1/workspaces/$$wsId", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ name: "AuditTestWsV2" })
+})
+.expect(status: 200)
+
+// Delete workspace — generates delete audit entry
+delete("$baseUrl/api/v1/workspaces/$$wsId", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 200)
+
+// Verify update and delete entries exist
+get("$baseUrl/api/v1/audit-log?filters=[{%22table%22:%22org_audit_log%22,%22column%22:%22action%22,%22operator%22:%22eq%22,%22value%22:%22update.workspace%22}]", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 200)
+.assert({ expect: [this.body.total gt 0] })
+
+get("$baseUrl/api/v1/audit-log?filters=[{%22table%22:%22org_audit_log%22,%22column%22:%22action%22,%22operator%22:%22eq%22,%22value%22:%22delete.workspace%22}]", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 200)
+.assert({ expect: [this.body.total gt 0] })

@@ -1,0 +1,60 @@
+// Test: restricted user with no domain permissions cannot manage domains
+
+// Login as admin — add a domain
+post("$baseUrl/api/v1/auth/login", {
+  body: json({ email: "$adminEmail", password: "$adminPassword" })
+})
+.expect(status: 200)
+.store({ "$$adminToken": this.body.token })
+
+post("$baseUrl/api/v1/domains", {
+  headers: { Authorization: "Bearer $$adminToken" },
+  body: json({ domain: "restricted-test.com", verificationType: "http-01" })
+})
+.expect(status: 200)
+.store({ "$$domainId": this.body.id })
+
+// Login as restricted user (no permissions)
+post("$baseUrl/api/v1/auth/login", {
+  body: json({ email: "$restrictedEmail", password: "$restrictedPassword" })
+})
+.expect(status: 200)
+.store({ "$$restrictedToken": this.body.token })
+
+// Cannot list domains
+get("$baseUrl/api/v1/domains", {
+  headers: { Authorization: "Bearer $$restrictedToken" }
+})
+.expect(status: 403)
+
+// Cannot add domain
+post("$baseUrl/api/v1/domains", {
+  headers: { Authorization: "Bearer $$restrictedToken" },
+  body: json({ domain: "evil.com", verificationType: "http-01" })
+})
+.expect(status: 403)
+
+// Cannot get domain
+get("$baseUrl/api/v1/domains/$$domainId", {
+  headers: { Authorization: "Bearer $$restrictedToken" }
+})
+.expect(status: 403)
+
+// Cannot update domain
+patch("$baseUrl/api/v1/domains/$$domainId", {
+  headers: { Authorization: "Bearer $$restrictedToken" },
+  body: json({ wildcardEnabled: false })
+})
+.expect(status: 403)
+
+// Cannot delete domain
+delete("$baseUrl/api/v1/domains/$$domainId", {
+  headers: { Authorization: "Bearer $$restrictedToken" }
+})
+.expect(status: 403)
+
+// Cannot verify domain
+post("$baseUrl/api/v1/domains/$$domainId/verify", {
+  headers: { Authorization: "Bearer $$restrictedToken" }
+})
+.expect(status: 403)

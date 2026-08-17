@@ -1,0 +1,43 @@
+// Webhook validation errors
+
+// Login
+post("$baseUrl/api/v1/auth/login", {
+  body: json({ email: "$adminEmail", password: "$adminPassword" })
+})
+.expect(status: 200)
+.store({ "$$token": this.body.token })
+
+// Empty name
+post("$baseUrl/api/v1/webhooks", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ name: "", url: "https://example.com" })
+})
+.expect(status: 400)
+
+// Empty URL
+post("$baseUrl/api/v1/webhooks", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ name: "Test", url: "" })
+})
+.expect(status: 400)
+
+// Invalid method
+post("$baseUrl/api/v1/webhooks", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ name: "Test", url: "https://example.com", method: "DELETE" })
+})
+.expect(status: 400)
+
+// Invalid attemptCount (too high)
+post("$baseUrl/api/v1/webhooks", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ name: "Test", url: "https://example.com", attemptCount: 99 })
+})
+.expect(status: 400)
+
+// Invalid attemptCount (zero)
+post("$baseUrl/api/v1/webhooks", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ name: "Test", url: "https://example.com", attemptCount: 0 })
+})
+.expect(status: 400)

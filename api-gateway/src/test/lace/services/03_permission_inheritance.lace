@@ -1,0 +1,62 @@
+// Test: granting read on workspace gives access to services within its projects
+
+// Login as admin
+post("$baseUrl/api/v1/auth/login", {
+  body: json({ email: "$adminEmail", password: "$adminPassword" })
+})
+.expect(status: 200)
+.store({ "$$adminToken": this.body.token })
+
+// Create hierarchy: workspace → project → service
+post("$baseUrl/api/v1/workspaces", {
+  headers: { Authorization: "Bearer $$adminToken" },
+  body: json({ name: "InhWs" })
+})
+.expect(status: 200)
+.store({ "$$wsId": this.body.id })
+
+post("$baseUrl/api/v1/projects", {
+  headers: { Authorization: "Bearer $$adminToken" },
+  body: json({ workspaceId: "$$wsId", name: "InhProj" })
+})
+.expect(status: 200)
+.store({ "$$projId": this.body.id })
+
+post("$baseUrl/api/v1/services", {
+  headers: { Authorization: "Bearer $$adminToken" },
+  body: json({ projectId: "$$projId", name: "InhSvc" })
+})
+.expect(status: 200)
+.store({ "$$svcId": this.body.id })
+
+// Grant member read on workspace only
+patch("$baseUrl/api/v1/users/$memberId/permissions", {
+  headers: { Authorization: "Bearer $$adminToken" },
+  body: json({
+    resources: [
+      { resourceType: "workspace", resourceId: "$$wsId", permissions: 1 }
+    ]
+  })
+})
+.expect(status: 200)
+
+// Login as member
+post("$baseUrl/api/v1/auth/login", {
+  body: json({ email: "$memberEmail", password: "$memberPassword" })
+})
+.expect(status: 200)
+.store({ "$$memberToken": this.body.token })
+
+// Member can see the service (inherited from workspace read)
+get("$baseUrl/api/v1/services/$$svcId", {
+  headers: { Authorization: "Bearer $$memberToken" }
+})
+.expect(status: 200)
+.assert({ expect: [this.body.name eq "InhSvc"] })
+
+// Member cannot update (only read access) — returns 404 to not reveal resource existence
+patch("$baseUrl/api/v1/services/$$svcId", {
+  headers: { Authorization: "Bearer $$memberToken" },
+  body: json({ name: "Modified" })
+})
+.expect(status: 404)

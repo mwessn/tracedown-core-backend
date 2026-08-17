@@ -1,0 +1,5 @@
+// Login with nonexistent email should return 401
+post("$baseUrl/api/v1/auth/login", {
+  body: json({ email: "nobody@example.com", password: "anything" })
+})
+.expect(status: 401)

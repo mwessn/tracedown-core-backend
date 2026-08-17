@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+    <property name="SERVICE_NAME" value="email-service"/>
+    <include resource="logback-base.xml"/>
+
+    <!--
+      Dedicated email-delivery audit trail. Always on (independent of LOG_TO_FILE)
+      and non-additive so it does not double-log through the root. STDOUT comes
+      from the shared base.
+    -->
+    <appender name="EMAIL_DELIVERY" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>${LOG_DIR}/email-delivery.log</file>
+        <rollingPolicy class="ch.qos.logback.core.rolling.TimeBasedRollingPolicy">
+            <fileNamePattern>${LOG_DIR}/email-delivery.%d{yyyy-MM-dd}.log</fileNamePattern>
+            <maxHistory>${LOG_RETENTION_DAYS}</maxHistory>
+        </rollingPolicy>
+        <encoder class="net.logstash.logback.encoder.LogstashEncoder"/>
+    </appender>
+
+    <logger name="email.delivery" level="INFO" additivity="false">
+        <appender-ref ref="EMAIL_DELIVERY"/>
+        <appender-ref ref="STDOUT"/>
+    </logger>
+</configuration>

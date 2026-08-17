@@ -1,0 +1,7 @@
+// Metrics: requires authentication
+
+get("$baseUrl/api/v1/services/00000000-0000-0000-0000-000000000001/metrics")
+.expect(status: 401)
+
+get("$baseUrl/api/v1/services/00000000-0000-0000-0000-000000000001/metrics/history")
+.expect(status: 401)

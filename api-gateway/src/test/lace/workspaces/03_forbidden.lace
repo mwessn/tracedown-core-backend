@@ -1,0 +1,21 @@
+// Restricted user has no workspace permissions
+
+// Login as restricted
+post("$baseUrl/api/v1/auth/login", {
+  body: json({ email: "$restrictedEmail", password: "$restrictedPassword" })
+})
+.expect(status: 200)
+.store({ "$$token": this.body.token })
+
+// List returns empty (user is a member but has no workspace access)
+get("$baseUrl/api/v1/workspaces", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 200)
+
+// Cannot create workspaces (requires org-level workspaces.write)
+post("$baseUrl/api/v1/workspaces", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ name: "Forbidden" })
+})
+.expect(status: 403)

@@ -1,0 +1,44 @@
+// Member has no direct permissions. Adding them to a group with
+// users=read should grant them read access to the groups endpoint.
+
+// Login as admin
+post("$baseUrl/api/v1/auth/login", {
+  body: json({ email: "$adminEmail", password: "$adminPassword" })
+})
+.expect(status: 200)
+.store({ "$$adminToken": this.body.token })
+
+// Create a group with users=read
+post("$baseUrl/api/v1/groups", {
+  headers: { Authorization: "Bearer $$adminToken" },
+  body: json({ name: "ReadAccess" })
+})
+.expect(status: 200)
+.store({ "$$groupId": this.body.id })
+
+// Set users=read on the group
+patch("$baseUrl/api/v1/groups/$$groupId", {
+  headers: { Authorization: "Bearer $$adminToken" },
+  body: json({ users: 1 })
+})
+.expect(status: 200)
+
+// Add member to the group
+post("$baseUrl/api/v1/groups/$$groupId/members", {
+  headers: { Authorization: "Bearer $$adminToken" },
+  body: json({ userId: "$memberId" })
+})
+.expect(status: 200)
+
+// Login as member — should now have read access via group
+post("$baseUrl/api/v1/auth/login", {
+  body: json({ email: "$memberEmail", password: "$memberPassword" })
+})
+.expect(status: 200)
+.store({ "$$memberToken": this.body.token })
+
+// Member can now list groups (requires users.read)
+get("$baseUrl/api/v1/groups", {
+  headers: { Authorization: "Bearer $$memberToken" }
+})
+.expect(status: 200)

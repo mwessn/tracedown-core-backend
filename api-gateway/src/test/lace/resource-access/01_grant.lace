@@ -1,0 +1,36 @@
+// Grant a user read access to a workspace, list grants, then revoke.
+
+post("$baseUrl/api/v1/auth/login", {
+  body: json({ email: "$adminEmail", password: "$adminPassword" })
+})
+.expect(status: 200)
+.store({ "$$token": this.body.token })
+
+post("$baseUrl/api/v1/workspaces", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ name: "GrantWs" })
+})
+.expect(status: 200)
+.store({ "$$wsId": this.body.id })
+
+// Grant the member read (1) access. principalId for a user is the userId.
+put("$baseUrl/api/v1/access/workspace/$$wsId", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ principalType: "user", principalId: "$memberId", permissions: 1 })
+})
+.expect(status: 200)
+.assert({ expect: [this.body.ok eq true] })
+
+// The access list returns an array of grant entries. (Lace has no array-length
+// operator, so the presence of the specific grant can't be asserted here.)
+get("$baseUrl/api/v1/access/workspace/$$wsId", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 200, body: schema($resourceAccessListSchema))
+
+// Revoke it.
+delete("$baseUrl/api/v1/access/workspace/$$wsId/user/$memberId", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 200)
+.assert({ expect: [this.body.ok eq true] })

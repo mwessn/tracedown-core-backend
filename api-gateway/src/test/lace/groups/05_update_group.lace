@@ -1,0 +1,37 @@
+// Login as admin
+post("$baseUrl/api/v1/auth/login", {
+  body: json({ email: "$adminEmail", password: "$adminPassword" })
+})
+.expect(status: 200)
+.store({ "$$token": this.body.token })
+
+// Create a group to update
+post("$baseUrl/api/v1/groups", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ name: "UpdateTest" })
+})
+.expect(status: 200)
+.store({ "$$groupId": this.body.id })
+
+// Update name
+patch("$baseUrl/api/v1/groups/$$groupId", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ name: "UpdatedName" })
+})
+.expect(status: 200)
+.assert({ expect: [this.body.name eq "UpdatedName"] })
+
+// Update permissions
+patch("$baseUrl/api/v1/groups/$$groupId", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ users: 1, settings: 2, domains: 1, webhooks: 0 })
+})
+.expect(status: 200)
+.assert({
+  expect: [
+    this.body.users eq 1,
+    this.body.settings eq 2,
+    this.body.domains eq 1,
+    this.body.webhooks eq 0
+  ]
+})

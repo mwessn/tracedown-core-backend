@@ -1,0 +1,33 @@
+// General tier: 5 requests allowed, 6th should be 429
+// Requests are 401 (bad token) but still counted by the rate limiter
+
+get("$baseUrl/api/v1/auth/me", {
+  headers: { Authorization: "Bearer fake1" }
+})
+.expect(status: 401)
+
+get("$baseUrl/api/v1/auth/me", {
+  headers: { Authorization: "Bearer fake2" }
+})
+.expect(status: 401)
+
+get("$baseUrl/api/v1/auth/me", {
+  headers: { Authorization: "Bearer fake3" }
+})
+.expect(status: 401)
+
+get("$baseUrl/api/v1/auth/me", {
+  headers: { Authorization: "Bearer fake4" }
+})
+.expect(status: 401)
+
+get("$baseUrl/api/v1/auth/me", {
+  headers: { Authorization: "Bearer fake5" }
+})
+.expect(status: 401)
+
+// 6th request exceeds the limit
+get("$baseUrl/api/v1/auth/me", {
+  headers: { Authorization: "Bearer fake6" }
+})
+.expect(status: 429)

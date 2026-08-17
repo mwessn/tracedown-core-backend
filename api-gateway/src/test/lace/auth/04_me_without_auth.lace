@@ -1,0 +1,3 @@
+// Accessing /me without auth should return 401
+get("$baseUrl/api/v1/auth/me")
+.expect(status: 401)

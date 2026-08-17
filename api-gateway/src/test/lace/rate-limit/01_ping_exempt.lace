@@ -1,0 +1,30 @@
+// /ping is exempt from rate limiting — always 200 regardless of volume
+get("$baseUrl/ping")
+.expect(status: 200)
+
+get("$baseUrl/ping")
+.expect(status: 200)
+
+get("$baseUrl/ping")
+.expect(status: 200)
+
+get("$baseUrl/ping")
+.expect(status: 200)
+
+get("$baseUrl/ping")
+.expect(status: 200)
+
+get("$baseUrl/ping")
+.expect(status: 200)
+
+get("$baseUrl/ping")
+.expect(status: 200)
+
+get("$baseUrl/ping")
+.expect(status: 200)
+
+get("$baseUrl/ping")
+.expect(status: 200)
+
+get("$baseUrl/ping")
+.expect(status: 200)

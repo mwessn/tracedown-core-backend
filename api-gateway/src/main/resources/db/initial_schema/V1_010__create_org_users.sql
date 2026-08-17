@@ -1,0 +1,23 @@
+CREATE TABLE org_users (
+    id                  UUID            PRIMARY KEY,
+    organization_id     UUID            NOT NULL REFERENCES organizations(id),
+    user_id             UUID            NOT NULL REFERENCES users(id),
+    joined_at           TIMESTAMP(0)    DEFAULT now(),
+    status              VARCHAR(16)     NOT NULL DEFAULT 'invited',
+    is_active           BOOLEAN         NOT NULL DEFAULT true,
+    deleted             BOOLEAN         NOT NULL DEFAULT false,
+    deleted_at          TIMESTAMP(0),
+    purge_after         TIMESTAMP(0),
+    org_user_list       SMALLINT        NOT NULL DEFAULT 0,
+    org_settings        SMALLINT        NOT NULL DEFAULT 0,
+    org_domains         SMALLINT        NOT NULL DEFAULT 0,
+    org_webhooks        SMALLINT        NOT NULL DEFAULT 0,
+    org_workspaces      SMALLINT        NOT NULL DEFAULT 0,
+    invite_token        VARCHAR(128)    NOT NULL,
+    invited_at          TIMESTAMP(0),
+    invited_by          UUID            REFERENCES users(id),
+    invite_expires_at   TIMESTAMP(0),
+    last_invite_sent_at TIMESTAMP(0),
+    permission_cache    JSONB,
+    UNIQUE(organization_id, user_id)
+);

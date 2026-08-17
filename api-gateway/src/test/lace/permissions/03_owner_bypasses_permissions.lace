@@ -1,0 +1,21 @@
+// Org owner always has full access regardless of direct/group permissions.
+
+// Login as admin (org owner)
+post("$baseUrl/api/v1/auth/login", {
+  body: json({ email: "$adminEmail", password: "$adminPassword" })
+})
+.expect(status: 200)
+.store({ "$$token": this.body.token })
+
+// Owner can list groups
+get("$baseUrl/api/v1/groups", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 200)
+
+// Owner can create groups
+post("$baseUrl/api/v1/groups", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ name: "OwnerBypassTest" })
+})
+.expect(status: 200)

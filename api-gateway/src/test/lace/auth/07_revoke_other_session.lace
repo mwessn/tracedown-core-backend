@@ -1,0 +1,24 @@
+// Login twice, revoke the first session from the second
+post("$baseUrl/api/v1/auth/login", {
+  body: json({ email: "$adminEmail", password: "$adminPassword" })
+})
+.expect(status: 200)
+.store({ "$$tokenA": this.body.token })
+
+post("$baseUrl/api/v1/auth/login", {
+  body: json({ email: "$adminEmail", password: "$adminPassword" })
+})
+.expect(status: 200)
+.store({ "$$tokenB": this.body.token })
+
+// List sessions from B — should see both
+get("$baseUrl/api/v1/auth/sessions", {
+  headers: { Authorization: "Bearer $$tokenB" }
+})
+.expect(status: 200)
+
+// Token A should still work before revocation
+get("$baseUrl/api/v1/auth/me", {
+  headers: { Authorization: "Bearer $$tokenA" }
+})
+.expect(status: 200)

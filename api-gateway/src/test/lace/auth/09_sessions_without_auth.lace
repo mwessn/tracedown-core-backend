@@ -1,0 +1,6 @@
+// Session endpoints without auth should return 401
+get("$baseUrl/api/v1/auth/sessions")
+.expect(status: 401)
+
+delete("$baseUrl/api/v1/auth/sessions")
+.expect(status: 401)

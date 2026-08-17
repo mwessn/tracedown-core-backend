@@ -1,0 +1,22 @@
+# Gradle
+.gradle/
+build/
+!gradle/wrapper/gradle-wrapper.jar
+
+# IntelliJ
+.idea/
+*.iml
+
+# Environment
+.env
+.env.*
+
+# E2E (Python)
+e2e/__pycache__/
+e2e/.pytest_cache/
+e2e/.venv/
+
+# Dev email output
+docker/email-attachments/
+
+!docker/.env.example

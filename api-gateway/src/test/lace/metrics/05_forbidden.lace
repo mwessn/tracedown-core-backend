@@ -1,0 +1,46 @@
+// Metrics: restricted user cannot access metrics for a service they don't have access to
+
+// Admin creates a service
+post("$baseUrl/api/v1/auth/login", {
+  body: json({ email: "$adminEmail", password: "$adminPassword" })
+})
+.expect(status: 200)
+.store({ "$$adminToken": this.body.token })
+
+post("$baseUrl/api/v1/workspaces", {
+  headers: { Authorization: "Bearer $$adminToken" },
+  body: json({ name: "ForbiddenMetricsWs" })
+})
+.expect(status: 200)
+.store({ "$$wsId": this.body.id })
+
+post("$baseUrl/api/v1/projects", {
+  headers: { Authorization: "Bearer $$adminToken" },
+  body: json({ workspaceId: "$$wsId", name: "ForbiddenMetricsProj" })
+})
+.expect(status: 200)
+.store({ "$$projId": this.body.id })
+
+post("$baseUrl/api/v1/services", {
+  headers: { Authorization: "Bearer $$adminToken" },
+  body: json({ projectId: "$$projId", name: "Forbidden Metrics Svc" })
+})
+.expect(status: 200)
+.store({ "$$svcId": this.body.id })
+
+// Restricted user tries to access metrics → 404 (no grant = resource not found)
+post("$baseUrl/api/v1/auth/login", {
+  body: json({ email: "$restrictedEmail", password: "$restrictedPassword" })
+})
+.expect(status: 200)
+.store({ "$$restrictedToken": this.body.token })
+
+get("$baseUrl/api/v1/services/$$svcId/metrics", {
+  headers: { Authorization: "Bearer $$restrictedToken" }
+})
+.expect(status: 404)
+
+get("$baseUrl/api/v1/services/$$svcId/metrics/history", {
+  headers: { Authorization: "Bearer $$restrictedToken" }
+})
+.expect(status: 404)

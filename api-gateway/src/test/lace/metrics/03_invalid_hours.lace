@@ -1,0 +1,42 @@
+// Metrics history: rejects invalid hours parameter
+
+// Login
+post("$baseUrl/api/v1/auth/login", {
+  body: json({ email: "$adminEmail", password: "$adminPassword" })
+})
+.expect(status: 200)
+.store({ "$$token": this.body.token })
+
+// Create workspace → project → service
+post("$baseUrl/api/v1/workspaces", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ name: "InvalidHoursWs" })
+})
+.expect(status: 200)
+.store({ "$$wsId": this.body.id })
+
+post("$baseUrl/api/v1/projects", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ workspaceId: "$$wsId", name: "InvalidHoursProj" })
+})
+.expect(status: 200)
+.store({ "$$projId": this.body.id })
+
+post("$baseUrl/api/v1/services", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ projectId: "$$projId", name: "Invalid Hours Svc" })
+})
+.expect(status: 200)
+.store({ "$$svcId": this.body.id })
+
+// hours=0 → 400
+get("$baseUrl/api/v1/services/$$svcId/metrics/history?hours=0", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 400)
+
+// hours=200 → 400 (max 168)
+get("$baseUrl/api/v1/services/$$svcId/metrics/history?hours=200", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 400)

@@ -1,0 +1,106 @@
+// Webhook resource bindings: attach, list, update, detach
+
+// Login
+post("$baseUrl/api/v1/auth/login", {
+  body: json({ email: "$adminEmail", password: "$adminPassword" })
+})
+.expect(status: 200)
+.store({ "$$token": this.body.token })
+
+// Create workspace → project → service hierarchy
+post("$baseUrl/api/v1/workspaces", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ name: "BindingWs" })
+})
+.expect(status: 200)
+.store({ "$$wsId": this.body.id })
+
+post("$baseUrl/api/v1/projects", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ workspaceId: "$$wsId", name: "BindingProj" })
+})
+.expect(status: 200)
+.store({ "$$projId": this.body.id })
+
+post("$baseUrl/api/v1/services", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ projectId: "$$projId", name: "BindingSvc" })
+})
+.expect(status: 200)
+.store({ "$$svcId": this.body.id })
+
+// Create webhook
+post("$baseUrl/api/v1/webhooks", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ name: "Binding Test Hook", url: "https://example.com/hook" })
+})
+.expect(status: 200)
+.store({ "$$whId": this.body.id })
+
+// Bind webhook to workspace
+post("$baseUrl/api/v1/webhooks/bindings/workspace/$$wsId", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ webhookId: "$$whId" })
+})
+.expect(status: 200)
+.assert({
+  expect: [
+    this.body.webhookName eq "Binding Test Hook",
+    this.body.enabled eq true
+  ]
+})
+.store({ "$$bindingId": this.body.id })
+
+// Bind same webhook to project
+post("$baseUrl/api/v1/webhooks/bindings/project/$$projId", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ webhookId: "$$whId" })
+})
+.expect(status: 200)
+
+// Bind same webhook to service
+post("$baseUrl/api/v1/webhooks/bindings/service/$$svcId", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ webhookId: "$$whId" })
+})
+.expect(status: 200)
+
+// Duplicate binding should fail
+post("$baseUrl/api/v1/webhooks/bindings/workspace/$$wsId", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ webhookId: "$$whId" })
+})
+.expect(status: 409)
+
+// List bindings for workspace
+get("$baseUrl/api/v1/webhooks/bindings/workspace/$$wsId", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 200)
+
+// Disable binding
+patch("$baseUrl/api/v1/webhooks/bindings/$$bindingId", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ enabled: false })
+})
+.expect(status: 200)
+.assert({ expect: [this.body.enabled eq false] })
+
+// Remove binding
+delete("$baseUrl/api/v1/webhooks/bindings/$$bindingId", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 200)
+
+// Verify removed — binding no longer in list
+get("$baseUrl/api/v1/webhooks/bindings/workspace/$$wsId", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 200)
+
+// Invalid resource type
+post("$baseUrl/api/v1/webhooks/bindings/invalid/$$wsId", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ webhookId: "$$whId" })
+})
+.expect(status: 400)

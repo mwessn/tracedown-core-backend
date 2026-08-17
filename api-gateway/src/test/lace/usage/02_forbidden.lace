@@ -1,0 +1,17 @@
+// Org-wide usage requires org admin; a plain member is refused.
+
+post("$baseUrl/api/v1/auth/login", {
+  body: json({ email: "$restrictedEmail", password: "$restrictedPassword" })
+})
+.expect(status: 200)
+.store({ "$$token": this.body.token })
+
+// Non-admin member cannot read org-wide usage.
+get("$baseUrl/api/v1/org/usage?hours=24", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 403)
+
+// Unauthenticated request is rejected.
+get("$baseUrl/api/v1/org/usage?hours=24")
+.expect(status: 401)

@@ -1,0 +1,39 @@
+package dev.tracedown.worker.jobs
+
+import dev.tracedown.common.models.AgentHealthChecks
+import kotlinx.coroutines.Dispatchers
+import org.jetbrains.exposed.sql.SqlExpressionBuilder.less
+import org.jetbrains.exposed.sql.deleteWhere
+import org.jetbrains.exposed.sql.transactions.experimental.newSuspendedTransaction
+import org.slf4j.LoggerFactory
+import java.time.Instant
+import java.time.temporal.ChronoUnit
+
+/**
+ * Trims agent health-check history to the configured window (default 90
+ * days; -1 keeps forever). The `probe_agents` snapshot columns are
+ * untouched — only the history rows age out.
+ */
+class AgentHealthCleanupJob(
+    private val retentionDays: Int,
+    override val intervalSeconds: Long = 3600L,
+) : ScheduledJob {
+
+    override val name = "AgentHealthCleanupJob"
+
+    private val log = LoggerFactory.getLogger(javaClass)
+
+    override suspend fun execute() {
+        if (retentionDays <= 0) {
+            log.debug("Agent health retention disabled (agentHealthRetentionDays={})", retentionDays)
+            return
+        }
+        val cutoff = Instant.now().minus(retentionDays.toLong(), ChronoUnit.DAYS)
+        val deleted = newSuspendedTransaction(Dispatchers.IO) {
+            AgentHealthChecks.deleteWhere { createdAt less cutoff }
+        }
+        if (deleted > 0) {
+            log.info("Agent health cleanup: deleted {} checks older than {}d", deleted, retentionDays)
+        }
+    }
+}

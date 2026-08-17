@@ -1,0 +1,75 @@
+// Notification template CRUD lifecycle: create with project binding, list, get, update, delete
+
+// Login
+post("$baseUrl/api/v1/auth/login", {
+  body: json({ email: "$adminEmail", password: "$adminPassword" })
+})
+.expect(status: 200)
+.store({ "$$token": this.body.token })
+
+// Create workspace
+post("$baseUrl/api/v1/workspaces", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ name: "NtfTestWs" })
+})
+.expect(status: 200)
+.store({ "$$wsId": this.body.id })
+
+// Create project
+post("$baseUrl/api/v1/projects", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ workspaceId: "$$wsId", name: "NtfTestProj" })
+})
+.expect(status: 200)
+.store({ "$$projId": this.body.id })
+
+// Create notification template with project binding
+post("$baseUrl/api/v1/notification-templates", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({
+    name: "alert-tpl",
+    text: "Service ${s.name} failed",
+    projectIds: ["$$projId"]
+  })
+})
+.expect(status: 201)
+.assert({
+  expect: [
+    this.body.name eq "alert-tpl",
+    this.body.text eq "Service ${s.name} failed"
+  ]
+})
+.store({ "$$tplId": this.body.id })
+
+// List notification templates
+get("$baseUrl/api/v1/notification-templates", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 200)
+
+// Get single template — verify fields and project binding
+get("$baseUrl/api/v1/notification-templates/$$tplId", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 200)
+.assert({
+  expect: [
+    this.body.name eq "alert-tpl",
+    this.body.text eq "Service ${s.name} failed"
+  ]
+})
+
+// Update template text
+patch("$baseUrl/api/v1/notification-templates/$$tplId", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ text: "Updated: ${s.name}" })
+})
+.expect(status: 200)
+.assert({ expect: [this.body.text eq "Updated: ${s.name}"] })
+
+// Delete template
+delete("$baseUrl/api/v1/notification-templates/$$tplId", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 200)
+.assert({ expect: [this.body.ok eq true] })

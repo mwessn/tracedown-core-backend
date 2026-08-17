@@ -1,0 +1,58 @@
+// Full project CRUD lifecycle
+
+// Login
+post("$baseUrl/api/v1/auth/login", {
+  body: json({ email: "$adminEmail", password: "$adminPassword" })
+})
+.expect(status: 200)
+.store({ "$$token": this.body.token })
+
+// Create workspace for projects
+post("$baseUrl/api/v1/workspaces", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ name: "ProjectTestWs" })
+})
+.expect(status: 200)
+.store({ "$$wsId": this.body.id })
+
+// Create project
+post("$baseUrl/api/v1/projects", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ workspaceId: "$$wsId", name: "Auth Service" })
+})
+.expect(status: 200)
+.assert({ expect: [this.body.name eq "Auth Service"] })
+.store({ "$$projId": this.body.id })
+
+// List projects
+get("$baseUrl/api/v1/projects?workspaceId=$$wsId", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 200)
+
+// Get project
+get("$baseUrl/api/v1/projects/$$projId", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 200)
+.assert({ expect: [this.body.name eq "Auth Service"] })
+
+// Update project
+patch("$baseUrl/api/v1/projects/$$projId", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ name: "Auth Service v2" })
+})
+.expect(status: 200)
+.assert({ expect: [this.body.name eq "Auth Service v2"] })
+
+// Delete project
+delete("$baseUrl/api/v1/projects/$$projId", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 200)
+
+// Verify deleted
+get("$baseUrl/api/v1/projects/$$projId", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 404)

@@ -1,0 +1,77 @@
+// Project variable CRUD with all three types
+
+// Login
+post("$baseUrl/api/v1/auth/login", {
+  body: json({ email: "$adminEmail", password: "$adminPassword" })
+})
+.expect(status: 200)
+.store({ "$$token": this.body.token })
+
+// Create workspace and project
+post("$baseUrl/api/v1/workspaces", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ name: "ProjVarWs" })
+})
+.expect(status: 200)
+.store({ "$$wsId": this.body.id })
+
+post("$baseUrl/api/v1/projects", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ workspaceId: "$$wsId", name: "ProjVarProj" })
+})
+.expect(status: 200)
+.store({ "$$projId": this.body.id })
+
+// Create variable type
+post("$baseUrl/api/v1/projects/$$projId/variables", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ key: "DB_HOST", value: "db.internal", type: "variable" })
+})
+.expect(status: 200)
+.assert({
+  expect: [
+    this.body.type eq "variable",
+    this.body.value eq "••••••"
+  ]
+})
+.store({ "$$varId": this.body.id })
+
+// Create secret type
+post("$baseUrl/api/v1/projects/$$projId/variables", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ key: "DB_PASS", value: "secret123", type: "secret" })
+})
+.expect(status: 200)
+.assert({ expect: [this.body.type eq "secret"] })
+
+// Create metric type
+post("$baseUrl/api/v1/projects/$$projId/variables", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ key: "ERRORS", value: "0", type: "metric" })
+})
+.expect(status: 200)
+.assert({
+  expect: [
+    this.body.type eq "metric",
+    this.body.value eq "0"
+  ]
+})
+
+// List variables
+get("$baseUrl/api/v1/projects/$$projId/variables", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 200)
+
+// Update variable
+patch("$baseUrl/api/v1/projects/$$projId/variables/$$varId", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ value: "db-v2.internal" })
+})
+.expect(status: 200)
+
+// Delete variable
+delete("$baseUrl/api/v1/projects/$$projId/variables/$$varId", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 200)

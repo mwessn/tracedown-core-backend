@@ -1,0 +1,42 @@
+// Login as admin (org owner)
+post("$baseUrl/api/v1/auth/login", {
+  body: json({ email: "$adminEmail", password: "$adminPassword" })
+})
+.expect(status: 200)
+.store({ "$$token": this.body.token })
+
+// Transfer ownership to member
+post("$baseUrl/api/v1/org/transfer", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ newOwnerId: "$memberId", password: "$adminPassword" })
+})
+.expect(status: 200)
+.assert({ expect: [this.body.ownerId eq "$memberId"] })
+
+// Transfer back to admin
+post("$baseUrl/api/v1/auth/login", {
+  body: json({ email: "$memberEmail", password: "$memberPassword" })
+})
+.expect(status: 200)
+.store({ "$$memberToken": this.body.token })
+
+// Get admin user ID from settings
+get("$baseUrl/api/v1/org/settings", {
+  headers: { Authorization: "Bearer $$memberToken" }
+})
+.expect(status: 200)
+.store({ "$$adminId": this.body.ownerId })
+
+// Actually we need admin's userId — let's get it from /me
+post("$baseUrl/api/v1/auth/login", {
+  body: json({ email: "$adminEmail", password: "$adminPassword" })
+})
+.expect(status: 200)
+.store({ "$$adminToken2": this.body.token, "$$adminUserId": this.body.user.id })
+
+// Transfer back
+post("$baseUrl/api/v1/org/transfer", {
+  headers: { Authorization: "Bearer $$memberToken" },
+  body: json({ newOwnerId: "$$adminUserId", password: "$memberPassword" })
+})
+.expect(status: 200)

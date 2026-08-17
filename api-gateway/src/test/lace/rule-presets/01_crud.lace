@@ -1,0 +1,30 @@
+// Rule-preset list / create / delete. The `script` field must be valid Lace.
+
+post("$baseUrl/api/v1/auth/login", {
+  body: json({ email: "$adminEmail", password: "$adminPassword" })
+})
+.expect(status: 200)
+.store({ "$$token": this.body.token })
+
+// The list returns an array of preset summaries. (Lace has no array-length
+// operator, so the count itself can't be asserted here.)
+get("$baseUrl/api/v1/rule-presets", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 200, body: schema($rulePresetListSchema))
+
+// Create an org-scoped preset (no workspaceId).
+post("$baseUrl/api/v1/rule-presets", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ name: "Ping", script: "get(\"https://example.com/\").expect(status: 200)" })
+})
+.expect(status: 200, body: schema($rulePresetSchema))
+.assert({ expect: [this.body.name eq "Ping", this.body.scope eq "org"] })
+.store({ "$$presetId": this.body.id })
+
+// Delete it.
+delete("$baseUrl/api/v1/rule-presets/$$presetId", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 200)
+.assert({ expect: [this.body.ok eq true] })

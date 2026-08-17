@@ -1,0 +1,19 @@
+// Login as restricted user (no settings permission)
+post("$baseUrl/api/v1/auth/login", {
+  body: json({ email: "$restrictedEmail", password: "$restrictedPassword" })
+})
+.expect(status: 200)
+.store({ "$$token": this.body.token })
+
+// Try to get settings — should be forbidden
+get("$baseUrl/api/v1/org/settings", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 403)
+
+// Try to update settings — should be forbidden
+patch("$baseUrl/api/v1/org/settings", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ name: "Hacked" })
+})
+.expect(status: 403)

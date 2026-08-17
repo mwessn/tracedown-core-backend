@@ -1,0 +1,19 @@
+// Login as restricted user (no permissions on any section)
+post("$baseUrl/api/v1/auth/login", {
+  body: json({ email: "$restrictedEmail", password: "$restrictedPassword" })
+})
+.expect(status: 200)
+.store({ "$$token": this.body.token })
+
+// Try to create a group — should be forbidden
+post("$baseUrl/api/v1/groups", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ name: "Forbidden" })
+})
+.expect(status: 403)
+
+// Try to list groups — should also be forbidden (no read perm)
+get("$baseUrl/api/v1/groups", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 403)

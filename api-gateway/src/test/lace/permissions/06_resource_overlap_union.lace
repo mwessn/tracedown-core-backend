@@ -1,0 +1,67 @@
+// Test: personal read + group write = effective write (union/max).
+
+// Login as admin
+post("$baseUrl/api/v1/auth/login", {
+  body: json({ email: "$adminEmail", password: "$adminPassword" })
+})
+.expect(status: 200)
+.store({ "$$adminToken": this.body.token })
+
+// Create workspace
+post("$baseUrl/api/v1/workspaces", {
+  headers: { Authorization: "Bearer $$adminToken" },
+  body: json({ name: "OverlapWs" })
+})
+.expect(status: 200)
+.store({ "$$wsId": this.body.id })
+
+// Personal grant: read on workspace
+patch("$baseUrl/api/v1/users/$restrictedId/permissions", {
+  headers: { Authorization: "Bearer $$adminToken" },
+  body: json({
+    resources: [
+      { resourceType: "workspace", resourceId: "$$wsId", permissions: 1 }
+    ]
+  })
+})
+.expect(status: 200)
+
+// Create group, add restricted user
+post("$baseUrl/api/v1/groups", {
+  headers: { Authorization: "Bearer $$adminToken" },
+  body: json({ name: "WsWriters" })
+})
+.expect(status: 200)
+.store({ "$$groupId": this.body.id })
+
+post("$baseUrl/api/v1/groups/$$groupId/members", {
+  headers: { Authorization: "Bearer $$adminToken" },
+  body: json({ userId: "$restrictedId" })
+})
+.expect(status: 200)
+
+// Group grant: write on same workspace
+patch("$baseUrl/api/v1/groups/$$groupId/permissions", {
+  headers: { Authorization: "Bearer $$adminToken" },
+  body: json({
+    resources: [
+      { resourceType: "workspace", resourceId: "$$wsId", permissions: 2 }
+    ]
+  })
+})
+.expect(status: 200)
+
+// Login as restricted
+post("$baseUrl/api/v1/auth/login", {
+  body: json({ email: "$restrictedEmail", password: "$restrictedPassword" })
+})
+.expect(status: 200)
+.store({ "$$restrictedToken": this.body.token })
+
+// Should be able to UPDATE (write) — union of read+write = write
+patch("$baseUrl/api/v1/workspaces/$$wsId", {
+  headers: { Authorization: "Bearer $$restrictedToken" },
+  body: json({ name: "OverlapUpdated" })
+})
+.expect(status: 200)
+.assert({ expect: [this.body.name eq "OverlapUpdated"] })

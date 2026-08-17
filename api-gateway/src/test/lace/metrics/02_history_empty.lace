@@ -1,0 +1,38 @@
+// Metrics history: returns empty buckets when no data exists
+
+// Login
+post("$baseUrl/api/v1/auth/login", {
+  body: json({ email: "$adminEmail", password: "$adminPassword" })
+})
+.expect(status: 200)
+.store({ "$$token": this.body.token })
+
+// Create workspace → project → service
+post("$baseUrl/api/v1/workspaces", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ name: "HistoryTestWs" })
+})
+.expect(status: 200)
+.store({ "$$wsId": this.body.id })
+
+post("$baseUrl/api/v1/projects", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ workspaceId: "$$wsId", name: "HistoryTestProj" })
+})
+.expect(status: 200)
+.store({ "$$projId": this.body.id })
+
+post("$baseUrl/api/v1/services", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ projectId: "$$projId", name: "History Test Svc" })
+})
+.expect(status: 200)
+.store({ "$$svcId": this.body.id })
+
+// History returns 200 even without data. The zero-filled-bucket count and
+// values are asserted in DashboardMetricsTest — Lace has no array-length
+// operator, so the count can't be checked here.
+get("$baseUrl/api/v1/services/$$svcId/metrics/history?hours=3", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 200)

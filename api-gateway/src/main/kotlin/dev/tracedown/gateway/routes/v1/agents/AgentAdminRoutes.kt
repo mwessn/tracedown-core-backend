@@ -1,0 +1,268 @@
+package dev.tracedown.gateway.routes.v1.agents
+
+import at.favre.lib.crypto.bcrypt.BCrypt
+import dev.tracedown.common.audit.AuditService
+import dev.tracedown.gateway.controllers.agents.CaService
+import dev.tracedown.common.errors.ErrorCodes
+import dev.tracedown.common.interceptors.InterceptorContext
+import dev.tracedown.common.interceptors.Interceptors
+import dev.tracedown.common.models.AgentBootstrapTokens
+import dev.tracedown.common.models.AgentCertificates
+import dev.tracedown.common.models.AgentHealthChecks
+import dev.tracedown.common.models.ServiceAllowedAgents
+import dev.tracedown.common.models.ProbeAgents
+import dev.tracedown.common.realtime.RealtimePublisher
+import dev.tracedown.common.validation.Validatable
+import dev.tracedown.common.validation.Validators
+import dev.tracedown.gateway.controllers.agents.AgentRegistrationController
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
+import dev.tracedown.gateway.routes.v1.auth.requireAuthWithOrg
+import dev.tracedown.gateway.util.BadRequestException
+import dev.tracedown.gateway.util.NotFoundException
+import dev.tracedown.gateway.util.requireOrgRead
+import dev.tracedown.gateway.util.requireOrgWrite
+import dev.tracedown.gateway.util.tryReceive
+import io.ktor.resources.Resource
+import io.ktor.server.response.respond
+import io.ktor.server.routing.Route
+import io.ktor.server.resources.delete
+import io.ktor.server.resources.get
+import io.ktor.server.resources.patch
+import io.ktor.server.resources.post
+import kotlinx.serialization.Serializable
+import org.jetbrains.exposed.sql.SqlExpressionBuilder.greaterEq
+import org.jetbrains.exposed.sql.and
+import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
+import org.jetbrains.exposed.sql.deleteWhere
+import org.jetbrains.exposed.sql.insert
+import org.jetbrains.exposed.sql.selectAll
+import org.jetbrains.exposed.sql.transactions.transaction
+import org.jetbrains.exposed.sql.update
+import java.security.SecureRandom
+import java.time.Instant
+import java.time.temporal.ChronoUnit
+import java.util.UUID
+
+@Serializable
+data class AgentSummary(
+    val slug: String,
+    val label: String,
+    val agentUri: String,
+    val isActive: Boolean,
+    val lastStatus: String,
+    val lastPing: String?,
+    val lastPongDeltaMs: Int?,
+    val createdAt: String,
+)
+
+@Serializable
+data class CreateBootstrapTokenRequest(val slug: String, val label: String? = null) : Validatable {
+    override fun validate() = buildList {
+        Validators.notBlank("slug", slug)?.let(::add)
+        Validators.maxLen("slug", slug, 64)?.let(::add)
+        Validators.maxLen("label", label, 64)?.let(::add)
+    }
+}
+
+/** The raw token is shown exactly once — only its hash is stored. */
+@Serializable
+data class BootstrapTokenResponse(val slug: String, val token: String, val expiresAt: String)
+
+@Serializable
+data class UpdateAgentRequest(val isActive: Boolean)
+
+@Serializable
+data class AgentHealthCheck(
+    val challengedAt: String,
+    val respondedAt: String?,
+    val roundTripMs: Int?,
+    val result: String,
+)
+
+private const val TOKEN_BYTES = 32
+private const val TOKEN_TTL_HOURS = 1L
+private val SLUG_RE = Regex("^[a-z0-9][a-z0-9-]{0,63}$")
+
+/**
+ * @OpenAPITag Agents
+ * Probe-agent fleet management: registered-agent list, bootstrap-token
+ * generation (the API twin of the `--agent-bootstrap` CLI), activation
+ * toggle. Agents are platform infrastructure — gated on org settings.
+ */
+@Resource("/api/v1/agents")
+class AgentAdmin {
+    @Resource("list")
+    class List(val parent: AgentAdmin = AgentAdmin())
+
+    @Resource("bootstrap-token")
+    class BootstrapToken(val parent: AgentAdmin = AgentAdmin())
+
+    @Serializable
+    @Resource("{slug}")
+    class BySlug(val parent: AgentAdmin = AgentAdmin(), val slug: String) {
+        @Serializable
+        @Resource("checks")
+        class Checks(val parent: BySlug, val hours: Int = 24)
+    }
+}
+
+fun Route.agentAdminRoutes() {
+    /** Lists all registered agents, active and inactive. */
+    get<AgentAdmin.List> {
+        val (principal, orgId) = requireAuthWithOrg(call)
+        val agents = transaction {
+            requireOrgRead(orgId, principal.userId) { it.settings }
+            ProbeAgents.selectAll()
+                .where { ProbeAgents.deleted eq false }
+                .orderBy(ProbeAgents.slug)
+                .map { row ->
+                    AgentSummary(
+                        slug = row[ProbeAgents.slug],
+                        label = row[ProbeAgents.label],
+                        agentUri = row[ProbeAgents.agentUri],
+                        isActive = row[ProbeAgents.isActive],
+                        lastStatus = row[ProbeAgents.lastStatus],
+                        lastPing = row[ProbeAgents.lastPing].toString(),
+                        lastPongDeltaMs = row[ProbeAgents.lastPongDeltaMs],
+                        createdAt = row[ProbeAgents.createdAt].toString(),
+                    )
+                }
+        }
+        call.respond(agents)
+    }
+
+    /** Creates a one-time agent bootstrap token (1h TTL, shown once). */
+    post<AgentAdmin.BootstrapToken> {
+        val (principal, orgId) = requireAuthWithOrg(call)
+        val body = tryReceive<CreateBootstrapTokenRequest>(call)
+        val slug = body.slug.trim()
+        if (!SLUG_RE.matches(slug)) throw BadRequestException(ErrorCodes.FIELD_INVALID)
+        val label = body.label?.trim()?.ifBlank { null } ?: slug
+
+        val token = ByteArray(TOKEN_BYTES).also { SecureRandom().nextBytes(it) }
+            .joinToString("") { "%02x".format(it) }
+        val tokenHash = BCrypt.withDefaults().hashToString(12, token.toCharArray())
+        val expiresAt = Instant.now().plus(TOKEN_TTL_HOURS, ChronoUnit.HOURS)
+
+        // An external module intercepts the request to connect a new agent via
+        // this key; a before-hook (with the requesting org/user in context) may
+        // deny it, atomically with the token insert.
+        Interceptors.injectableInTx(
+            "agent.bootstrap.create",
+            // Carry the new agent's slug so a hook can act on the created token.
+            InterceptorContext(orgId = orgId, userId = principal.userId, extra = mutableMapOf("slug" to slug)),
+        ) {
+            requireOrgWrite(orgId, principal.userId) { it.settings }
+            // The signing CA is created lazily on the very first bootstrap.
+            CaService.ensureCaRoot()
+            AgentBootstrapTokens.insert {
+                it[id] = UUID.randomUUID()
+                it[AgentBootstrapTokens.slug] = slug
+                it[AgentBootstrapTokens.label] = label
+                it[AgentBootstrapTokens.tokenHash] = tokenHash
+                it[AgentBootstrapTokens.expiresAt] = expiresAt
+                it[createdBy] = principal.userId
+                it[createdAt] = Instant.now()
+            }
+            AuditService.log(orgId, principal.userId, "create.agent_bootstrap_token", "agent", slug, entityDisplayName = slug)
+        }
+
+        call.respond(BootstrapTokenResponse(slug = slug, token = token, expiresAt = expiresAt.toString()))
+    }
+
+    /** Health-check history for one agent, most recent window first-to-last. */
+    get<AgentAdmin.BySlug.Checks> { resource ->
+        val (principal, orgId) = requireAuthWithOrg(call)
+        val hours = resource.hours.coerceIn(1, 24 * 30)
+        val cutoff = Instant.now().minus(hours.toLong(), ChronoUnit.HOURS)
+        val checks = transaction {
+            requireOrgRead(orgId, principal.userId) { it.settings }
+            val agentId = ProbeAgents.selectAll()
+                .where { ProbeAgents.slug eq resource.parent.slug }
+                .firstOrNull()?.get(ProbeAgents.id) ?: throw NotFoundException()
+            AgentHealthChecks.selectAll()
+                .where { (AgentHealthChecks.probeAgentId eq agentId) and (AgentHealthChecks.challengedAt greaterEq cutoff) }
+                .orderBy(AgentHealthChecks.challengedAt)
+                .map { row ->
+                    AgentHealthCheck(
+                        challengedAt = row[AgentHealthChecks.challengedAt].toString(),
+                        respondedAt = row[AgentHealthChecks.respondedAt]?.toString(),
+                        roundTripMs = row[AgentHealthChecks.roundTripMs],
+                        result = row[AgentHealthChecks.result],
+                    )
+                }
+        }
+        call.respond(checks)
+    }
+
+    /**
+     * Decommissions an agent: history keeps its rows (probe_results FK), but
+     * the agent leaves every list, selection pool and health cycle, and its
+     * certificates are revoked so the identity is dead.
+     */
+    delete<AgentAdmin.BySlug> { resource ->
+        val (principal, orgId) = requireAuthWithOrg(call)
+        Interceptors.injectableInTx(
+            "agent.delete",
+            InterceptorContext(orgId = orgId, userId = principal.userId, extra = mutableMapOf("slug" to resource.slug)),
+        ) {
+            requireOrgWrite(orgId, principal.userId) { it.settings }
+            val agent = ProbeAgents.selectAll()
+                .where { (ProbeAgents.slug eq resource.slug) and (ProbeAgents.deleted eq false) }
+                .firstOrNull() ?: throw NotFoundException()
+            val agentId = agent[ProbeAgents.id]
+
+            // Free the slug (unique index) for future re-bootstraps; keep it
+            // recognizable in audit/history joins. varchar(64): trim the base
+            // so the suffix always fits.
+            val freedSlug = "${resource.slug.take(45)}-deleted-${Instant.now().epochSecond}"
+            ProbeAgents.update({ ProbeAgents.id eq agentId }) {
+                it[isActive] = false
+                it[deleted] = true
+                it[slug] = freedSlug
+            }
+            AgentCertificates.update({
+                (AgentCertificates.probeAgentId eq agentId) and (AgentCertificates.revoked eq false)
+            }) {
+                it[revoked] = true
+                it[revokedAt] = Instant.now()
+                it[revokedReason] = "agent deleted"
+            }
+            ServiceAllowedAgents.deleteWhere { probeAgentId eq agentId }
+            AgentBootstrapTokens.deleteWhere { (slug eq resource.slug) and (used eq false) }
+            AuditService.log(orgId, principal.userId, "delete.agent", "agent", resource.slug, entityDisplayName = resource.slug)
+        }
+
+        // Same channels the health feed uses — live clients drop the agent
+        // without waiting for a poll.
+        val removedEvent = buildJsonObject { put("agentSlug", resource.slug) }
+        RealtimePublisher.publish("agents:summary", AgentRegistrationController.GLOBAL_ORG, "agent.removed", removedEvent)
+        RealtimePublisher.publish("agents", AgentRegistrationController.GLOBAL_ORG, "agent.removed", removedEvent)
+
+        call.respond(mapOf("ok" to true))
+    }
+
+    /** Activates/deactivates an agent (inactive agents are never selected). */
+    patch<AgentAdmin.BySlug> { resource ->
+        val (principal, orgId) = requireAuthWithOrg(call)
+        val body = tryReceive<UpdateAgentRequest>(call)
+        Interceptors.injectableInTx(
+            "agent.update",
+            InterceptorContext(orgId = orgId, userId = principal.userId, extra = mutableMapOf("slug" to resource.slug)),
+        ) {
+            requireOrgWrite(orgId, principal.userId) { it.settings }
+            val updated = ProbeAgents.update({ (ProbeAgents.slug eq resource.slug) and (ProbeAgents.deleted eq false) }) {
+                it[isActive] = body.isActive
+            }
+            if (updated == 0) throw NotFoundException()
+            AuditService.log(
+                orgId, principal.userId,
+                if (body.isActive) "activate.agent" else "deactivate.agent",
+                "agent", resource.slug,
+                entityDisplayName = resource.slug,
+            )
+        }
+        call.respond(mapOf("ok" to true))
+    }
+}

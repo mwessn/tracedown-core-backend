@@ -1,0 +1,54 @@
+// Test: restricted user with no webhook permissions cannot manage webhooks
+
+// Login as admin — create a webhook
+post("$baseUrl/api/v1/auth/login", {
+  body: json({ email: "$adminEmail", password: "$adminPassword" })
+})
+.expect(status: 200)
+.store({ "$$adminToken": this.body.token })
+
+post("$baseUrl/api/v1/webhooks", {
+  headers: { Authorization: "Bearer $$adminToken" },
+  body: json({ name: "Admin Hook", url: "https://example.com/hook" })
+})
+.expect(status: 200)
+.store({ "$$whId": this.body.id })
+
+// Login as restricted user (no permissions)
+post("$baseUrl/api/v1/auth/login", {
+  body: json({ email: "$restrictedEmail", password: "$restrictedPassword" })
+})
+.expect(status: 200)
+.store({ "$$restrictedToken": this.body.token })
+
+// Cannot list webhooks
+get("$baseUrl/api/v1/webhooks", {
+  headers: { Authorization: "Bearer $$restrictedToken" }
+})
+.expect(status: 403)
+
+// Cannot create webhook
+post("$baseUrl/api/v1/webhooks", {
+  headers: { Authorization: "Bearer $$restrictedToken" },
+  body: json({ name: "Bad Hook", url: "https://evil.com" })
+})
+.expect(status: 403)
+
+// Cannot get webhook
+get("$baseUrl/api/v1/webhooks/$$whId", {
+  headers: { Authorization: "Bearer $$restrictedToken" }
+})
+.expect(status: 403)
+
+// Cannot update webhook
+patch("$baseUrl/api/v1/webhooks/$$whId", {
+  headers: { Authorization: "Bearer $$restrictedToken" },
+  body: json({ name: "Hacked" })
+})
+.expect(status: 403)
+
+// Cannot delete webhook
+delete("$baseUrl/api/v1/webhooks/$$whId", {
+  headers: { Authorization: "Bearer $$restrictedToken" }
+})
+.expect(status: 403)

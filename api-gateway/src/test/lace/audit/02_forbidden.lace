@@ -1,0 +1,14 @@
+// Audit log: restricted user cannot access audit log
+
+// Login as restricted user
+post("$baseUrl/api/v1/auth/login", {
+  body: json({ email: "$restrictedEmail", password: "$restrictedPassword" })
+})
+.expect(status: 200)
+.store({ "$$restrictedToken": this.body.token })
+
+// Cannot read audit log
+get("$baseUrl/api/v1/audit-log", {
+  headers: { Authorization: "Bearer $$restrictedToken" }
+})
+.expect(status: 403)

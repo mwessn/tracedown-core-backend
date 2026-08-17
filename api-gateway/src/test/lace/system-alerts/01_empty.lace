@@ -1,0 +1,40 @@
+// System alerts are raised by the platform (no create API), so on a clean org
+// the lists are empty. This covers the shape, the dismiss-not-found path, and
+// the settings-permission gate.
+
+post("$baseUrl/api/v1/auth/login", {
+  body: json({ email: "$adminEmail", password: "$adminPassword" })
+})
+.expect(status: 200)
+.store({ "$$token": this.body.token })
+
+// No alerts on a fresh org.
+get("$baseUrl/api/v1/system-alerts", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 200)
+
+// History is paged; the total reflects the empty org.
+get("$baseUrl/api/v1/system-alerts/history", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 200)
+.assert({ expect: [this.body.total eq 0] })
+
+// Dismissing an alert that does not exist is a not-found.
+post("$baseUrl/api/v1/system-alerts/00000000-0000-0000-0000-000000000000/dismiss", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 404)
+
+// A member without settings access cannot read alerts.
+post("$baseUrl/api/v1/auth/login", {
+  body: json({ email: "$restrictedEmail", password: "$restrictedPassword" })
+})
+.expect(status: 200)
+.store({ "$$restrictedToken": this.body.token })
+
+get("$baseUrl/api/v1/system-alerts", {
+  headers: { Authorization: "Bearer $$restrictedToken" }
+})
+.expect(status: 403)

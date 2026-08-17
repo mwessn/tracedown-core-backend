@@ -1,0 +1,77 @@
+// Workspace variable CRUD with all three types
+
+// Login
+post("$baseUrl/api/v1/auth/login", {
+  body: json({ email: "$adminEmail", password: "$adminPassword" })
+})
+.expect(status: 200)
+.store({ "$$token": this.body.token })
+
+// Create workspace
+post("$baseUrl/api/v1/workspaces", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ name: "VarTest" })
+})
+.expect(status: 200)
+.store({ "$$wsId": this.body.id })
+
+// Create a "variable" type (default) — encrypted at rest, masked by default
+post("$baseUrl/api/v1/workspaces/$$wsId/variables", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ key: "API_URL", value: "https://api.example.com", type: "variable" })
+})
+.expect(status: 200)
+.assert({
+  expect: [
+    this.body.key eq "API_URL",
+    this.body.type eq "variable",
+    this.body.value eq "••••••"
+  ]
+})
+.store({ "$$varId": this.body.id })
+
+// Create a "secret" type — encrypted, never visible
+post("$baseUrl/api/v1/workspaces/$$wsId/variables", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ key: "API_KEY", value: "sk-secret-123", type: "secret" })
+})
+.expect(status: 200)
+.assert({
+  expect: [
+    this.body.type eq "secret",
+    this.body.value eq "••••••"
+  ]
+})
+
+// Create a "metric" type — plaintext, always visible
+post("$baseUrl/api/v1/workspaces/$$wsId/variables", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ key: "REQUEST_COUNT", value: "0", type: "metric" })
+})
+.expect(status: 200)
+.assert({
+  expect: [
+    this.body.type eq "metric",
+    this.body.value eq "0"
+  ]
+})
+
+// Duplicate key should fail
+post("$baseUrl/api/v1/workspaces/$$wsId/variables", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ key: "API_URL", value: "other", type: "variable" })
+})
+.expect(status: 409)
+
+// Update variable value
+patch("$baseUrl/api/v1/workspaces/$$wsId/variables/$$varId", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ value: "https://api-v2.example.com" })
+})
+.expect(status: 200)
+
+// Delete variable
+delete("$baseUrl/api/v1/workspaces/$$wsId/variables/$$varId", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 200)

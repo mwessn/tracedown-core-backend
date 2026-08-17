@@ -1,0 +1,66 @@
+// Test: reveal endpoint decrypts variable-type but rejects secrets
+
+// Login
+post("$baseUrl/api/v1/auth/login", {
+  body: json({ email: "$adminEmail", password: "$adminPassword" })
+})
+.expect(status: 200)
+.store({ "$$token": this.body.token })
+
+// Create workspace
+post("$baseUrl/api/v1/workspaces", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ name: "RevealTest" })
+})
+.expect(status: 200)
+.store({ "$$wsId": this.body.id })
+
+// Create variable type
+post("$baseUrl/api/v1/workspaces/$$wsId/variables", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ key: "DB_HOST", value: "db.internal", type: "variable" })
+})
+.expect(status: 200)
+.store({ "$$varVarId": this.body.id })
+
+// Create secret type
+post("$baseUrl/api/v1/workspaces/$$wsId/variables", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ key: "DB_PASS", value: "supersecret", type: "secret" })
+})
+.expect(status: 200)
+.store({ "$$secretVarId": this.body.id })
+
+// Create metric type
+post("$baseUrl/api/v1/workspaces/$$wsId/variables", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ key: "UPTIME", value: "99.9", type: "metric" })
+})
+.expect(status: 200)
+.store({ "$$metricVarId": this.body.id })
+
+// Reveal variable type — should return decrypted value
+get("$baseUrl/api/v1/workspaces/$$wsId/variables/$$varVarId/reveal", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 200)
+.assert({ expect: [this.body.value eq "db.internal"] })
+
+// Reveal secret type — should be rejected
+get("$baseUrl/api/v1/workspaces/$$wsId/variables/$$secretVarId/reveal", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 400)
+
+// Reveal metric type — should return plain value
+get("$baseUrl/api/v1/workspaces/$$wsId/variables/$$metricVarId/reveal", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 200)
+.assert({ expect: [this.body.value eq "99.9"] })
+
+// List should still show masked values for encrypted types
+get("$baseUrl/api/v1/workspaces/$$wsId/variables", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 200)

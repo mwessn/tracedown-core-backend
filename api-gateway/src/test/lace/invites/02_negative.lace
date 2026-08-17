@@ -1,0 +1,17 @@
+// Invite negatives: auth required to send; bogus tokens on the public endpoints.
+
+// Sending requires authentication.
+post("$baseUrl/api/v1/invites", {
+  body: json({ email: "nobody@tracedown.dev" })
+})
+.expect(status: 401)
+
+// The public accept endpoint rejects an unknown token.
+post("$baseUrl/api/v1/invites/not-a-real-token/accept", {
+  body: json({ password: "Whatever1!", displayName: "Nobody" })
+})
+.expect(status: 401)
+
+// The public info endpoint returns nothing for an unknown token.
+get("$baseUrl/api/v1/invites/not-a-real-token")
+.expect(status: [401, 404])

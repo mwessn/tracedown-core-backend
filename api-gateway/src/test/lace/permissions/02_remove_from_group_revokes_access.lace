@@ -1,0 +1,61 @@
+// Removing a user from a group should revoke the group-granted permissions.
+// The 'restricted' user has no direct permissions and is not in any group.
+
+// Login as admin
+post("$baseUrl/api/v1/auth/login", {
+  body: json({ email: "$adminEmail", password: "$adminPassword" })
+})
+.expect(status: 200)
+.store({ "$$adminToken": this.body.token })
+
+// Create a group with users=read
+post("$baseUrl/api/v1/groups", {
+  headers: { Authorization: "Bearer $$adminToken" },
+  body: json({ name: "TempAccess" })
+})
+.expect(status: 200)
+.store({ "$$groupId": this.body.id })
+
+patch("$baseUrl/api/v1/groups/$$groupId", {
+  headers: { Authorization: "Bearer $$adminToken" },
+  body: json({ users: 1 })
+})
+.expect(status: 200)
+
+// Add restricted user to the group
+post("$baseUrl/api/v1/groups/$$groupId/members", {
+  headers: { Authorization: "Bearer $$adminToken" },
+  body: json({ userId: "$restrictedId" })
+})
+.expect(status: 200)
+
+// Restricted user can now list groups
+post("$baseUrl/api/v1/auth/login", {
+  body: json({ email: "$restrictedEmail", password: "$restrictedPassword" })
+})
+.expect(status: 200)
+.store({ "$$restrictedToken": this.body.token })
+
+get("$baseUrl/api/v1/groups", {
+  headers: { Authorization: "Bearer $$restrictedToken" }
+})
+.expect(status: 200)
+
+// Remove restricted user from the group
+delete("$baseUrl/api/v1/groups/$$groupId/members/$restrictedId", {
+  headers: { Authorization: "Bearer $$adminToken" }
+})
+.expect(status: 200)
+
+// Re-login to get fresh session with updated cache
+post("$baseUrl/api/v1/auth/login", {
+  body: json({ email: "$restrictedEmail", password: "$restrictedPassword" })
+})
+.expect(status: 200)
+.store({ "$$restrictedToken2": this.body.token })
+
+// Restricted user should now be denied
+get("$baseUrl/api/v1/groups", {
+  headers: { Authorization: "Bearer $$restrictedToken2" }
+})
+.expect(status: 403)

@@ -1,0 +1,90 @@
+# Resource-limits overlay — approximates a small production VM (~8 vCPU /
+# ~7 GB for the stack) so load tests surface OOM kills, CPU throttling and
+# GC pressure instead of borrowing the whole dev machine.
+#
+# Opt-in:
+#   docker compose -f docker-compose.yml -f docker-compose.limits.yml up -d
+#
+# JVM services get JAVA_TOOL_OPTIONS so the heap sizes itself from the
+# container cap (default is only 25% of it) — the JVM picks this env var up
+# automatically, no Dockerfile changes.
+#
+# The probe agent and test-api are not compose-managed. Cap the agent live:
+#   docker update --cpus 2 --memory 3g --memory-swap 3g tracedown-agent-dev-agent
+# test-api stays uncapped on purpose — it plays "the internet", not the stack.
+#
+# DB_POOL_SIZE shrinks each service's Hikari pool (default 10; Hikari fills
+# to max eagerly, so 8 JVM services = 80 idle connections otherwise).
+# Takes effect once images carry the DB_POOL_SIZE-aware DatabaseFactory.
+
+x-jvm-env: &jvm-env
+  JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=60"
+
+services:
+  tracedown-postgres:
+    cpus: 2
+    mem_limit: 2g
+
+  tracedown-redis-a:
+    cpus: 0.5
+    mem_limit: 512m
+
+  tracedown-gateway:
+    cpus: 1
+    mem_limit: 768m
+    environment:
+      <<: *jvm-env
+      DB_POOL_SIZE: "6"
+
+  tracedown-scheduler:
+    cpus: 1
+    mem_limit: 768m
+    environment:
+      <<: *jvm-env
+      DB_POOL_SIZE: "6"
+
+  tracedown-ingestor:
+    cpus: 1
+    mem_limit: 512m
+    environment:
+      <<: *jvm-env
+      DB_POOL_SIZE: "4"
+
+  tracedown-dispatcher:
+    cpus: 0.5
+    mem_limit: 512m
+    environment:
+      <<: *jvm-env
+      DB_POOL_SIZE: "3"
+
+  tracedown-email:
+    cpus: 0.25
+    mem_limit: 384m
+    environment:
+      <<: *jvm-env
+      DB_POOL_SIZE: "2"
+
+  tracedown-metrics:
+    cpus: 0.5
+    mem_limit: 512m
+    environment:
+      <<: *jvm-env
+      DB_POOL_SIZE: "3"
+
+  tracedown-worker:
+    cpus: 0.5
+    mem_limit: 512m
+    environment:
+      <<: *jvm-env
+      DB_POOL_SIZE: "3"
+
+  tracedown-realtime:
+    cpus: 0.5
+    mem_limit: 384m
+    environment:
+      <<: *jvm-env
+      DB_POOL_SIZE: "2"
+
+  tracedown-nginx:
+    cpus: 0.5
+    mem_limit: 128m

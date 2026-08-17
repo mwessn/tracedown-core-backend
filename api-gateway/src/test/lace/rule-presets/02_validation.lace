@@ -1,0 +1,21 @@
+// Preset creation validates both the name and the Lace script.
+
+post("$baseUrl/api/v1/auth/login", {
+  body: json({ email: "$adminEmail", password: "$adminPassword" })
+})
+.expect(status: 200)
+.store({ "$$token": this.body.token })
+
+// A script that is not valid Lace is rejected.
+post("$baseUrl/api/v1/rule-presets", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ name: "Broken", script: "this is not lace" })
+})
+.expect(status: 400)
+
+// A blank name is rejected.
+post("$baseUrl/api/v1/rule-presets", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ name: "", script: "get(\"https://example.com/\").expect(status: 200)" })
+})
+.expect(status: 400)
