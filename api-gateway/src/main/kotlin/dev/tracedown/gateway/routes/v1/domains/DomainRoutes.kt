@@ -26,6 +26,10 @@ class Domains {
     class ById(val parent: Domains = Domains(), val domainId: String) {
         @Resource("verify")
         class Verify(val parent: ById)
+
+        @Resource("dns-handoff")
+        class DnsHandoff(val parent: ById)
+
     }
 }
 
@@ -65,6 +69,13 @@ fun Route.domainRoutes() {
         val domainId = parseUuid(resource.domainId, "domain ID")
         DomainController.delete(orgId, domainId, principal.userId)
         call.respond(mapOf("ok" to true))
+    }
+
+    /** Where this domain's DNS records are edited, when we recognise the provider. */
+    get<Domains.ById.DnsHandoff> { resource ->
+        val (principal, orgId) = requireAuthWithOrg(call)
+        val domainId = parseUuid(resource.parent.domainId, "domain ID")
+        call.respond(DomainController.dnsHandoff(orgId, domainId, principal.userId))
     }
 
     /** Triggers domain verification. Checks the challenge token via HTTP or DNS. */
