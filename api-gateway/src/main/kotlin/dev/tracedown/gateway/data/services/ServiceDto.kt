@@ -60,6 +60,68 @@ data class ToggleServiceRequest(
     val isActive: Boolean,
 )
 
+/**
+ * One service a scoped toggle did not act on, and why.
+ *
+ * A scope is a blunt instrument — it names a project, not the services in it —
+ * so some of what it sweeps up will not be actionable. Naming each one is the
+ * difference between "34 of 40 enabled" and knowing which six to go and fix.
+ */
+@Serializable
+data class SkippedService(
+    val serviceId: String,
+    val name: String,
+    /** `forbidden`, `script_missing` or `script_invalid`. */
+    val reason: String,
+)
+
+/** Outcome of enabling or disabling every service in a project or workspace. */
+@Serializable
+data class ScopedToggleResult(
+    /** Services the scope covered, before any were filtered out. */
+    val matched: Int,
+    /** Services whose `isActive` actually moved. */
+    val changed: Int,
+    /**
+     * Already in the requested state, so left untouched. Counted rather than
+     * listed: this is the ordinary case for a re-run, not something to act on.
+     */
+    val unchanged: Int,
+    /**
+     * Covered by the scope but not acted on — see [SkippedService.reason].
+     *
+     * A SAMPLE, capped at [SKIPPED_DETAIL_LIMIT]. Nothing bounds how many
+     * services a scope holds — Core gates none of it — so a workspace of five
+     * thousand scriptless services would otherwise put five thousand rows in
+     * this response and five thousand nodes in the dialog that renders it.
+     * [skippedTotal] carries the real figure.
+     */
+    val skipped: List<SkippedService>,
+    /**
+     * How many were skipped in total. Equals `skipped.size` until the sample is
+     * capped, after which it keeps counting — so the caller can say "and 4,950
+     * more" instead of implying the list is complete.
+     */
+    val skippedTotal: Int,
+    /**
+     * Skip count per reason, over ALL skips rather than the capped sample.
+     *
+     * This is what stays useful as the scope grows: fifty names out of five
+     * thousand tells the reader almost nothing, while "4,950 have no script
+     * yet, 2 you cannot edit" tells them exactly what to go and do.
+     */
+    val skippedByReason: Map<String, Int>,
+)
+
+/**
+ * How many skipped services a scoped toggle names individually.
+ *
+ * Enough to act on — a handful of broken scripts is the case worth listing by
+ * name — without letting the response scale with the size of the scope. Past
+ * this, the count is the useful information, not another thousand names.
+ */
+const val SKIPPED_DETAIL_LIMIT = 50
+
 /** Returned when script validation fails. */
 @Serializable
 data class ScriptValidationError(
