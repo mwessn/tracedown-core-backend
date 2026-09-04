@@ -13,6 +13,7 @@ import dev.tracedown.common.models.AgentCertificates
 import dev.tracedown.common.models.AgentHealthChecks
 import dev.tracedown.common.models.ServiceAllowedAgents
 import dev.tracedown.common.models.ProbeAgents
+import dev.tracedown.common.agents.AgentEnrolmentAddress
 import dev.tracedown.common.agents.FleetAudience
 import dev.tracedown.common.validation.Validatable
 import dev.tracedown.common.validation.Validators
@@ -20,6 +21,7 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import dev.tracedown.gateway.routes.v1.auth.requireAuthWithOrg
 import dev.tracedown.gateway.util.BadRequestException
+import dev.tracedown.gateway.util.ConflictException
 import dev.tracedown.gateway.util.NotFoundException
 import dev.tracedown.gateway.util.requireOrgRead
 import dev.tracedown.gateway.util.requireOrgWrite
@@ -68,9 +70,21 @@ data class CreateBootstrapTokenRequest(val slug: String, val label: String? = nu
     }
 }
 
-/** The raw token is shown exactly once — only its hash is stored. */
+/**
+ * The raw token is shown exactly once — only its hash is stored.
+ *
+ * `schedulerUrl` is the base URL the agent must dial with it
+ * (`PROBE_AGENT_SCHEDULER_URL`), from [AgentEnrolmentAddress]; null when the
+ * deployment has not configured one, in which case the dashboard shows a
+ * placeholder rather than an address that is only right on one network.
+ */
 @Serializable
-data class BootstrapTokenResponse(val slug: String, val token: String, val expiresAt: String)
+data class BootstrapTokenResponse(
+    val slug: String,
+    val token: String,
+    val expiresAt: String,
+    val schedulerUrl: String? = null,
+)
 
 /**
  * Partial update — an absent field is left as it is.
@@ -184,6 +198,12 @@ fun Route.agentAdminRoutes() {
             ),
         ) {
             requireOrgWrite(orgId, principal.userId) { it.settings }
+            // Registration refuses a slug that is already an agent, so a token
+            // for one can never be redeemed — refuse it here, where the person
+            // asking can still pick another name. Deleted agents do not hold
+            // their slug (it is renamed to free it), so any row counts.
+            val taken = ProbeAgents.selectAll().where { ProbeAgents.slug eq slug }.empty().not()
+            if (taken) throw ConflictException(ErrorCodes.AGENT_SLUG_TAKEN)
             // The signing CA is created lazily on the very first bootstrap.
             CaService.ensureCaRoot()
             // A fresh token supersedes any outstanding one for the slug — the
@@ -208,7 +228,14 @@ fun Route.agentAdminRoutes() {
             AuditService.log(orgId, principal.userId, "create.agent_bootstrap_token", "agent", slug, entityDisplayName = slug)
         }
 
-        call.respond(BootstrapTokenResponse(slug = slug, token = token, expiresAt = expiresAt.toString()))
+        call.respond(
+            BootstrapTokenResponse(
+                slug = slug,
+                token = token,
+                expiresAt = expiresAt.toString(),
+                schedulerUrl = AgentEnrolmentAddress.resolve(),
+            ),
+        )
     }
 
     /**
