@@ -1,7 +1,9 @@
 package dev.tracedown.worker.config
 
+import dev.tracedown.common.storage.BodyConfinement
 import dev.tracedown.common.storage.S3Config
 import io.ktor.server.application.ApplicationEnvironment
+import java.nio.file.Path
 import java.time.Duration
 
 data class DatabaseConfig(
@@ -48,6 +50,12 @@ data class WorkerConfig(
     val jobIntervals: JobIntervals,
     /** S3-compatible storage config. Null if only filesystem storage is used. */
     val s3Config: S3Config?,
+    /**
+     * Where platform storage lives — the same root, bucket and prefix the ingestor
+     * relocates bodies into. Deletions are confined to it: a stored URI outside it
+     * names a body the platform does not own and is skipped, never deleted.
+     */
+    val bodyConfinement: BodyConfinement,
 ) {
     companion object {
         /** Loads configuration from the Ktor application environment. */
@@ -95,6 +103,25 @@ data class WorkerConfig(
                         secretKey = config.property("storage.s3.secretKey").getString(),
                         region = config.propertyOrNull("storage.s3.region")?.getString()?.takeIf { it.isNotBlank() } ?: "auto",
                         timeoutSeconds = config.propertyOrNull("storage.s3.timeoutSeconds")?.getString()?.toLongOrNull() ?: 30L,
+                    )
+                },
+                bodyConfinement = run {
+                    val root = config.propertyOrNull("storage.filesystemRoot")?.getString()?.takeIf { it.isNotBlank() }
+                    val bucket = config.propertyOrNull("storage.s3.bucket")?.getString()?.takeIf { it.isNotBlank() }
+                    // Deletions are confined to platform storage — but only to
+                    // what the operator actually named. A worker upgraded into
+                    // this release without STORAGE_S3_BUCKET or
+                    // STORAGE_FILESYSTEM_ROOT keeps deleting as it did, rather
+                    // than purging rows and orphaning every object behind them;
+                    // Application says so at startup.
+                    BodyConfinement(
+                        filesystemRoot = root?.let { Path.of(it) },
+                        s3Bucket = bucket,
+                        s3KeyPrefix = config.propertyOrNull("storage.s3.prefix")?.getString() ?: "",
+                        unconfinedSchemes = buildSet {
+                            if (root == null) add("file")
+                            if (bucket == null) add("s3")
+                        },
                     )
                 },
             )

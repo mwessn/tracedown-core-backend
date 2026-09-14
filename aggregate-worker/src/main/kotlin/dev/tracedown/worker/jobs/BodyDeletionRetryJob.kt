@@ -3,6 +3,7 @@ package dev.tracedown.worker.jobs
 import dev.tracedown.common.config.ioTransaction
 import dev.tracedown.common.models.PendingBodyDeletions
 import dev.tracedown.common.storage.BodyStorageClient
+import dev.tracedown.common.storage.StorageConfinementException
 import org.jetbrains.exposed.v1.core.SortOrder
 import org.jetbrains.exposed.v1.jdbc.select
 import org.jetbrains.exposed.v1.jdbc.selectAll
@@ -30,6 +31,8 @@ private val log = LoggerFactory.getLogger("dev.tracedown.worker.jobs.BodyDeletio
  * the orphan the table exists to prevent. A URI that no longer exists in storage
  * counts as deleted — [BodyStorageClient.delete] does not treat a missing object
  * as an error — so a bucket cleaned out by other means drains this table too.
+ * A URI the client refuses on confinement is not the platform's to delete (a
+ * body kept outside platform storage) and is cleared the same way.
  */
 class BodyDeletionRetryJob(
     private val storageClient: BodyStorageClient,
@@ -55,10 +58,19 @@ class BodyDeletionRetryJob(
         // unreachable store must not hold a pooled connection for the batch.
         val settled = mutableListOf<String>()
         val stillFailing = mutableListOf<Pair<String, String?>>()
+        var skipped = 0
 
         for ((uri, attempts) in pending) {
             try {
                 storageClient.delete(uri)
+                settled.add(uri)
+            } catch (e: StorageConfinementException) {
+                // Cleared, not retried: it names a body outside platform storage,
+                // which is not the platform's to delete and would otherwise sit
+                // in this table forever. WARN because the row should not exist —
+                // nothing writes an out-of-storage URI here on purpose.
+                log.warn("Pending body {} is outside platform storage — not deleting it: {}", uri, e.message)
+                skipped++
                 settled.add(uri)
             } catch (e: Exception) {
                 stillFailing.add(uri to e.message)
@@ -82,6 +94,9 @@ class BodyDeletionRetryJob(
         }
         if (stillFailing.isNotEmpty()) {
             log.warn("Body deletion retry: {} object(s) still pending deletion", stillFailing.size)
+        }
+        if (skipped > 0) {
+            log.warn("Body deletion retry: {} of {} pending object(s) were outside platform storage", skipped, pending.size)
         }
     }
 }

@@ -137,6 +137,34 @@ open class VariableCryptoEngine(
         return String(cipher.doFinal(Base64.getDecoder().decode(encryptedBase64)), Charsets.UTF_8)
     }
 
+    // ── Key-bound AES-GCM (credentials that belong to no organization) ──
+
+    /**
+     * Encrypts [plaintext] AES-256-GCM under this engine's key, binding it to
+     * [context] as additional authenticated data (e.g. `body_store:<id>`), so a
+     * ciphertext copied onto another row does not decrypt. Returns
+     * (ciphertextBase64, ivBase64). Body store credentials use it through
+     * `storage/BodyStoreCrypto`, on a key of their own.
+     */
+    fun encryptBound(plaintext: String, context: String): Pair<String, String> {
+        val iv = ByteArray(GCM_IV_BYTES).also(random::nextBytes)
+        val cipher = Cipher.getInstance(GCM_TRANSFORM)
+        cipher.init(Cipher.ENCRYPT_MODE, kek, GCMParameterSpec(GCM_TAG_BITS, iv))
+        cipher.updateAAD(context.toByteArray(Charsets.UTF_8))
+        val ct = cipher.doFinal(plaintext.toByteArray(Charsets.UTF_8))
+        val enc = Base64.getEncoder()
+        return enc.encodeToString(ct) to enc.encodeToString(iv)
+    }
+
+    /** Decrypts a value written by [encryptBound] for the same [context]. */
+    fun decryptBound(ciphertextBase64: String, ivBase64: String, context: String): String {
+        val dec = Base64.getDecoder()
+        val cipher = Cipher.getInstance(GCM_TRANSFORM)
+        cipher.init(Cipher.DECRYPT_MODE, kek, GCMParameterSpec(GCM_TAG_BITS, dec.decode(ivBase64)))
+        cipher.updateAAD(context.toByteArray(Charsets.UTF_8))
+        return String(cipher.doFinal(dec.decode(ciphertextBase64)), Charsets.UTF_8)
+    }
+
     // ── KEK rotation groundwork ──
 
     /** Outcome of a KEK re-wrap pass over all org DEKs. */
@@ -360,4 +388,7 @@ object VariableCrypto {
     /** Decrypts a platform-key value from its encrypted + IV base64 strings. */
     fun decrypt(encryptedBase64: String, ivBase64: String): String =
         engine().decryptLegacy(encryptedBase64, ivBase64)
+
+    /** True once [init] has run — a service without the platform key configured cannot decrypt. */
+    fun isInitialized(): Boolean = engine != null
 }

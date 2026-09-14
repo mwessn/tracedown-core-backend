@@ -21,6 +21,8 @@ data class StorageConfig(
     val s3: S3Config?,
     val s3Bucket: String?,
     val s3Prefix: String,
+    /** Comma-separated directories a filesystem body store's root must lie inside. */
+    val bodyStoreFilesystemBases: String?,
 )
 
 data class IngestorConfig(
@@ -28,6 +30,21 @@ data class IngestorConfig(
     val redisAUrl: String,
     val popTimeoutSeconds: Long,
     val storage: StorageConfig,
+    /**
+     * `BODY_STORE_AES_KEY` — the key a body store's credentials are encrypted
+     * with, needed when an agent imports from its own S3 store. Null when not
+     * configured: such imports then fail and the body is recorded as unavailable.
+     * It must match the gateway's. The platform key is deliberately not read
+     * here: nothing else in this service decrypts anything.
+     */
+    val bodyStoreAesKey: String?,
+    /**
+     * `BODY_STORE_PRIVATE_ENDPOINTS` — allow a store endpoint over `http` or on
+     * a private / internal host. Must match the gateway's, or a store the
+     * gateway accepted cannot be read here.
+     */
+    val bodyStorePrivateEndpoints: Boolean,
+    val deploymentEnvironment: String?,
 ) {
     companion object {
         /** Loads configuration from the Ktor application environment. */
@@ -59,7 +76,12 @@ data class IngestorConfig(
                     s3Bucket = config.propertyOrNull("storage.s3.bucket")?.getString()
                         ?.takeIf { it.isNotBlank() },
                     s3Prefix = config.propertyOrNull("storage.s3.prefix")?.getString() ?: "",
+                    bodyStoreFilesystemBases = config.propertyOrNull("storage.stores.filesystemBases")?.getString(),
                 ),
+                bodyStoreAesKey = config.propertyOrNull("storage.stores.aesKey")?.getString()?.takeIf { it.isNotBlank() },
+                bodyStorePrivateEndpoints = config.propertyOrNull("storage.stores.privateEndpoints")
+                    ?.getString()?.trim()?.lowercase() == "true",
+                deploymentEnvironment = config.propertyOrNull("deployment.environment")?.getString(),
             )
         }
     }

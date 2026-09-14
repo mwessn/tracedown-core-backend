@@ -15,6 +15,7 @@ import dev.tracedown.gateway.controllers.integrations.GrafanaIntegrationControll
 import dev.tracedown.gateway.cli.AgentBootstrap
 import dev.tracedown.gateway.cli.AgentRemove
 import dev.tracedown.gateway.cli.OrgBootstrap
+import dev.tracedown.gateway.cli.RewrapBodyStores
 import dev.tracedown.gateway.cli.RewrapOrgKeys
 import dev.tracedown.gateway.jobs.SecretReencryption
 import dev.tracedown.common.onboarding.OrgService
@@ -43,6 +44,7 @@ import dev.tracedown.gateway.routes.v1.metrics.usageRoutes
 import dev.tracedown.gateway.routes.v1.orgs.permissionRoutes
 import dev.tracedown.gateway.routes.v1.orgs.resourceAccessRoutes
 import dev.tracedown.gateway.routes.v1.agents.agentAdminRoutes
+import dev.tracedown.gateway.routes.v1.agents.bodyStoreRoutes
 import dev.tracedown.gateway.routes.v1.presets.rulePresetRoutes
 import dev.tracedown.gateway.routes.v1.projects.projectRoutes
 import dev.tracedown.gateway.routes.v1.services.serviceRoutes
@@ -102,6 +104,7 @@ fun main(args: Array<String>) {
     if (AgentRemove.handle(args)) return
     if (OrgBootstrap.handle(args)) return
     if (RewrapOrgKeys.handle(args)) return
+    if (RewrapBodyStores.handle(args)) return
     EngineMain.main(args)
 }
 
@@ -245,18 +248,46 @@ fun Application.module() {
                 timeoutSeconds = storageConf.propertyOrNull("storage.s3.timeoutSeconds")?.getString()?.toLongOrNull() ?: 30L,
             )
         }
+    val storageRoot = storageConf.propertyOrNull("storage.filesystemRoot")?.getString() ?: "/data/bodies"
+    val storageBucket = storageConf.propertyOrNull("storage.s3.bucket")?.getString()?.takeIf { it.isNotBlank() }
+    val storagePrefix = storageConf.propertyOrNull("storage.s3.prefix")?.getString() ?: ""
     dev.tracedown.gateway.controllers.results.ProbeResultController.init(
         dev.tracedown.common.storage.BodyStorageClient(
             s3Config = storageS3,
             confinement = dev.tracedown.common.storage.BodyConfinement(
-                filesystemRoot = java.nio.file.Path.of(
-                    storageConf.propertyOrNull("storage.filesystemRoot")?.getString() ?: "/data/bodies",
-                ),
-                s3Bucket = storageConf.propertyOrNull("storage.s3.bucket")?.getString()?.takeIf { it.isNotBlank() },
-                s3KeyPrefix = storageConf.propertyOrNull("storage.s3.prefix")?.getString() ?: "",
+                filesystemRoot = java.nio.file.Path.of(storageRoot),
+                s3Bucket = storageBucket,
+                s3KeyPrefix = storagePrefix,
             ),
         )
     )
+    // Body stores: other places agents may keep bodies. The registry builds a
+    // confined client per store; the default store above is described for the
+    // dashboard (and so a store can never be created over it).
+    dev.tracedown.common.storage.BodyStoreRegistry.configure(
+        filesystemBases = storageConf.propertyOrNull("storage.stores.filesystemBases")?.getString(),
+        allowPrivateEndpoints = storageConf.propertyOrNull("storage.stores.privateEndpoints")
+            ?.getString()?.trim()?.lowercase() == "true",
+        timeoutSeconds = storageS3?.timeoutSeconds ?: 30L,
+    )
+    // A store's credentials sit under their own key, not the platform one: the
+    // result-ingestor needs them too and has no business holding the key that
+    // unwraps TOTP secrets, the CA root and every org's data-encryption key.
+    storageConf.propertyOrNull("storage.stores.aesKey")?.getString()?.takeIf { it.isNotBlank() }
+        ?.let { dev.tracedown.common.storage.BodyStoreCrypto.init(it) }
+    dev.tracedown.common.storage.BodyStoreService.configureDefault(
+        if (storageS3 != null) {
+            dev.tracedown.common.storage.DefaultBodyStore(
+                kind = "s3", bucket = storageBucket, prefix = storagePrefix.trim('/').ifEmpty { null },
+                endpoint = storageS3.endpoint, filesystemRoot = storageRoot,
+            )
+        } else {
+            dev.tracedown.common.storage.DefaultBodyStore(kind = "filesystem", rootPath = storageRoot, filesystemRoot = storageRoot)
+        },
+    )
+    // Said once, loudly: with stores configured and no key, every read of a
+    // body in one fails and the reason only shows per request.
+    dev.tracedown.common.storage.BodyStoreService.warnIfSecretsUnreadable("api-gateway")
 
     // Provider, not an instance: constructing it must not force the lazy
     // connection and drag Redis into module init (see EmailPublisher).
@@ -498,6 +529,7 @@ fun Application.module() {
         resourceAccessRoutes()
         rulePresetRoutes()
         agentAdminRoutes()
+        bodyStoreRoutes()
         workspaceRoutes()
         projectRoutes()
         serviceRoutes()
