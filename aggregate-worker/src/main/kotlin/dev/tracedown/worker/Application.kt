@@ -103,7 +103,14 @@ fun Application.module() {
             resultRetentionDays = config.resultRetentionDays,
         )
     )
-    jobScope.launchJob(RetentionJob(defaultRetentionDays = config.resultRetentionDays, storageClient = storageClient, intervalSeconds = intervals.retentionSeconds))
+    jobScope.launchJob(
+        RetentionJob(
+            defaultRetentionDays = config.resultRetentionDays,
+            storageClient = storageClient,
+            defaultBodyRetentionDays = config.bodyRetentionDays,
+            intervalSeconds = intervals.retentionSeconds,
+        )
+    )
     jobScope.launchJob(AggregateRetentionJob(hourlyRetentionDays = config.hourlyAggregateRetentionDays, intervalSeconds = intervals.retentionSeconds))
     jobScope.launchJob(PurgeJob(storageClient = storageClient, intervalSeconds = intervals.purgeSeconds))
     // Finishes the body deletions retention and purge could not complete. Without
@@ -137,9 +144,17 @@ fun Application.module() {
         ),
     )
 
+    // The effective rule, not the raw numbers: -1 reads as a number and the
+    // thing an operator needs to see is whether bodies have a life of their own.
     log.info(
-        "aggregate-worker started (resultRetentionDays={}, hourlyAggregateRetentionDays={})",
-        config.resultRetentionDays, config.hourlyAggregateRetentionDays
+        "aggregate-worker started (results: {}, response bodies: {}, hourlyAggregateRetentionDays={})",
+        if (config.resultRetentionDays > 0) "${config.resultRetentionDays}d" else "never expire by age",
+        if (config.bodyRetentionDays > 0) {
+            "${config.bodyRetentionDays}d, or with their result, whichever comes first"
+        } else {
+            "no window of their own — bodies follow their results"
+        },
+        config.hourlyAggregateRetentionDays
     )
 
     // Shutdown hooks

@@ -1,0 +1,54 @@
+-- The index behind the retention body pass: "which of this organization's
+-- expired-by-body-window results still have a body the platform owns?"
+--
+-- The pass drives off probe_results — its (organization_id, started_at) index
+-- answers "whose bodies are old", bounded at both ends by a per-organization
+-- watermark — and probes probe_steps once per result it finds. This index is
+-- what that probe reads.
+--
+-- Measured on PostgreSQL 18.6 against 2.5M results / 5M steps (702 MB of
+-- probe_steps), of which 123,750 rows (2.5%) carry a default-store body, for an
+-- organization with nothing left to expire — the steady state, and the shape
+-- that runs every tick:
+--
+--   watermark-bounded (what the job runs), one tick's window:
+--       Index Scan on idx_probe_results_org, probe_steps never probed
+--       0.04 ms, 3 buffers
+--   first run, window floored at the result cutoff (335 days), with this index:
+--       Index Scan using idx_probe_steps_expirable_body, 57 ms, 175k buffers
+--   the same first-run window without it:
+--       Index Scan using idx_probe_steps_result (the FK index) plus a filter,
+--       340 ms, 262k buffers — every step row of the organization read to
+--       discard the 97.5% that carry no body
+--
+-- For an organization that does have bodies in the window, the LIMIT fills
+-- early and the same first-run query costs 12 ms with this index against 292 ms
+-- without it.
+--
+-- So the watermark is what keeps an ordinary tick free, and this index is what
+-- keeps the first run — and any tick that finds real work — off the FK index's
+-- full step history. The predicate is what keeps it cheap: 3.8 MB against a
+-- 702 MB table, where the FK index over the same rows is 118 MB.
+-- body_store_id IS NULL is part of the predicate because a body in an in_place
+-- store belongs to the store owner and is never expired by the platform, so
+-- those rows should not be in the index at all.
+--
+-- It is alone in its own migration on purpose. probe_steps is the largest table
+-- in the schema, and a plain CREATE INDEX holds a SHARE lock on it for the whole
+-- scan, which blocks ingestion. An operator with a big enough table can build it
+-- by hand before deploying this release:
+--
+--   CREATE INDEX CONCURRENTLY idx_probe_steps_expirable_body
+--       ON probe_steps (probe_result_id)
+--       WHERE response_body_storage_url IS NOT NULL AND body_store_id IS NULL;
+--
+-- and IF NOT EXISTS then makes this migration a no-op.
+--
+-- Why the migration cannot simply say CONCURRENTLY itself: Flyway takes a
+-- PostgreSQL advisory lock inside a transaction and holds it across the whole
+-- migration run, and CREATE INDEX CONCURRENTLY waits for every transaction that
+-- can see the table to finish — including Flyway's own. It does not fail; it
+-- hangs forever. See V1789375635__index_probe_steps_body_store_id.
+CREATE INDEX IF NOT EXISTS idx_probe_steps_expirable_body
+    ON probe_steps (probe_result_id)
+    WHERE response_body_storage_url IS NOT NULL AND body_store_id IS NULL;
