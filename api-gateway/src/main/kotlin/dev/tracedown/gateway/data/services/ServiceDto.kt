@@ -164,8 +164,9 @@ data class ScriptValidation(
     )
     val domainsChecked: Boolean = false,
     @JsonSchema.Description(
-        "Whether everything a save would judge was judged: false when a call's host is in `targets.unresolved`, or " +
-            "when the verified-domain rules apply and were not checked. `valid` with `complete` is a save's verdict.",
+        "Whether everything a save would judge was judged: false when a call's host is in `targets.unresolved`, when " +
+            "the verified-domain rules apply and were not checked, or when they apply and no `serviceId` was given " +
+            "(there is no schedule to judge the interval rule against). `valid` with `complete` is a save's verdict.",
     )
     val complete: Boolean = false,
 )

@@ -333,7 +333,8 @@ object PublicApiOperations {
             "Returns a step's stored response body",
             "As text in the response: `content`, `contentType` (null when not known) and `encoding` (`base64` when the " +
                 "bytes are not UTF-8 text or the text carries control characters, null otherwise). Bodies over 4 MiB are " +
-                "refused with 413 `body_too_large` (`details.maxBytes`); `getStepBodyRaw` serves those. 410 " +
+                "refused with 413 `body_too_large` (`details.maxBytes`); `getStepBodyRaw` serves those. A client that " +
+                "takes nothing of the answer for 20 seconds, or has not taken all of it after 10 minutes, is cut off. 410 " +
                 "`body_gone` when the step recorded a body that is no longer there; 204 when it stored none " +
                 "(`hasBody: false`). 503 `body_store_unavailable` (with `Retry-After`) is worth retrying with backoff; " +
                 "a read can take up to about 10 seconds to be refused that way.",
@@ -345,7 +346,8 @@ object PublicApiOperations {
                 "(`application/octet-stream` otherwise), with `Content-Length`, `Content-Disposition: attachment` and " +
                 "`X-Content-Type-Options: nosniff`. Up to the store's own limit, 32 MiB (413 `body_too_large`, " +
                 "`details.maxBytes`); never a link to where it is kept. HEAD answers the headers alone, from a size " +
-                "lookup. A client that has not taken the body within 60 seconds is cut off. Otherwise as " +
+                "lookup. A client that takes nothing for 20 seconds, or has not taken the whole body after 10 minutes, is " +
+                "cut off. Otherwise as " +
                 "`getStepBody`: 204 when no body was stored, 410 `body_gone`, 503 `body_store_unavailable` with " +
                 "`Retry-After`. Errors are JSON.",
             noContent = "The step stored no body.", binary = true,
@@ -363,7 +365,9 @@ object PublicApiOperations {
                 "`targets.unresolved` and judged by neither policy. Without `serviceId` there are no variables (calls " +
                 "whose host comes from one are unresolved). Verified-domain coverage is judged only for a caller who " +
                 "may read the organization's domains — `domainsChecked` says whether it was — and only over calls whose " +
-                "host is known. So `valid` means nothing this caller can judge refuses the script; with `complete` " +
+                "host is known; without `serviceId` there is no schedule, so the interval rule is not judged and " +
+                "`complete` is false wherever verified domains are asked for. So `valid` means nothing this caller can " +
+                "judge refuses the script; with `complete` " +
                 "true as well it is a save's verdict. Targets are always named as the script writes them. It changes nothing, so a read-only key may call it, and it takes no " +
                 "`Idempotency-Key`.",
             request = typeOf<ValidateScriptRequest>(), response = typeOf<ScriptValidation>(), idempotent = false,

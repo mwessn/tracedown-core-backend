@@ -1157,7 +1157,10 @@ object ServiceController {
                 errors = errors,
                 domainsChecked = domain != null,
                 // Everything a save would judge was judged here.
-                complete = unresolved.isEmpty() && (domain != null || trustedDomainMode),
+                // Every rule judged: no host unknown, and where verified
+                // domains are asked for, judged — with a service, whose
+                // schedule the interval rule needs.
+                complete = unresolved.isEmpty() && (trustedDomainMode || (domain != null && serviceId != null)),
                 targets = ScriptTargets(
                     blocked = blocked.map { BlockedTarget(source = it.source ?: "", reason = it.reason ?: "") },
                     unverified = domain?.unverifiedHosts ?: emptyList(),
