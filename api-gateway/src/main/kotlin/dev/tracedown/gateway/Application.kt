@@ -202,6 +202,16 @@ fun Application.module() {
     }
 
     dev.tracedown.gateway.util.ScheduleNudge.init { redisA }
+    // The event feed: tell waiting reads when this process has written to the
+    // outbox, wake them on any process's nudge, and bound how many a key holds.
+    dev.tracedown.common.models.OutboxEmit.onCommitted { orgId ->
+        redisA.publish(dev.tracedown.common.models.OutboxEmit.NUDGE_CHANNEL, orgId.toString())
+    }
+    dev.tracedown.gateway.controllers.events.EventPollSlots.init { redisA }
+    dev.tracedown.gateway.controllers.events.EventWakeups.start(appConfig.redis.aUrl)
+    monitor.subscribe(io.ktor.server.application.ApplicationStopped) {
+        dev.tracedown.gateway.controllers.events.EventWakeups.stop()
+    }
     dev.tracedown.common.realtime.RealtimePublisher.init { redisA }
 
     // Redis C (resource hierarchy cache) — optional, disabled if not configured.
@@ -459,6 +469,10 @@ fun Application.module() {
             // asking again — after a pause, not at once.
             if (cause.code == ErrorCodes.BODY_STORE_UNAVAILABLE) {
                 call.response.headers.append(HttpHeaders.RetryAfter, BODY_RETRY_AFTER_SECONDS.toString())
+            }
+            // An event read is let in once one of the key's others returns.
+            if (cause.code == ErrorCodes.TOO_MANY_EVENT_POLLS) {
+                call.response.headers.append(HttpHeaders.RetryAfter, "1")
             }
             if (details == null) {
                 call.respond(cause.status, mapOf("error" to cause.code))

@@ -3,6 +3,7 @@ package dev.tracedown.common.auth
 import dev.tracedown.common.models.ApiKeys
 import dev.tracedown.common.models.Users
 import org.jetbrains.exposed.v1.core.JoinType
+import org.jetbrains.exposed.v1.core.Op
 import org.jetbrains.exposed.v1.core.and
 import org.jetbrains.exposed.v1.core.eq
 import org.jetbrains.exposed.v1.jdbc.selectAll
@@ -64,11 +65,20 @@ object ApiKeyFormat {
 object ApiKeyAuthenticator {
 
     /** Only the digest is stored at rest: the caller hashes the presented key (`TokenHasher`) and this matches. */
-    fun authenticateDigest(keyHash: String): ApiKeyResult = transaction {
+    fun authenticateDigest(keyHash: String): ApiKeyResult = authenticate { ApiKeys.keyHash eq keyHash }
+
+    /**
+     * The same verdict, again, for a key already authenticated — by its id.
+     * For a call that outlasts the moment it was let in: whatever happened to
+     * the key or its user since applies from the next ask.
+     */
+    fun recheck(keyId: UUID): ApiKeyResult = authenticate { ApiKeys.id eq keyId }
+
+    private fun authenticate(match: () -> Op<Boolean>): ApiKeyResult = transaction {
         val row = ApiKeys
             .join(Users, JoinType.LEFT, ApiKeys.createdBy, Users.id)
             .selectAll()
-            .where { (ApiKeys.keyHash eq keyHash) and (ApiKeys.deleted eq false) }
+            .where { match() and (ApiKeys.deleted eq false) }
             .firstOrNull()
             ?: return@transaction ApiKeyResult.Invalid(ApiKeyResult.Reason.NOT_FOUND)
 

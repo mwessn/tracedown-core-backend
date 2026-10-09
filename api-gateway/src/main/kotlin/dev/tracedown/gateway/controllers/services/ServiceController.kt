@@ -33,6 +33,7 @@ import dev.tracedown.common.variables.ScriptVariableResolver
 import dev.tracedown.common.variables.SystemVariableSeeder
 import dev.tracedown.common.variables.SystemVariables
 import dev.tracedown.common.variables.VariableLimits
+import dev.tracedown.gateway.controllers.presets.RulePresetController
 import dev.tracedown.gateway.controllers.metrics.DashboardMetricsController
 import dev.tracedown.gateway.data.CreateVariableRequest
 import dev.tracedown.gateway.data.UpdateVariableRequest
@@ -184,7 +185,11 @@ object ServiceController {
         if (request.script != null && request.script.isNotBlank()) {
             validateScript(request.script).takeIf { it.isNotEmpty() }?.let { throw scriptRefused(it) }
         }
-        if (request.isActive == true && request.script.isNullOrBlank()) {
+        val presetId = request.presetId?.let { raw ->
+            if (!request.script.isNullOrBlank()) throw fieldError("presetId")
+            runCatching { UUID.fromString(raw) }.getOrElse { throw fieldError("presetId", ErrorCodes.INVALID_UUID) }
+        }
+        if (request.isActive == true && request.script.isNullOrBlank() && presetId == null) {
             throw fieldError("script", ErrorCodes.FIELD_REQUIRED)
         }
 
@@ -198,9 +203,19 @@ object ServiceController {
             val (created, workspaceId) = createRow(orgId, projectId, request, userId)
             var summary = created
             val id = UUID.fromString(created.id)
-            if (!request.script.isNullOrBlank()) {
+            // A preset is read once the caller is known to be able to create
+            // here, so a refusal says nothing about presets they could not
+            // have used; its script then takes the path a script takes.
+            val script = if (presetId != null) {
+                RulePresetController.scriptFor(orgId, userId, presetId, workspaceId).also { preset ->
+                    validateScript(preset).takeIf { it.isNotEmpty() }?.let { throw scriptRefused(it) }
+                }
+            } else {
+                request.script
+            }
+            if (!script.isNullOrBlank()) {
                 summary = updateRow(
-                    orgId, id, UpdateServiceRequest(script = request.script, version = created.version), userId,
+                    orgId, id, UpdateServiceRequest(script = script, version = created.version), userId,
                     // Switched on as a first save switches it on, unless the
                     // create says otherwise — then not even for a moment.
                     autoEnable = request.isActive != false,

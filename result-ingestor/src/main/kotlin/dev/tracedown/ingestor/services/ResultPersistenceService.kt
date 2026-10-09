@@ -619,10 +619,12 @@ object ResultPersistenceService {
             // recovery this is when the outage began — used just below to compute
             // downtime, since the row's value is gone once we update it.
             val previousStatusSince = service?.get(Services.lastStatusSince)
+            // The same pair, for the outbox event: whether this run moved the
+            // service's status, and from what.
+            val previousStatus = service?.get(Services.lastStatus)
+            val statusChanged = service != null && previousStatus != status
 
             if (service != null) {
-                val previousStatus = service[Services.lastStatus]
-                val statusChanged = previousStatus != status
 
                 Services.update({ Services.id eq serviceId }) {
                     // An errored run is not a ProbeResult (spec §9 has no such
@@ -726,6 +728,10 @@ object ResultPersistenceService {
                     put("organizationId", organizationId.toString())
                     put("status", status)
                     put("runDurationMs", elapsedMs)
+                    // Whether the service's status moved with this run, and
+                    // from what (absent before its first run).
+                    put("statusChanged", statusChanged)
+                    previousStatus?.let { put("previousStatus", it) }
                     // Present only on a recovery — the dispatcher formats it into
                     // the recovery message. Absent for every other result.
                     downtimeSeconds?.let { put("downtimeSeconds", it) }

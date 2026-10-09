@@ -105,16 +105,7 @@ internal object ApiKeyAuth {
                 }
                 // Named by its digest, never by any part of the token itself.
                 log.debug("Refused API key {}…: {}", digest.take(12), result.reason)
-                throw UnauthorizedException(
-                    when (result.reason) {
-                        ApiKeyResult.Reason.NOT_FOUND -> ErrorCodes.INVALID_API_KEY
-                        ApiKeyResult.Reason.REVOKED -> ErrorCodes.API_KEY_REVOKED
-                        ApiKeyResult.Reason.EXPIRED -> ErrorCodes.API_KEY_EXPIRED
-                        ApiKeyResult.Reason.OWNER_GONE,
-                        ApiKeyResult.Reason.OWNER_INACTIVE,
-                        ApiKeyResult.Reason.NOT_MEMBER -> ErrorCodes.API_KEY_OWNER_INACTIVE
-                    },
-                )
+                throw UnauthorizedException(apiKeyRefusal(result.reason))
             }
         }
 
@@ -198,4 +189,14 @@ internal object ApiKeyAuth {
             log.debug("Could not stamp last_used_at for key {}: {}", keyId, e.message)
         }
     }
+}
+
+/** The code a key refused for [reason] is answered with. */
+internal fun apiKeyRefusal(reason: ApiKeyResult.Reason): String = when (reason) {
+    ApiKeyResult.Reason.NOT_FOUND -> ErrorCodes.INVALID_API_KEY
+    ApiKeyResult.Reason.REVOKED -> ErrorCodes.API_KEY_REVOKED
+    ApiKeyResult.Reason.EXPIRED -> ErrorCodes.API_KEY_EXPIRED
+    ApiKeyResult.Reason.OWNER_GONE,
+    ApiKeyResult.Reason.OWNER_INACTIVE,
+    ApiKeyResult.Reason.NOT_MEMBER -> ErrorCodes.API_KEY_OWNER_INACTIVE
 }

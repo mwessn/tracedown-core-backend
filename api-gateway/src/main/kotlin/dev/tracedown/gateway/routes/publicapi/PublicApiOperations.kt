@@ -5,7 +5,17 @@ import dev.tracedown.gateway.data.CreateVariableRequest
 import dev.tracedown.gateway.data.UpdateVariableRequest
 import dev.tracedown.gateway.data.VariableHierarchyResponse
 import dev.tracedown.gateway.data.VariableSummary
+import dev.tracedown.gateway.controllers.events.EventPollSlots
+import dev.tracedown.gateway.controllers.events.EventTypes
 import dev.tracedown.gateway.data.agents.PublicAgentSummary
+import dev.tracedown.gateway.data.alerts.PublicSystemAlert
+import dev.tracedown.gateway.data.events.EventPage
+import dev.tracedown.gateway.data.notifications.CreateNotificationTemplateRequest
+import dev.tracedown.gateway.data.notifications.NotificationTemplateSummary
+import dev.tracedown.gateway.data.notifications.UpdateNotificationTemplateRequest
+import dev.tracedown.gateway.data.presets.CreateRulePresetRequest
+import dev.tracedown.gateway.data.presets.RulePresetSummary
+import dev.tracedown.gateway.data.presets.UpdateRulePresetRequest
 import dev.tracedown.gateway.data.apikeys.ApiKeyInfo
 import dev.tracedown.gateway.data.metrics.AssertionFailuresDto
 import dev.tracedown.gateway.data.metrics.EndpointSeriesDto
@@ -217,7 +227,9 @@ object PublicApiOperations {
                 "(default `*/5 * * * *`). A `script`, when given, is validated and saved as a script save is, and " +
                 "switches the service on unless `isActive` is false. While the organization works in verified-domain " +
                 "mode, a script may only call hosts on a verified domain with a few limits relaxed; see the guide " +
-                "(https://tracedown.dev/guide/api/).",
+                "(https://tracedown.dev/guide/api/). `presetId` instead of `script` starts it from a preset's script, " +
+                "copied: a preset the caller may read, and a workspace's only for a service in that workspace (404 " +
+                "naming `presetId` otherwise).",
             request = typeOf<CreateServiceRequest>(), response = typeOf<ServiceSummary>(),
             errors = listOf(HttpStatusCode.NotFound, HttpStatusCode.Conflict)),
         PublicOperation(get, "/services/{id}", "getService", "Services", "Returns a service", response = typeOf<ServiceSummary>()),
@@ -346,6 +358,82 @@ object PublicApiOperations {
             request = typeOf<Map<String, Boolean>>(), response = typeOf<WebhookBindingSummary>()),
         PublicOperation(delete, "/webhooks/bindings/{id}", "deleteWebhookBinding", "Webhooks", "Removes a binding",
             "The webhook itself stays.", response = OK),
+
+        // Presets
+        PublicOperation(get, "/presets", "listPresets", "Presets", "Lists script presets",
+            "The organization-wide presets, and — with `workspaceId` — that workspace's too when the caller may see it " +
+                "(a workspace they may not see, or one that is not there, lists the organization-wide ones only). By " +
+                "name, ties by id.",
+            query = listOf(QueryParameter("workspaceId", typeOf<String>(), "Also list this workspace's presets.")) + PAGING,
+            response = typeOf<Page<RulePresetSummary>>()),
+        PublicOperation(post, "/presets", "createPreset", "Presets", "Saves a script preset",
+            "Organization-wide, which needs write on the organization's workspaces, or in the workspace named by " +
+                "`workspaceId`, which needs write on it. `name` at most 128 characters; `script` must be valid Lace, " +
+                "at most 16384 characters.",
+            request = typeOf<CreateRulePresetRequest>(), response = typeOf<RulePresetSummary>(), errors = listOf(HttpStatusCode.NotFound)),
+        PublicOperation(get, "/presets/{id}", "getPreset", "Presets", "Returns a script preset",
+            "A workspace's preset is found only by those who may see the workspace.", response = typeOf<RulePresetSummary>()),
+        PublicOperation(patch, "/presets/{id}", "updatePreset", "Presets", "Renames a preset or replaces its script",
+            "Fields left out are unchanged; a preset stays in its scope. Needs what saving into that scope needs.",
+            request = typeOf<UpdateRulePresetRequest>(), response = typeOf<RulePresetSummary>()),
+        PublicOperation(delete, "/presets/{id}", "deletePreset", "Presets", "Deletes a preset",
+            "Services made from it keep their script.", response = OK),
+
+        // Notification templates
+        PublicOperation(get, "/notification-templates", "listNotificationTemplates", "Notification templates",
+            "Lists notification templates", "Oldest first, ties by id. Needs read on the organization's notifications.",
+            query = PAGING, response = typeOf<Page<NotificationTemplateSummary>>()),
+        PublicOperation(post, "/notification-templates", "createNotificationTemplate", "Notification templates",
+            "Creates a notification template",
+            "`name` at most 64 characters and unique in the organization (409 otherwise); `text` at most 10000. " +
+                "`projectIds` binds it to those projects at once. Needs write on the organization's notifications.",
+            request = typeOf<CreateNotificationTemplateRequest>(), response = typeOf<NotificationTemplateSummary>(),
+            errors = listOf(HttpStatusCode.NotFound, HttpStatusCode.Conflict)),
+        PublicOperation(get, "/notification-templates/{id}", "getNotificationTemplate", "Notification templates",
+            "Returns a notification template", response = typeOf<NotificationTemplateSummary>()),
+        PublicOperation(patch, "/notification-templates/{id}", "updateNotificationTemplate", "Notification templates",
+            "Renames a template or replaces its text", "Fields left out are unchanged.",
+            request = typeOf<UpdateNotificationTemplateRequest>(), response = typeOf<NotificationTemplateSummary>(), errors = CONFLICT),
+        PublicOperation(delete, "/notification-templates/{id}", "deleteNotificationTemplate", "Notification templates",
+            "Deletes a notification template", response = OK),
+        PublicOperation(get, "/projects/{id}/notification-templates", "listProjectNotificationTemplates", "Notification templates",
+            "Lists the templates bound to a project", "Oldest first, ties by id.",
+            query = PAGING, response = typeOf<Page<NotificationTemplateSummary>>()),
+        PublicOperation(put, "/projects/{id}/notification-templates/{templateId}", "bindProjectNotificationTemplate",
+            "Notification templates", "Binds a template to a project",
+            "Binding one that is bound already changes nothing. Answers the template.",
+            response = typeOf<NotificationTemplateSummary>()),
+        PublicOperation(delete, "/projects/{id}/notification-templates/{templateId}", "unbindProjectNotificationTemplate",
+            "Notification templates", "Unbinds a template from a project", "Answers the template.",
+            response = typeOf<NotificationTemplateSummary>()),
+
+        // Alerts
+        PublicOperation(get, "/alerts", "listAlerts", "Alerts", "Lists the organization's system alerts",
+            "`state=active` (default): the latest alert of each type the caller has not dismissed, as the dashboard's " +
+                "banners show them, most recently seen first. `state=all`: every episode, newest first, ties by id, each " +
+                "with when the caller dismissed it. Needs write on the organization's settings, as the banners do.",
+            query = listOf(QueryParameter("state", typeOf<String>(), "`active` (default) or `all`.")) + PAGING,
+            response = typeOf<Page<PublicSystemAlert>>()),
+        PublicOperation(post, "/alerts/{id}/dismiss", "dismissAlert", "Alerts", "Dismisses an alert for the caller",
+            "For the caller only, as in the dashboard; dismissing one twice changes nothing.", response = OK),
+
+        // Events
+        PublicOperation(get, "/events", "listEvents", "Events", "Reads the event feed",
+            "The events after the cursor `after`, oldest first, that the caller may see now — decided on every read " +
+                "with the checks the dashboard's reads of the same resources make. With none there, waits up to `wait` " +
+                "seconds for the first, and answers an empty page when none came. Pass `next` as `after` to read on; it " +
+                "moves even on an empty page. Without `after`, reads from now on. Types: " +
+                EventTypes.ALL.joinToString(", ") { "`$it`" } + ". A variable's events carry its key, never its value. " +
+                "410 `cursor_expired` when the cursor is older than the events kept, with `details.oldest` to start " +
+                "again from; 429 `too_many_event_polls` (with `Retry-After`) when the key already has " +
+                "${EventPollSlots.PER_KEY} reads open.",
+            query = listOf(
+                QueryParameter("after", typeOf<String>(), "A cursor: `next` of an earlier read."),
+                QueryParameter("wait", typeOf<Int>(), "Seconds to wait for an event when there is none, 0–30. Default 0."),
+                QueryParameter("types", typeOf<String>(), "Only these event types: comma-separated, or the parameter repeated."),
+                QueryParameter("limit", typeOf<Int>(), "Events per page, 1–100. Default 100."),
+            ),
+            response = typeOf<EventPage>(), errors = listOf(HttpStatusCode.Gone)),
     ) + variables("organization", "", tagHierarchy = false) +
         variables("workspace", "/workspaces/{id}", tagHierarchy = true) +
         variables("project", "/projects/{id}", tagHierarchy = true) +
@@ -377,5 +465,9 @@ object PublicApiOperations {
         "Access" to "Who may see or change a workspace, project or service.",
         "Directory" to "The organization's members and groups.",
         "Webhooks" to "Attaching existing webhooks to resources.",
+        "Presets" to "Script presets: Lace scripts a service can start from.",
+        "Notification templates" to "The text notifications are written with, and the projects that use it.",
+        "Alerts" to "The warning log: what the platform has noticed about the organization's agents and runs.",
+        "Events" to "A feed of what happens to the resources the caller may see.",
     )
 }

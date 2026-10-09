@@ -6,6 +6,10 @@ import dev.tracedown.common.errors.ErrorCodes
 import dev.tracedown.common.net.PathCanonicalizer
 import dev.tracedown.gateway.context.Credential
 import dev.tracedown.gateway.routes.publicapi.v1.accessRoutes
+import dev.tracedown.gateway.routes.publicapi.v1.alertRoutes
+import dev.tracedown.gateway.routes.publicapi.v1.eventRoutes
+import dev.tracedown.gateway.routes.publicapi.v1.notificationTemplateRoutes
+import dev.tracedown.gateway.routes.publicapi.v1.presetRoutes
 import dev.tracedown.gateway.routes.publicapi.v1.directoryRoutes
 import dev.tracedown.gateway.routes.publicapi.v1.keyRoutes
 import dev.tracedown.gateway.routes.publicapi.v1.metricsRoutes
@@ -202,6 +206,10 @@ object PublicApi {
         v1.accessRoutes()
         v1.directoryRoutes()
         v1.webhookRoutes()
+        v1.presetRoutes()
+        v1.notificationTemplateRoutes()
+        v1.alertRoutes()
+        v1.eventRoutes()
         for (route in v1.endpoints()) {
             val (method, path) = route
             val operation = PublicApiOperations.find(method, path)

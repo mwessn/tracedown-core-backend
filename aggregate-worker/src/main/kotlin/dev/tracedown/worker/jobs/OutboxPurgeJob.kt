@@ -69,15 +69,31 @@ class OutboxPurgeJob(
             // the floor is absent and this clause is dropped entirely.
             // retentionDays and floor are numeric values under our control —
             // safe to inline.
+            //
+            // The same statement raises the retention mark to the highest seq
+            // it deleted, so a reader walking the log by seq can tell that it
+            // has been passed: what is deleted here is not a prefix (an
+            // unpublished result row outlives newer rows), so the lowest seq
+            // left cannot say that.
             val cursorClause = if (floor != null) "AND seq <= $floor" else ""
             val sql = """
-                DELETE FROM outbox
-                WHERE created_at < now() - make_interval(days => $retentionDays)
-                  $cursorClause
-                  AND (published = true OR event_type <> 'probe_result.created')
+                WITH gone AS (
+                    DELETE FROM outbox
+                    WHERE created_at < now() - make_interval(days => $retentionDays)
+                      $cursorClause
+                      AND (published = true OR event_type <> 'probe_result.created')
+                    RETURNING seq
+                ), mark AS (
+                    UPDATE outbox_retention
+                    SET purged_through = GREATEST(purged_through, (SELECT MAX(seq) FROM gone)),
+                        updated_at = now()
+                    WHERE id = 1 AND EXISTS (SELECT 1 FROM gone)
+                )
+                SELECT COUNT(*) AS deleted FROM gone
             """.trimIndent()
-            val stmt = connection.prepareStatement(sql, false)
-            stmt.executeUpdate().toLong()
+            (connection.connection as java.sql.Connection).prepareStatement(sql).use { stmt ->
+                stmt.executeQuery().use { rs -> if (rs.next()) rs.getLong("deleted") else 0L }
+            }
         }
 
         if (deleted > 0) {

@@ -3,6 +3,7 @@ package dev.tracedown.common.models
 import org.jetbrains.exposed.v1.core.Table
 import org.jetbrains.exposed.v1.core.java.javaUUID
 import org.jetbrains.exposed.v1.javatime.timestamp
+import org.jetbrains.exposed.v1.javatime.timestampWithTimeZone
 import org.jetbrains.exposed.v1.json.jsonb
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
@@ -34,6 +35,19 @@ object Outbox : Table("outbox") {
      */
     val claimedBy = varchar("claimed_by", 128).nullable()
     val claimedAt = timestamp("claimed_at").nullable()
+
+    /**
+     * When the row was written, by the database's clock at the INSERT itself
+     * (`DEFAULT clock_timestamp()`), never set from code — [createdAt] is not
+     * that: a probe result's row carries the run's start. Null on rows older
+     * than the column.
+     *
+     * The event feed reads it to tell a hole in [seq] that a transaction still
+     * holds open (which will fill) from one a rollback left (which will not):
+     * `seq` is handed out at INSERT and becomes visible at COMMIT, so for a
+     * moment a later number can be readable while an earlier one is not.
+     */
+    val insertedAt = timestampWithTimeZone("inserted_at").nullable().databaseGenerated()
 
     override val primaryKey = PrimaryKey(id)
 }

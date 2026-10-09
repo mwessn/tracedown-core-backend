@@ -26,6 +26,8 @@ import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import org.flywaydb.core.Flyway
 import org.jetbrains.exposed.v1.core.and
+import org.jetbrains.exposed.v1.core.neq
+import dev.tracedown.common.alerts.SystemAlertService
 import org.jetbrains.exposed.v1.core.eq
 import org.jetbrains.exposed.v1.jdbc.Database
 import org.jetbrains.exposed.v1.jdbc.deleteAll
@@ -177,8 +179,14 @@ class OutboxClaimTest {
         Outbox.selectAll().where { Outbox.published eq true }.count()
     }
 
+    /**
+     * Unpublished rows, less the alert events a dropped notification raises:
+     * those are for cursor readers, and no flag consumer ever publishes them.
+     */
     private fun unpublishedCount(): Long = transaction {
-        Outbox.selectAll().where { Outbox.published eq false }.count()
+        Outbox.selectAll().where {
+            (Outbox.published eq false) and (Outbox.eventType neq SystemAlertService.ALERT_RAISED_EVENT)
+        }.count()
     }
 
     private fun claimOf(resultId: UUID): Pair<String?, Instant?> = transaction {

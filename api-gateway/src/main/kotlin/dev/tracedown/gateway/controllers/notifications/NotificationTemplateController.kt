@@ -110,7 +110,7 @@ object NotificationTemplateController {
                 (NotificationTemplates.organizationId eq orgId) and
                     (NotificationTemplates.deleted eq false)
             }
-            val (pagedQuery, total) = query.applyPfs(pfs)
+            val (pagedQuery, total) = query.applyPfs(pfs, DEFAULT_ORDER)
             val items = pagedQuery.map { row ->
                 val templateId = row[NotificationTemplates.id]
                 val projectIds = loadProjectIds(templateId)
@@ -119,6 +119,38 @@ object NotificationTemplateController {
             Page(items = items, total = total, page = pfs.page, pageSize = pfs.pageSize)
         }
     }
+
+    /**
+     * The templates bound to one project, oldest first — [list] narrowed to
+     * the project, under the same permission. A project of another
+     * organization is not found.
+     */
+    fun listForProject(orgId: UUID, projectId: UUID, userId: UUID, pfs: PfsParams): Page<NotificationTemplateSummary> {
+        return transaction {
+            requireOrgRead(orgId, userId) { it.notifications }
+            requireProjectInOrg(projectId, orgId)
+
+            val query = NotificationTemplates.join(
+                ProjectNotificationTemplates,
+                org.jetbrains.exposed.v1.core.JoinType.INNER,
+                onColumn = NotificationTemplates.id,
+                otherColumn = ProjectNotificationTemplates.notificationTemplateId,
+            ).select(NotificationTemplates.columns).where {
+                (NotificationTemplates.organizationId eq orgId) and
+                    (NotificationTemplates.deleted eq false) and
+                    (ProjectNotificationTemplates.projectId eq projectId)
+            }
+            val (pagedQuery, total) = query.applyPfs(pfs, DEFAULT_ORDER)
+            val items = pagedQuery.map { row -> summaryFromRow(row, loadProjectIds(row[NotificationTemplates.id])) }
+            Page(items = items, total = total, page = pfs.page, pageSize = pfs.pageSize)
+        }
+    }
+
+    /** Oldest first, ties by id, when a list asks for no order of its own. */
+    private val DEFAULT_ORDER = listOf(
+        NotificationTemplates.createdAt to org.jetbrains.exposed.v1.core.SortOrder.ASC,
+        NotificationTemplates.id to org.jetbrains.exposed.v1.core.SortOrder.ASC,
+    )
 
     /** Returns a single notification template. */
     fun get(orgId: UUID, templateId: UUID, userId: UUID): NotificationTemplateSummary {
@@ -197,8 +229,18 @@ object NotificationTemplateController {
 
     // ── Project Bindings ──
 
-    /** Binds a template to a project. */
-    fun bindProject(orgId: UUID, templateId: UUID, request: BindProjectRequest, userId: UUID): NotificationTemplateSummary {
+    /**
+     * Binds a template to a project. A binding that is already there is 409 —
+     * or, with [alreadyBoundOk], the answer it would have been, with nothing
+     * written or audited: what a PUT of the binding means.
+     */
+    fun bindProject(
+        orgId: UUID,
+        templateId: UUID,
+        request: BindProjectRequest,
+        userId: UUID,
+        alreadyBoundOk: Boolean = false,
+    ): NotificationTemplateSummary {
         val projectId = UUID.fromString(request.projectId)
 
         return transaction {
@@ -212,7 +254,10 @@ object NotificationTemplateController {
                         (ProjectNotificationTemplates.projectId eq projectId)
                 }
                 .any()
-            if (exists) throw ConflictException()
+            if (exists) {
+                if (alreadyBoundOk) return@transaction templateSummary(templateId)
+                throw ConflictException()
+            }
 
             ProjectNotificationTemplates.insert {
                 it[id] = UUID.randomUUID()
