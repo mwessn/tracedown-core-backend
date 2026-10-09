@@ -39,4 +39,18 @@ object RunState {
 
     /** Never stored: a pending request older than the reader's bound. */
     const val EXPIRED = "expired"
+
+    /**
+     * The outbox event a stored settlement writes, in the transaction that
+     * stores it: `{runId, serviceId, orgId, state, status?, reason?}`. An
+     * expiry is never stored, so it writes none.
+     */
+    const val SETTLED_EVENT = "run_request.settled"
+
+    /** How bad each result status is, worst first: a run's status is its worst result's. */
+    val SEVERITY = listOf("failure", "timeout", "error", "success", "skipped")
+
+    /** The worst of [statuses], by [SEVERITY]. */
+    fun worst(statuses: Collection<String>): String? =
+        statuses.minByOrNull { SEVERITY.indexOf(it).let { i -> if (i < 0) 0 else i } }
 }

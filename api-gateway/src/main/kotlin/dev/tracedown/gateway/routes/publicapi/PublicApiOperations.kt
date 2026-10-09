@@ -190,7 +190,7 @@ object PublicApiOperations {
     /** What each event type's `resource.type` is, by the type's first word. */
     private val EVENT_RESOURCE = mapOf(
         "result" to "service", "service" to "service", "workspace" to "workspace",
-        "project" to "project", "variable" to "variable", "alert" to "alert",
+        "project" to "project", "variable" to "variable", "alert" to "alert", "run" to "service",
     )
 
     private fun variables(scope: String, prefix: String, tagHierarchy: Boolean): List<PublicOperation> {
@@ -543,8 +543,11 @@ object PublicApiOperations {
                 "never the value; a script's writeback of a metric is a `variable.updated` (or `created`) too. " +
                 "Deleting a workspace or project deletes everything in it: there is one event, for the container — " +
                 "drop all its children. `alert.raised` is a new episode of a system alert, and needs what the warning " +
-                "log needs. `occurredAt`: a result's run start, an alert's episode start, otherwise when the change " +
-                "was made.\n\n" +
+                "log needs. `run.settled` is a run asked for by `POST /services/{id}/run` reaching `done` or `skipped` " +
+                "(`state`), with the run's worst result `status` and, when skipped, the `reason` " +
+                "(`run_not_delivered` when no scheduler took it); an `expired` run is never an event — it is what " +
+                "`GET /services/{id}/runs/{runId}` says once nothing has come. `occurredAt`: a result's run start, an " +
+                "alert's episode start, otherwise when the change was made.\n\n" +
                 "Not metered by the request budget; instead a key holds at most ${EventPollSlots.PER_KEY} reads open " +
                 "at once (a user ${EventPollSlots.PER_USER}, an organization ${EventPollSlots.PER_ORG}), 429 " +
                 "`too_many_event_polls` with `Retry-After` beyond that. A transaction left open on the platform holds " +

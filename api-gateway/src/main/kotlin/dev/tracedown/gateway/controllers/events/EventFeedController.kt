@@ -11,6 +11,7 @@ import dev.tracedown.common.errors.ErrorCodes
 import dev.tracedown.common.models.OrgVariables
 import dev.tracedown.common.models.OutboxRetention
 import dev.tracedown.common.models.ProjectVariables
+import dev.tracedown.common.models.RunState
 import dev.tracedown.common.models.Projects
 import dev.tracedown.common.models.ServiceVariables
 import dev.tracedown.common.models.Services
@@ -64,6 +65,7 @@ object EventTypes {
     const val RESULT_RECORDED = "result.recorded"
     const val SERVICE_STATUS_CHANGED = "service.status_changed"
     const val ALERT_RAISED = "alert.raised"
+    const val RUN_SETTLED = "run.settled"
 
     /** `<resource>.created|updated|deleted` for these resources. */
     val RESOURCES = listOf("workspace", "project", "service", "variable")
@@ -72,7 +74,7 @@ object EventTypes {
     val ALL: List<String> =
         listOf(RESULT_RECORDED, SERVICE_STATUS_CHANGED) +
             RESOURCES.flatMap { r -> CHANGES.map { "$r.$it" } } +
-            ALERT_RAISED
+            ALERT_RAISED + RUN_SETTLED
 
     /** Each type's `data` fields, as the description lists them and a test pins them. */
     val DATA: Map<String, List<String>> =
@@ -80,6 +82,7 @@ object EventTypes {
             RESULT_RECORDED to listOf("resultId", "status", "runDurationMs", "reason", "projectId", "workspaceId"),
             SERVICE_STATUS_CHANGED to listOf("status", "previousStatus", "resultId"),
             ALERT_RAISED to listOf("type", "subject", "severity"),
+            RUN_SETTLED to listOf("runId", "serviceId", "state", "status", "reason"),
         ) + CHANGES.flatMap { change ->
             listOf(
                 "workspace.$change" to emptyList(),
@@ -316,7 +319,7 @@ object EventFeedController {
                 for (row in rows) {
                     val parent = row.payload.uuid("parentId")
                     when (row.eventType) {
-                        in RESULT_EVENTS -> row.payload.uuid("serviceId")?.let(services::add)
+                        in RESULT_EVENTS, RunState.SETTLED_EVENT -> row.payload.uuid("serviceId")?.let(services::add)
                         in SERVICE_EVENTS -> parent?.let(projects::add)
                         in VARIABLE_EVENTS -> {
                             val scope = row.payload.text("scope") ?: continue
@@ -433,6 +436,19 @@ object EventFeedController {
                     put("scope", scope)
                     put("scopeId", parent.toString())
                     put("key", context.variableKeys[row.aggregateId])
+                }))
+            }
+            RunState.SETTLED_EVENT -> {
+                // A run is read as its service's results are.
+                val service = payload.uuid("serviceId") ?: return emptyList()
+                val (project, workspace) = context.serviceParents[service] ?: return emptyList()
+                if (!visible(cached, "service", service, project, workspace)) return emptyList()
+                listOf(event(EventTypes.RUN_SETTLED, "service", service, buildJsonObject {
+                    put("runId", payload.text("runId"))
+                    put("serviceId", service.toString())
+                    put("state", payload.text("state"))
+                    put("status", payload.text("status"))
+                    put("reason", payload.text("reason"))
                 }))
             }
             SystemAlertService.ALERT_RAISED_EVENT -> {

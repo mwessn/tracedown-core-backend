@@ -2557,6 +2557,13 @@ class ApiKeyResourcesTest {
         ServiceController.createVariable(o, fx.service, CreateVariableRequest("SVC_PLAIN", "service-plain-value"), u)
         val resultId = recordResult(fx, "failure", "success")
         val skippedId = recordResult(fx, "skipped", null)
+        // A run asked for that no scheduler hears settles at once, as skipped.
+        stopListeningForRuns()
+        val settledRun = try {
+            ServiceController.triggerRun(o, fx.service, u).runId
+        } finally {
+            listenForRuns()
+        }
         // Out of it: a project of another workspace, which they hold nothing in.
         // (One in the same workspace is not: holding a service lets them read
         // its workspace, and a workspace's readers read its projects.)
@@ -2575,7 +2582,7 @@ class ApiKeyResourcesTest {
         val owner = obj(ownerRaw)
         assertEquals(
             listOf("workspace.updated", "variable.created", "service.updated", "variable.created",
-                "result.recorded", "service.status_changed", "result.recorded",
+                "result.recorded", "service.status_changed", "result.recorded", "run.settled",
                 "workspace.created", "project.created", "variable.created", "service.created", "result.recorded",
                 "service.status_changed", "alert.raised"),
             owner.types(),
@@ -2583,7 +2590,7 @@ class ApiKeyResourcesTest {
         val grantee = events(address, granteeKey, "?after=${start["grantee"]}")
         assertEquals(
             listOf("workspace.updated", "variable.created", "service.updated", "variable.created", "result.recorded",
-                "service.status_changed", "result.recorded"),
+                "service.status_changed", "result.recorded", "run.settled"),
             grantee.types(),
         )
         val seen = grantee["items"]!!.jsonArray.map { it.jsonObject }
@@ -2615,6 +2622,12 @@ class ApiKeyResourcesTest {
         assertEquals("skipped", skipped["data"]!!.jsonObject.str("status"))
         assertEquals("dispatch_queue_full", skipped["data"]!!.jsonObject.str("reason"))
         assertTrue(skipped["data"]!!.jsonObject["runDurationMs"] is JsonNull)
+        val run = items.single { it.str("type") == "run.settled" }["data"]!!.jsonObject
+        assertEquals(settledRun.toString(), run.str("runId"))
+        assertEquals(fx.service.toString(), run.str("serviceId"))
+        assertEquals("skipped", run.str("state"))
+        assertEquals("run_not_delivered", run.str("reason"))
+        assertTrue(run["status"] is JsonNull, run.toString())
         val alert = items.single { it.str("type") == "alert.raised" }
         assertEquals("agent_down", alert["data"]!!.jsonObject.str("type"))
         val result = items.first { it.str("type") == "result.recorded" }

@@ -4,6 +4,8 @@ import dev.tracedown.common.config.DatabaseFactory
 import dev.tracedown.common.models.Organizations
 import dev.tracedown.common.models.Outbox
 import dev.tracedown.common.models.Projects
+import dev.tracedown.common.models.RunRequests
+import dev.tracedown.common.models.RunState
 import dev.tracedown.common.models.Services
 import dev.tracedown.common.models.Users
 import dev.tracedown.common.models.Workspaces
@@ -107,8 +109,9 @@ class OutboxEventsTest {
         return id
     }
 
-    private fun persist(serviceId: UUID, outcome: String, extra: String = ""): UUID {
-        val resultId = UUID.randomUUID()
+    private fun persist(serviceId: UUID, outcome: String, extra: String = "", runId: UUID? = null): UUID {
+        val resultId = runId ?: UUID.randomUUID()
+        val run = if (runId == null) "" else ""","trigger": "manual", "runId": "$runId""""
         val envelope = Json.parseToJsonElement(
             """
             {
@@ -117,7 +120,7 @@ class OutboxEventsTest {
               "projectId": "$projectId",
               "workspaceId": "$workspaceId",
               "organizationId": "$orgId",
-              "startedAt": "$NOW",
+              "startedAt": "$NOW"$run,
               "rawResult": { "outcome": "$outcome", "elapsedMs": 40, "calls": [] $extra }
             }
             """.trimIndent(),
@@ -178,5 +181,31 @@ class OutboxEventsTest {
             assertEquals(setOf("id", "orgId", "scope", "parentId"), payload.keys)
             assertFalse(payload.toString().contains("\"6\"") || payload.toString().contains(":5"), "A value reached the outbox: $payload")
         }
+    }
+
+    @Test
+    fun `a run asked for announces its settlement, with the run's status`() {
+        val service = newService()
+        val runId = UUID.randomUUID()
+        transaction {
+            RunRequests.insert {
+                it[id] = runId
+                it[serviceId] = service
+                it[organizationId] = orgId
+                it[requestedAt] = NOW
+                it[state] = RunState.PENDING
+            }
+        }
+        persist(service, "failure", runId = runId)
+        val settled = transaction {
+            Outbox.selectAll().where { Outbox.eventType eq RunState.SETTLED_EVENT }
+                .map { it[Outbox.payload] to it[Outbox.organizationId] }
+                .filter { it.first["runId"]!!.jsonPrimitive.content == runId.toString() }
+        }.single()
+        assertEquals(orgId, settled.second)
+        assertEquals("done", settled.first["state"]!!.jsonPrimitive.content)
+        assertEquals("failure", settled.first["status"]!!.jsonPrimitive.content)
+        assertEquals(service.toString(), settled.first["serviceId"]!!.jsonPrimitive.content)
+        assertNull(settled.first["reason"])
     }
 }

@@ -643,12 +643,31 @@ object ResultPersistenceService {
                     .map { it[ProbeResults.status] }
                 val match = (RunRequests.id eq runId) and (RunRequests.serviceId eq serviceId) and
                     (RunRequests.organizationId eq organizationId) and (RunRequests.state neq RunState.DONE)
-                RunRequests.update({ match }) {
+                val settled = if (siblings.all { s -> s == "skipped" }) RunState.SKIPPED else RunState.DONE
+                val updated = RunRequests.update({ match }) {
                     it[expectedResults] = runSize.toShort()
                     if (siblings.size >= runSize) {
-                        it[state] = if (siblings.all { s -> s == "skipped" }) RunState.SKIPPED else RunState.DONE
+                        it[state] = settled
                         it[RunRequests.resultId] = runId
                     }
+                }
+                // The settlement, for readers of the event feed — in the same
+                // transaction, so it is there exactly when the state is.
+                if (updated > 0 && siblings.size >= runSize) {
+                    OutboxEmit.emitResourceEvent(
+                        RunState.SETTLED_EVENT, "run_request", runId,
+                        buildJsonObject {
+                            put("runId", runId.toString())
+                            put("serviceId", serviceId.toString())
+                            put("orgId", organizationId.toString())
+                            put("state", settled)
+                            put("status", RunState.worst(siblings))
+                            if (settled == RunState.SKIPPED) {
+                                put("reason", rawResult["reason"]?.jsonPrimitive?.contentOrNull ?: "unknown")
+                            }
+                        },
+                        organizationId = organizationId,
+                    )
                 }
             }
 
