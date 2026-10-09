@@ -16,12 +16,19 @@ data class EventResource(
 data class FeedEvent(
     /** Unique per event; the same event read twice has the same id. */
     val id: String,
-    /** See [dev.tracedown.gateway.controllers.events.EventTypes]. */
+    /** One of [dev.tracedown.gateway.controllers.events.EventTypes.ALL]. */
     val type: String,
-    /** When it happened: for a result, when its run started. ISO-8601. */
+    /**
+     * When it happened, ISO-8601: for a result, when its run started; for an
+     * alert, when its episode began; for a change, when it was made.
+     */
     val occurredAt: String,
     val resource: EventResource,
-    /** What the type carries; never a variable's value or any other secret. */
+    /**
+     * What the type carries — exactly the fields
+     * [dev.tracedown.gateway.controllers.events.EventTypes.DATA] lists for it;
+     * never a variable's value or any other secret.
+     */
     val data: JsonObject,
 )
 
@@ -31,4 +38,6 @@ data class EventPage(
     val items: List<FeedEvent>,
     /** Pass as `after` to read on. Moves even when [items] is empty. */
     val next: String,
+    /** True when more may be there already: read on from [next] at once rather than waiting. */
+    val more: Boolean = false,
 )

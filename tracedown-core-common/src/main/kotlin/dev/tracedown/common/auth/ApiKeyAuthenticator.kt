@@ -20,6 +20,8 @@ data class ApiKeyContext(
     val totpEnabled: Boolean,
     /** The key's own ceiling — an [AccessLevel]: read or write. */
     val access: Short,
+    /** The user's permissions in [organizationId], as they were resolved to let the key in. */
+    val permissions: CachedPermissions? = null,
 )
 
 /** Outcome of validating a presented API key, with the reason when it is refused. */
@@ -94,18 +96,21 @@ object ApiKeyAuthenticator {
                 ApiKeyResult.Invalid(ApiKeyResult.Reason.OWNER_GONE)
             !row[Users.isActive] ->
                 ApiKeyResult.Invalid(ApiKeyResult.Reason.OWNER_INACTIVE)
-            resolveCachedPermissions(row[ApiKeys.organizationId], userId) == null ->
-                ApiKeyResult.Invalid(ApiKeyResult.Reason.NOT_MEMBER)
-            else -> ApiKeyResult.Valid(
-                ApiKeyContext(
-                    keyId = row[ApiKeys.id],
-                    userId = userId,
-                    organizationId = row[ApiKeys.organizationId],
-                    email = row[Users.email],
-                    totpEnabled = row[Users.totpEnabled],
-                    access = row[ApiKeys.access],
-                ),
-            )
+            else -> {
+                val permissions = resolveCachedPermissions(row[ApiKeys.organizationId], userId)
+                    ?: return@transaction ApiKeyResult.Invalid(ApiKeyResult.Reason.NOT_MEMBER)
+                ApiKeyResult.Valid(
+                    ApiKeyContext(
+                        keyId = row[ApiKeys.id],
+                        userId = userId,
+                        organizationId = row[ApiKeys.organizationId],
+                        email = row[Users.email],
+                        totpEnabled = row[Users.totpEnabled],
+                        access = row[ApiKeys.access],
+                        permissions = permissions,
+                    ),
+                )
+            }
         }
     }
 }

@@ -412,7 +412,7 @@ class ApiKeyResourcesTest {
         GroupController.createGroup(o, "Fixture group", u)
         val preset = RulePresetController.create(o, u, CreateRulePresetRequest("Fixture preset", SCRIPT)).id
         val template = NotificationTemplateController.create(
-            o, CreateNotificationTemplateRequest("Fixture template", "{{service}} is {{status}}", listOf(proj.toString())), u,
+            o, CreateNotificationTemplateRequest("Fixture template", "\${s.name} is \${trigger}", listOf(proj.toString())), u,
         ).id
         val spareTemplate = NotificationTemplateController.create(o, CreateNotificationTemplateRequest("Spare template", "Spare"), u).id
         val alert = UUID.randomUUID()
@@ -835,7 +835,7 @@ class ApiKeyResourcesTest {
         Case("GET", "/notification-templates", { "/notification-templates" }, { "$v1/notification-templates" },
             shape = page("id", "name", "text", "projectIds")),
         Case("POST", "/notification-templates", { "/notification-templates" }, { "$v1/notification-templates" },
-            { """{"name":"Made by key","text":"{{service}} changed"}""" }, shape = hasFields("id", "name", "text")),
+            { """{"name":"Made by key","text":"${'$'}{s.name} changed"}""" }, shape = hasFields("id", "name", "text")),
         Case("GET", "/notification-templates/{id}", { "/notification-templates/${it.template}" },
             { "$v1/notification-templates/${it.template}" }, shape = hasFields("id", "name", "text", "projectIds")),
         Case("PATCH", "/notification-templates/{id}", { "/notification-templates/${it.template}" },
@@ -2376,9 +2376,10 @@ class ApiKeyResourcesTest {
         transaction {
             Outbox.insert {
                 it[id] = UUID.randomUUID()
+                it[Outbox.organizationId] = fx.owner.orgId
                 it[aggregateType] = "probe_result"
                 it[aggregateId] = resultId
-                it[eventType] = "probe_result.created"
+                it[eventType] = if (status == "skipped") "probe_result.skipped" else "probe_result.created"
                 it[payload] = kotlinx.serialization.json.buildJsonObject {
                     put("resultId", JsonPrimitive(resultId.toString()))
                     put("serviceId", JsonPrimitive(service.toString()))
@@ -2386,9 +2387,13 @@ class ApiKeyResourcesTest {
                     put("workspaceId", JsonPrimitive(workspace.toString()))
                     put("organizationId", JsonPrimitive(fx.owner.orgId.toString()))
                     put("status", JsonPrimitive(status))
-                    put("runDurationMs", JsonPrimitive(12))
-                    put("statusChanged", JsonPrimitive(previous != status))
-                    previous?.let { put("previousStatus", JsonPrimitive(it)) }
+                    if (status == "skipped") {
+                        put("reason", JsonPrimitive("dispatch_queue_full"))
+                    } else {
+                        put("runDurationMs", JsonPrimitive(12))
+                        put("statusChanged", JsonPrimitive(previous != status))
+                        previous?.let { put("previousStatus", JsonPrimitive(it)) }
+                    }
                 }
                 it[published] = false
                 it[createdAt] = Instant.now()
@@ -2421,6 +2426,7 @@ class ApiKeyResourcesTest {
         ServiceController.update(o, fx.service, UpdateServiceRequest(name = "Feed service"), u)
         ServiceController.createVariable(o, fx.service, CreateVariableRequest("SVC_PLAIN", "service-plain-value"), u)
         val resultId = recordResult(fx, "failure", "success")
+        val skippedId = recordResult(fx, "skipped", null)
         // Out of it: a project of another workspace, which they hold nothing in.
         // (One in the same workspace is not: holding a service lets them read
         // its workspace, and a workspace's readers read its projects.)
@@ -2439,14 +2445,15 @@ class ApiKeyResourcesTest {
         val owner = obj(ownerRaw)
         assertEquals(
             listOf("workspace.updated", "variable.created", "service.updated", "variable.created",
-                "result.recorded", "service.status_changed",
+                "result.recorded", "service.status_changed", "result.recorded",
                 "workspace.created", "project.created", "variable.created", "service.created", "result.recorded",
                 "service.status_changed", "alert.raised"),
             owner.types(),
         )
         val grantee = events(address, granteeKey, "?after=${start["grantee"]}")
         assertEquals(
-            listOf("workspace.updated", "variable.created", "service.updated", "variable.created", "result.recorded", "service.status_changed"),
+            listOf("workspace.updated", "variable.created", "service.updated", "variable.created", "result.recorded",
+                "service.status_changed", "result.recorded"),
             grantee.types(),
         )
         val seen = grantee["items"]!!.jsonArray.map { it.jsonObject }
@@ -2467,6 +2474,19 @@ class ApiKeyResourcesTest {
         val items = owner["items"]!!.jsonArray.map { it.jsonObject }
         assertEquals(listOf("PROJ_SECRET", "SVC_PLAIN", "OTHER_VAR"),
             items.filter { it.str("type") == "variable.created" }.map { it["data"]!!.jsonObject.str("key") })
+        // Every type carries exactly the data the description lists for it.
+        for (item in items) {
+            assertEquals(
+                dev.tracedown.gateway.controllers.events.EventTypes.DATA.getValue(item.str("type")).toSet(),
+                item["data"]!!.jsonObject.keys, "data of $item",
+            )
+        }
+        val skipped = items.single { it.str("type") == "result.recorded" && it["data"]!!.jsonObject.str("resultId") == skippedId.toString() }
+        assertEquals("skipped", skipped["data"]!!.jsonObject.str("status"))
+        assertEquals("dispatch_queue_full", skipped["data"]!!.jsonObject.str("reason"))
+        assertTrue(skipped["data"]!!.jsonObject["runDurationMs"] is JsonNull)
+        val alert = items.single { it.str("type") == "alert.raised" }
+        assertEquals("agent_down", alert["data"]!!.jsonObject.str("type"))
         val result = items.first { it.str("type") == "result.recorded" }
         assertEquals(resultId.toString(), result["data"]!!.jsonObject.str("resultId"))
         assertEquals(fx.service.toString(), result["resource"]!!.jsonObject.str("id"))
@@ -2542,55 +2562,155 @@ class ApiKeyResourcesTest {
         assertTrue(Duration.ofNanos(System.nanoTime() - quiet) >= Duration.ofMillis(900))
     }
 
-    @Test
-    fun `a cursor older than what is kept is refused with where to start again`() {
-        val address = nextAddress()
-        val fx = fixtures(address)
-        val cursor = events(address, fx.readKey).str("next")
-        val position = dev.tracedown.gateway.controllers.events.EventFeedController.decodeCursor(cursor)!!
-        ServiceController.update(fx.owner.orgId, fx.service, UpdateServiceRequest(name = "Kept"), fx.owner.userId)
-        try {
-            transaction {
-                dev.tracedown.common.models.OutboxRetention.update({ dev.tracedown.common.models.OutboxRetention.id eq 1 }) {
-                    it[purgedThrough] = position + 1
-                }
-            }
-            val (status, raw) = send(address, "GET", "${PublicApi.V1}/events?after=$cursor", fx.readKey)
-            assertEquals(410, status, raw)
-            assertEquals("cursor_expired", errorOf(raw))
-            val oldest = obj(raw)["details"]!!.jsonObject.str("oldest")
-            assertEquals(position + 1, dev.tracedown.gateway.controllers.events.EventFeedController.decodeCursor(oldest))
-            assertEquals(200, send(address, "GET", "${PublicApi.V1}/events?after=$oldest", fx.readKey).first)
-        } finally {
-            transaction {
-                dev.tracedown.common.models.OutboxRetention.update({ dev.tracedown.common.models.OutboxRetention.id eq 1 }) {
-                    it[purgedThrough] = 0
-                }
-            }
+    /** [fx]'s organization's last outbox row, as a position. */
+    private fun lastPosition(fx: Fx): dev.tracedown.gateway.util.EventCursor.Position.At = transaction {
+        Outbox.selectAll().where { Outbox.organizationId eq fx.owner.orgId }
+            .map { dev.tracedown.gateway.util.EventCursor.Position.At(it[Outbox.xid]!!, it[Outbox.seq]) }
+            .max()
+    }
+
+    private fun setMark(xid: Long, seq: Long) = transaction {
+        dev.tracedown.common.models.OutboxRetention.update({ dev.tracedown.common.models.OutboxRetention.id eq 1 }) {
+            it[purgedXid] = xid
+            it[purgedSeq] = seq
         }
     }
 
     @Test
-    fun `a hole that a transaction may still fill holds the feed until it is old`() {
+    fun `a cursor older than what is kept is refused with where to start again, also while it waits`() {
         val address = nextAddress()
         val fx = fixtures(address)
         val cursor = events(address, fx.readKey).str("next")
-        // A number taken and never written: what a transaction still open — or
-        // one rolled back — leaves behind it.
-        transaction { exec("SELECT nextval(pg_get_serial_sequence('outbox', 'seq'))") }
-        ServiceController.update(fx.owner.orgId, fx.service, UpdateServiceRequest(name = "Behind a hole"), fx.owner.userId)
+        ServiceController.update(fx.owner.orgId, fx.service, UpdateServiceRequest(name = "Kept"), fx.owner.userId)
+        val purged = lastPosition(fx)
+        try {
+            setMark(purged.xid, purged.seq)
+            val (status, raw) = send(address, "GET", "${PublicApi.V1}/events?after=$cursor", fx.readKey)
+            assertEquals(410, status, raw)
+            assertEquals("cursor_expired", errorOf(raw))
+            val oldest = obj(raw)["details"]!!.jsonObject.str("oldest")
+            assertEquals(purged, dev.tracedown.gateway.util.EventCursor.decode(fx.owner.orgId, oldest))
+            assertEquals(200, send(address, "GET", "${PublicApi.V1}/events?after=$oldest", fx.readKey).first)
 
-        val held = events(address, fx.readKey, "?after=$cursor")
-        assertEquals(emptyList<String>(), held.types())
-        assertEquals(cursor, held.str("next"), "The read moved past a hole that could still fill")
-
-        // Once the row after it is older than a transaction lasts, the hole is
-        // a rollback, and the read goes past it.
-        transaction {
-            exec("UPDATE outbox SET inserted_at = clock_timestamp() - interval '1 minute' " +
-                "WHERE seq > ${dev.tracedown.gateway.controllers.events.EventFeedController.decodeCursor(cursor)}")
+            // A read already waiting when the purge passes it is told so on its
+            // next look, not served the rows after the gap.
+            setMark(0, 0)
+            val from = events(address, fx.readKey).str("next")
+            val waiting = java.util.concurrent.CompletableFuture.supplyAsync {
+                send(address, "GET", "${PublicApi.V1}/events?after=$from&wait=6", fx.readKey)
+            }
+            Thread.sleep(500)
+            ServiceController.update(fx.owner.orgId, fx.service, UpdateServiceRequest(name = "Purged past"), fx.owner.userId)
+            val passed = lastPosition(fx)
+            setMark(passed.xid, passed.seq)
+            ServiceController.update(fx.owner.orgId, fx.service, UpdateServiceRequest(name = "Wake"), fx.owner.userId)
+            val (waitStatus, waitRaw) = waiting.get(20, java.util.concurrent.TimeUnit.SECONDS)
+            // Either the look after the wake-up saw the mark (410), or the
+            // first event had already been read before the mark moved.
+            if (waitStatus == 410) {
+                assertEquals("cursor_expired", errorOf(waitRaw))
+            } else {
+                assertEquals(200, waitStatus, waitRaw)
+                val (again, againRaw) = send(address, "GET", "${PublicApi.V1}/events?after=$from", fx.readKey)
+                assertEquals(410, again, againRaw)
+            }
+        } finally {
+            setMark(0, 0)
         }
-        assertEquals(listOf("service.updated"), events(address, fx.readKey, "?after=$cursor").types())
+    }
+
+    /** Opens a transaction on a connection of its own that writes an outbox row for [fx], and leaves it open. */
+    private fun openWrite(fx: Fx, name: String): java.sql.Connection {
+        val connection = java.sql.DriverManager.getConnection(postgres.jdbcUrl, postgres.username, postgres.password)
+        connection.autoCommit = false
+        connection.prepareStatement(
+            "INSERT INTO outbox (id, aggregate_type, aggregate_id, event_type, payload, published, created_at, organization_id) " +
+                "VALUES (?, 'workspace', ?, 'resource.workspace.updated', ?::jsonb, false, now(), ?)",
+        ).use { stmt ->
+            stmt.setObject(1, UUID.randomUUID())
+            stmt.setObject(2, fx.workspace)
+            stmt.setString(3, """{"id":"${fx.workspace}","orgId":"${fx.owner.orgId}","name":"$name"}""")
+            stmt.setObject(4, fx.owner.orgId)
+            stmt.executeUpdate()
+        }
+        return connection
+    }
+
+    @Test
+    fun `a row whose transaction commits late is not passed over, however late`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val cursor = events(address, fx.readKey).str("next")
+        val late = openWrite(fx, "late")
+        try {
+            // Written and committed after the open one: its row is readable, the
+            // open one's is not yet.
+            ServiceController.update(fx.owner.orgId, fx.service, UpdateServiceRequest(name = "On time"), fx.owner.userId)
+            repeat(2) {
+                val held = events(address, fx.readKey, "?after=$cursor")
+                assertEquals(emptyList<String>(), held.types(), "Read past a transaction still open: $held")
+                assertEquals(cursor, held.str("next"))
+                Thread.sleep(1000)
+            }
+            late.commit()
+        } finally {
+            late.close()
+        }
+        assertEquals(listOf("workspace.updated", "service.updated"), events(address, fx.readKey, "?after=$cursor").types())
+    }
+
+    @Test
+    fun `reading from now takes in a row whose transaction is still open`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val inFlight = openWrite(fx, "in flight")
+        val cursor = try {
+            events(address, fx.readKey).str("next").also { inFlight.commit() }
+        } finally {
+            inFlight.close()
+        }
+        assertEquals(listOf("workspace.updated"), events(address, fx.readKey, "?after=$cursor").types())
+    }
+
+    @Test
+    fun `a key revoked while its read waits is refused on the next look`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val key = mintKey(fx.ownerSession, "read", address)
+        val cursor = events(address, key).str("next")
+        val waiting = java.util.concurrent.CompletableFuture.supplyAsync {
+            send(address, "GET", "${PublicApi.V1}/events?after=$cursor&wait=10", key)
+        }
+        Thread.sleep(500)
+        transaction {
+            dev.tracedown.common.models.ApiKeys.update({
+                dev.tracedown.common.models.ApiKeys.keyHash eq dev.tracedown.common.auth.TokenHasher.sha256Hex(key)
+            }) { it[revoked] = true }
+        }
+        ServiceController.update(fx.owner.orgId, fx.service, UpdateServiceRequest(name = "After revocation"), fx.owner.userId)
+        val (status, raw) = waiting.get(20, java.util.concurrent.TimeUnit.SECONDS)
+        assertEquals(401, status, raw)
+        assertEquals("api_key_revoked", errorOf(raw))
+    }
+
+    @Test
+    fun `a cursor is sealed to its organization`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val other = fixtures(nextAddress())
+        val cursor = events(address, fx.readKey).str("next")
+        // Sealed: the position it names is nowhere in it in the clear.
+        val position = dev.tracedown.gateway.util.EventCursor.decode(fx.owner.orgId, cursor)
+            as dev.tracedown.gateway.util.EventCursor.Position.At
+        val sealed = java.util.Base64.getUrlDecoder().decode(cursor.removePrefix("ev2."))
+        val seqBytes = java.nio.ByteBuffer.allocate(8).putLong(position.seq).array()
+        assertFalse(sealed.toList().windowed(8).any { it == seqBytes.toList() }, "The cursor shows its position: $cursor")
+        assertFalse(position.seq.toString() in String(sealed, Charsets.ISO_8859_1), "The cursor shows its position: $cursor")
+        val (status, raw) = send(address, "GET", "${PublicApi.V1}/events?after=$cursor", other.readKey)
+        assertEquals(400, status, raw)
+        assertEquals("after", obj(raw)["details"]!!.jsonObject.str("field"))
+        // The same position, asked twice, is the same cursor.
+        assertEquals(events(address, fx.readKey, "?after=$cursor").str("next"), events(address, fx.readKey, "?after=$cursor").str("next"))
     }
 
     @Test

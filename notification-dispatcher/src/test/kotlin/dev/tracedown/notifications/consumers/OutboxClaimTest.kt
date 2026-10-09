@@ -2,6 +2,7 @@ package dev.tracedown.notifications.consumers
 
 import com.zaxxer.hikari.HikariConfig
 import com.zaxxer.hikari.HikariDataSource
+import dev.tracedown.common.alerts.SystemAlertService
 import dev.tracedown.common.models.Organizations
 import dev.tracedown.common.models.Outbox
 import dev.tracedown.common.models.SystemAlerts
@@ -26,9 +27,8 @@ import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import org.flywaydb.core.Flyway
 import org.jetbrains.exposed.v1.core.and
-import org.jetbrains.exposed.v1.core.neq
-import dev.tracedown.common.alerts.SystemAlertService
 import org.jetbrains.exposed.v1.core.eq
+import org.jetbrains.exposed.v1.core.neq
 import org.jetbrains.exposed.v1.jdbc.Database
 import org.jetbrains.exposed.v1.jdbc.deleteAll
 import org.jetbrains.exposed.v1.jdbc.insert
@@ -539,6 +539,14 @@ class OutboxClaimTest {
         val data = alerts.single()!!
         assertEquals(svc.toString(), data["serviceId"]!!.jsonPrimitive.content)
         assertEquals("RuntimeException", data["lastError"]!!.jsonPrimitive.content)
+
+        // And the episode is an event of its own, for readers of the outbox.
+        val raised = transaction {
+            Outbox.selectAll().where { Outbox.eventType eq SystemAlertService.ALERT_RAISED_EVENT }.toList()
+        }
+        assertEquals(1, raised.size, "a new episode writes its outbox row")
+        assertEquals(org, raised.single()[Outbox.organizationId])
+        assertEquals("notification_dropped", raised.single()[Outbox.payload]["alertType"]!!.jsonPrimitive.content)
     }
 
     /** A whole chain of undeliverable heads drains rather than compounding. */

@@ -7,7 +7,6 @@ import dev.tracedown.common.auth.CachedPermissions
 import dev.tracedown.common.auth.canAccessResource
 import dev.tracedown.common.auth.canRead
 import dev.tracedown.common.auth.canWrite
-import dev.tracedown.common.auth.resolveCachedPermissions
 import dev.tracedown.common.errors.ErrorCodes
 import dev.tracedown.common.models.OrgVariables
 import dev.tracedown.common.models.OutboxRetention
@@ -16,11 +15,16 @@ import dev.tracedown.common.models.Projects
 import dev.tracedown.common.models.ServiceVariables
 import dev.tracedown.common.models.Services
 import dev.tracedown.common.models.WorkspaceVariables
+import dev.tracedown.gateway.context.SessionAuth
 import dev.tracedown.gateway.context.apiKeyRefusal
 import dev.tracedown.gateway.data.events.EventPage
 import dev.tracedown.gateway.data.events.EventResource
 import dev.tracedown.gateway.data.events.FeedEvent
 import dev.tracedown.gateway.util.ApiException
+import dev.tracedown.gateway.util.EventCursor
+import dev.tracedown.gateway.util.EventCursor.Position
+import dev.tracedown.gateway.util.EventWakeups
+import dev.tracedown.gateway.util.ForbiddenException
 import dev.tracedown.gateway.util.UnauthorizedException
 import dev.tracedown.gateway.util.fieldError
 import io.ktor.http.HttpStatusCode
@@ -50,10 +54,12 @@ import org.jetbrains.exposed.v1.jdbc.transactions.TransactionManager
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
 import java.sql.Connection
 import java.time.Duration
-import java.util.Base64
 import java.util.UUID
 
-/** The feed's event types — the public names, not the outbox's. */
+/**
+ * The feed's event types — the public names, not the outbox's — and the
+ * fields each one's `data` carries, exactly.
+ */
 object EventTypes {
     const val RESULT_RECORDED = "result.recorded"
     const val SERVICE_STATUS_CHANGED = "service.status_changed"
@@ -67,71 +73,72 @@ object EventTypes {
         listOf(RESULT_RECORDED, SERVICE_STATUS_CHANGED) +
             RESOURCES.flatMap { r -> CHANGES.map { "$r.$it" } } +
             ALERT_RAISED
+
+    /** Each type's `data` fields, as the description lists them and a test pins them. */
+    val DATA: Map<String, List<String>> =
+        mapOf(
+            RESULT_RECORDED to listOf("resultId", "status", "runDurationMs", "reason", "projectId", "workspaceId"),
+            SERVICE_STATUS_CHANGED to listOf("status", "previousStatus", "resultId"),
+            ALERT_RAISED to listOf("type", "subject", "severity"),
+        ) + CHANGES.flatMap { change ->
+            listOf(
+                "workspace.$change" to emptyList(),
+                "project.$change" to listOf("workspaceId"),
+                "service.$change" to listOf("projectId", "workspaceId"),
+                "variable.$change" to listOf("scope", "scopeId", "key"),
+            )
+        }
 }
 
 /**
- * The event feed: the outbox, read by position, as the events a caller may
- * see.
+ * The event feed: one organization's outbox rows, read in order, as the events
+ * a caller may see.
  *
- * **Position.** Every outbox row has a `seq`; a cursor is a `seq` the reader
- * has read up to, written opaquely ([encodeCursor]). The same position always
- * gives the same cursor, and reading from it again gives the same events
- * (less any the caller may no longer see). A read moves the cursor over every
- * row it looked at — another organization's, a type the caller did not ask
- * for, one they may not see — so an empty page still moves it.
- *
- * **A hole is not skipped while it may still fill.** `seq` is taken at INSERT
- * and seen at COMMIT, so a row can be readable while a lower one, in a
- * transaction still open, is not; moving past that hole would lose the row
- * for good. A read stops before a hole whose next row was written less than
- * [GAP_GRACE] ago and looks again; a hole older than that was a rollback (or
- * the purge), and is passed.
+ * **Order and position.** Rows are read in (xid, seq) order — the writing
+ * transaction, then the row — and only those written by transactions below the
+ * oldest one still open (`pg_snapshot_xmin`). Every such transaction has
+ * committed or rolled back, and none to come can be given a lower xid, so no
+ * row can ever appear behind a position once a reader has passed it — however
+ * late its transaction commits, and without waiting out holes a rollback
+ * leaves in `seq`. The price is that an open transaction holds readers back
+ * for as long as it stays open. A cursor is a position, sealed for the
+ * organization ([EventCursor]). Each read moves it over every row it looked
+ * at — a type the caller did not ask for, a resource they may not see — so an
+ * empty page still moves it.
  *
  * **Retention.** The outbox is trimmed; [OutboxRetention] says how far. A
- * cursor below that may have missed rows and is refused — 410
- * `cursor_expired` with the oldest cursor that has missed nothing.
+ * position before that may have missed rows and is refused — 410
+ * `cursor_expired` with the oldest cursor that has missed nothing — checked on
+ * every look, after its rows are read.
  *
  * **Who sees what** is decided on every look, from the user's permissions as
  * they are then — the checks the dashboard's reads of the same resource make
- * ([visible]) — and the key is looked at again each time too, so a grant
- * withdrawn, a member removed or a key revoked stops delivery from the next
- * look, even within one long-poll.
+ * ([visible]) — and the key, its user and the second-factor rule are looked at
+ * again each time too, so a grant withdrawn, a member removed or a key revoked
+ * stops delivery from the next look, even within one long-poll. A result's
+ * service, project and workspace are read from the database, not taken from
+ * the row.
  *
  * **Waiting** holds nothing: each look is a short transaction, and between
- * looks the read suspends on a signal from [EventWakeups], or for
- * [RECHECK] when none comes.
+ * looks the read suspends on a signal from [EventWakeups], or for [RECHECK]
+ * when none comes. A look that read as many rows as it may looks again at once.
  */
 object EventFeedController {
 
     const val MAX_WAIT_SECONDS = 30
     const val MAX_LIMIT = 100
 
-    /** Outbox rows looked at per look, whoever they belong to. */
-    private const val SCAN_ROWS = 500
-
-    /** How long a hole in `seq` is waited for before it is taken to be a rollback. */
-    val GAP_GRACE: Duration = Duration.ofSeconds(10)
+    /** The organization's outbox rows read per look. */
+    internal const val SCAN_ROWS = 500
 
     /** How long a waiting read goes without looking, when nothing wakes it. */
     private val RECHECK: Duration = Duration.ofSeconds(5)
 
-    /** How soon to look again while held at a hole. */
-    private val HOLE_RECHECK: Duration = Duration.ofSeconds(1)
-
     /** A pause after a wake-up, so a burst of writes is read in one look. */
     private val SETTLE: Duration = Duration.ofMillis(200)
 
-    private const val CURSOR_PREFIX = "ev1:"
-
-    /** The cursor for position [seq]. */
-    fun encodeCursor(seq: Long): String =
-        Base64.getUrlEncoder().withoutPadding().encodeToString("$CURSOR_PREFIX$seq".toByteArray())
-
-    /** The position a cursor names, or null when it is not one. */
-    fun decodeCursor(cursor: String): Long? = runCatching {
-        val text = String(Base64.getUrlDecoder().decode(cursor))
-        text.removePrefix(CURSOR_PREFIX).takeIf { text.startsWith(CURSOR_PREFIX) }?.toLong()?.takeIf { it >= 0 }
-    }.getOrNull()
+    /** The oldest transaction still open, as the position just before everything it and later ones write. */
+    private const val HORIZON = "pg_snapshot_xmin(pg_current_snapshot())::text::bigint"
 
     /**
      * Reads the events after [after] that [userId] may see in [orgId] through
@@ -147,17 +154,10 @@ object EventFeedController {
         types: Set<String>?,
         limit: Int,
     ): EventPage {
-        var position = if (after == null) {
-            onIo { headSeq() }
-        } else {
-            decodeCursor(after) ?: throw fieldError("after")
-        }
-        val purgedThrough = onIo { purgedThrough() }
-        if (position < purgedThrough) {
-            throw ApiException(
-                HttpStatusCode.Gone, ErrorCodes.CURSOR_EXPIRED,
-                details = buildJsonObject { put("oldest", encodeCursor(purgedThrough)) },
-            )
+        var position: Position.At = when (val named = after?.let { EventCursor.decode(orgId, it) ?: throw fieldError("after") }) {
+            null -> onIo { Position.At(horizon() - 1, Long.MAX_VALUE) }
+            is Position.At -> named
+            is Position.Legacy -> onIo { fromLegacy(orgId, named.seq) }
         }
 
         val deadline = System.nanoTime() + Duration.ofSeconds(waitSeconds.toLong()).toNanos()
@@ -167,11 +167,14 @@ object EventFeedController {
             try {
                 val look = onIo { look(orgId, userId, keyId, position, types, limit) }
                 position = look.position
-                if (look.items.isNotEmpty()) return EventPage(look.items, encodeCursor(position))
+                val page = { EventPage(look.items, EventCursor.encode(orgId, position), look.more) }
+                if (look.items.isNotEmpty()) return page()
                 val remaining = Duration.ofNanos(deadline - System.nanoTime())
-                if (remaining.isNegative || remaining.isZero) return EventPage(emptyList(), encodeCursor(position))
-                val pause = minOf(remaining, if (look.held) HOLE_RECHECK else RECHECK)
-                val woken = withTimeoutOrNull(pause.toMillis()) { signal.await() } != null
+                if (remaining.isNegative || remaining.isZero) return page()
+                // Read everything there was and found nothing for the caller:
+                // there may be more, so look on at once.
+                if (look.more) continue
+                val woken = withTimeoutOrNull(minOf(remaining, RECHECK).toMillis()) { signal.await() } != null
                 if (woken) delay(minOf(SETTLE, Duration.ofNanos((deadline - System.nanoTime()).coerceAtLeast(0))).toMillis())
             } finally {
                 EventWakeups.release(orgId, signal)
@@ -182,102 +185,122 @@ object EventFeedController {
     /** Blocking database work, off the caller's thread, in a transaction of its own. */
     private suspend fun <T> onIo(block: () -> T): T = withContext(Dispatchers.IO) { transaction { block() } }
 
-    private fun headSeq(): Long = queryLong("SELECT COALESCE(MAX(seq), 0) FROM outbox")
+    private fun connection(): Connection = TransactionManager.current().connection.connection as Connection
 
-    private fun purgedThrough(): Long =
-        OutboxRetention.selectAll().where { OutboxRetention.id eq 1 }.firstOrNull()?.get(OutboxRetention.purgedThrough) ?: 0L
-
-    private fun queryLong(sql: String): Long {
-        val connection = TransactionManager.current().connection.connection as Connection
-        return connection.prepareStatement(sql).use { stmt ->
-            stmt.executeQuery().use { rs -> if (rs.next()) rs.getLong(1) else 0L }
-        }
+    private fun horizon(): Long = connection().prepareStatement("SELECT $HORIZON").use { stmt ->
+        stmt.executeQuery().use { rs -> rs.next(); rs.getLong(1) }
     }
 
-    /** One look's outcome: what it found, how far it read, and whether a hole stopped it. */
-    internal data class Look(val items: List<FeedEvent>, val position: Long, val held: Boolean)
+    /**
+     * Where an `ev1:` cursor — a bare `seq` — reads on from: just before the
+     * first row after that `seq`, in the order the feed now reads. Rows of the
+     * same transactions that the old cursor had passed come again; an event's
+     * id says it is one already seen.
+     */
+    private fun fromLegacy(orgId: UUID, seq: Long): Position.At {
+        val sql = "SELECT LEAST(COALESCE(MIN(xid), $HORIZON), $HORIZON) FROM outbox WHERE organization_id = ? AND seq > ?"
+        val first = connection().prepareStatement(sql).use { stmt ->
+            stmt.setObject(1, orgId)
+            stmt.setLong(2, seq)
+            stmt.executeQuery().use { rs -> rs.next(); rs.getLong(1) }
+        }
+        return Position.At(first - 1, Long.MAX_VALUE)
+    }
 
-    /** One outbox row as a look reads it. [payload] is null for another organization's row. */
+    /** One look's outcome: what it found, how far it read, and whether more may be there already. */
+    internal data class Look(val items: List<FeedEvent>, val position: Position.At, val more: Boolean)
+
+    /** One outbox row as a look reads it. */
     private data class Row(
-        val seq: Long,
+        val position: Position.At,
         val id: UUID,
         val eventType: String,
         val aggregateId: UUID,
         val createdAt: java.time.Instant,
-        val payload: JsonObject?,
+        val payload: JsonObject,
     )
 
     /** One look, in the caller's transaction. */
-    internal fun look(orgId: UUID, userId: UUID, keyId: UUID, after: Long, types: Set<String>?, limit: Int): Look {
-        // The key and its user as they are now, not as they were when the
-        // request came in: a long-poll outlives that moment.
-        val key = ApiKeyAuthenticator.recheck(keyId)
-        if (key is ApiKeyResult.Invalid) throw UnauthorizedException(apiKeyRefusal(key.reason))
-        val cached = resolveCachedPermissions(orgId, userId)
-            ?: throw UnauthorizedException(ErrorCodes.API_KEY_OWNER_INACTIVE)
+    internal fun look(orgId: UUID, userId: UUID, keyId: UUID, after: Position.At, types: Set<String>?, limit: Int): Look {
+        // The key, its user and their permissions as they are now, not as they
+        // were when the request came in: a long-poll outlives that moment.
+        val key = when (val result = ApiKeyAuthenticator.recheck(keyId)) {
+            is ApiKeyResult.Invalid -> throw UnauthorizedException(apiKeyRefusal(result.reason))
+            is ApiKeyResult.Valid -> result.context
+        }
+        if (!key.totpEnabled && SessionAuth.isTotpEnforcedForOrg(userId, orgId)) {
+            throw ForbiddenException(ErrorCodes.TOTP_ENROLLMENT_REQUIRED)
+        }
+        val cached = key.permissions ?: throw UnauthorizedException(ErrorCodes.API_KEY_OWNER_INACTIVE)
 
-        val (rows, held) = readRows(orgId, after)
+        val rows = readRows(orgId, after)
+        // After the read: a purge that passed the position meanwhile may have
+        // taken rows the read never saw.
+        val mark = OutboxRetention.selectAll().where { OutboxRetention.id eq 1 }.firstOrNull()
+            ?.let { Position.At(it[OutboxRetention.purgedXid], it[OutboxRetention.purgedSeq]) }
+        if (mark != null && after < mark) {
+            throw ApiException(
+                HttpStatusCode.Gone, ErrorCodes.CURSOR_EXPIRED,
+                details = buildJsonObject { put("oldest", EventCursor.encode(orgId, mark)) },
+            )
+        }
         val context = Context.load(rows)
 
         val items = mutableListOf<FeedEvent>()
         var position = after
+        var stoppedShort = false
         for (row in rows) {
             val events = eventsOf(row, cached, context).filter { types == null || it.type in types }
-            if (items.isNotEmpty() && items.size + events.size > limit) break
+            if (items.isNotEmpty() && items.size + events.size > limit) {
+                stoppedShort = true
+                break
+            }
             items += events
-            position = row.seq
-            if (items.size >= limit) break
+            position = row.position
+            if (items.size >= limit && row !== rows.last()) {
+                stoppedShort = true
+                break
+            }
         }
-        // An empty look took every row it read, so [held] still says why it stopped.
-        return Look(items, position, held)
+        return Look(items, position, stoppedShort || rows.size == SCAN_ROWS)
     }
 
-    /**
-     * The rows after [after] up to the first hole that may still fill, and
-     * whether one stopped the read. Rows of other organizations come without
-     * their payload: only their position matters here.
-     */
-    private fun readRows(orgId: UUID, after: Long): Pair<List<Row>, Boolean> {
+    /** The organization's rows after [after], up to the oldest open transaction. */
+    private fun readRows(orgId: UUID, after: Position.At): List<Row> {
         val sql = """
-            SELECT seq, id, event_type, aggregate_id, created_at,
-                   COALESCE(clock_timestamp() - inserted_at < make_interval(secs => ?), false) AS young,
-                   CASE WHEN payload ->> 'orgId' = ? OR payload ->> 'organizationId' = ? THEN payload::text END AS payload
+            SELECT seq, xid, id, event_type, aggregate_id, created_at, payload::text AS payload
             FROM outbox
-            WHERE seq > ?
-            ORDER BY seq
+            WHERE organization_id = ? AND (xid, seq) > (?, ?) AND xid < $HORIZON
+            ORDER BY xid, seq
             LIMIT ?
         """.trimIndent()
-        val connection = TransactionManager.current().connection.connection as Connection
         val rows = mutableListOf<Row>()
-        var held = false
-        connection.prepareStatement(sql).use { stmt ->
-            stmt.setDouble(1, GAP_GRACE.toMillis() / 1000.0)
-            stmt.setString(2, orgId.toString())
-            stmt.setString(3, orgId.toString())
-            stmt.setLong(4, after)
-            stmt.setInt(5, SCAN_ROWS)
+        connection().prepareStatement(sql).use { stmt ->
+            stmt.setObject(1, orgId)
+            stmt.setLong(2, after.xid)
+            stmt.setLong(3, after.seq)
+            stmt.setInt(4, SCAN_ROWS)
             stmt.executeQuery().use { rs ->
-                var expected = after + 1
                 while (rs.next()) {
-                    val seq = rs.getLong("seq")
-                    if (seq != expected && rs.getBoolean("young")) {
-                        held = true
-                        break
-                    }
                     rows += Row(
-                        seq = seq,
+                        position = Position.At(rs.getLong("xid"), rs.getLong("seq")),
                         id = rs.getObject("id") as UUID,
                         eventType = rs.getString("event_type"),
                         aggregateId = rs.getObject("aggregate_id") as UUID,
                         createdAt = rs.getTimestamp("created_at").toInstant(),
-                        payload = rs.getString("payload")?.let { Json.parseToJsonElement(it).jsonObject },
+                        payload = Json.parseToJsonElement(rs.getString("payload")).jsonObject,
                     )
-                    expected = seq + 1
                 }
             }
         }
-        return rows to held
+        return rows
     }
+
+    private val RESULT_EVENTS = setOf("probe_result.created", "probe_result.skipped")
+    private val SERVICE_EVENTS = setOf("resource.service.created", "resource.service.updated", "resource.service.deleted")
+    private val PROJECT_EVENTS = setOf("resource.project.created", "resource.project.updated", "resource.project.deleted")
+    private val WORKSPACE_EVENTS = setOf("resource.workspace.created", "resource.workspace.updated", "resource.workspace.deleted")
+    private val VARIABLE_EVENTS = setOf("resource.variable.created", "resource.variable.updated", "resource.variable.deleted")
 
     /** What a look needs to know about the resources its rows name, read once per look. */
     private class Context(
@@ -291,13 +314,12 @@ object EventFeedController {
                 val services = mutableSetOf<UUID>()
                 val variables = mutableMapOf<String, MutableSet<UUID>>()
                 for (row in rows) {
-                    val payload = row.payload ?: continue
-                    val parent = payload.uuid("parentId")
+                    val parent = row.payload.uuid("parentId")
                     when (row.eventType) {
-                        "resource.service.created", "resource.service.updated", "resource.service.deleted" ->
-                            parent?.let(projects::add)
-                        "resource.variable.created", "resource.variable.updated", "resource.variable.deleted" -> {
-                            val scope = payload.text("scope") ?: continue
+                        in RESULT_EVENTS -> row.payload.uuid("serviceId")?.let(services::add)
+                        in SERVICE_EVENTS -> parent?.let(projects::add)
+                        in VARIABLE_EVENTS -> {
+                            val scope = row.payload.text("scope") ?: continue
                             variables.getOrPut(scope) { mutableSetOf() } += row.aggregateId
                             when (scope) {
                                 "project" -> parent?.let(projects::add)
@@ -335,29 +357,30 @@ object EventFeedController {
     }
 
     /**
-     * The events [row] is, as the caller may see them: none for another
-     * organization's row, a kind the feed does not carry, or a resource the
-     * caller may not read.
+     * The events [row] is, as the caller may see them: none for a kind the
+     * feed does not carry, or a resource the caller may not read.
      */
     private fun eventsOf(row: Row, cached: CachedPermissions, context: Context): List<FeedEvent> {
-        val payload = row.payload ?: return emptyList()
+        val payload = row.payload
         val at = row.createdAt.toString()
         val change = row.eventType.substringAfterLast('.')
         fun event(type: String, resource: String, id: UUID, data: JsonObject, suffix: String = "") =
             FeedEvent(row.id.toString() + suffix, type, at, EventResource(resource, id.toString()), data)
 
         return when (row.eventType) {
-            "probe_result.created" -> {
+            in RESULT_EVENTS -> {
+                // Where the result's service lives now, from the database: the
+                // row is not trusted to say whose it is.
                 val service = payload.uuid("serviceId") ?: return emptyList()
-                val project = payload.uuid("projectId") ?: return emptyList()
-                val workspace = payload.uuid("workspaceId") ?: return emptyList()
+                val (project, workspace) = context.serviceParents[service] ?: return emptyList()
                 if (!visible(cached, "service", service, project, workspace)) return emptyList()
                 val status = payload.text("status")
                 buildList {
                     add(event(EventTypes.RESULT_RECORDED, "service", service, buildJsonObject {
                         put("resultId", payload.text("resultId"))
                         put("status", status)
-                        put("durationMs", payload["runDurationMs"]?.jsonPrimitive?.longOrNull)
+                        put("runDurationMs", payload["runDurationMs"]?.jsonPrimitive?.longOrNull)
+                        put("reason", payload.text("reason"))
                         put("projectId", project.toString())
                         put("workspaceId", workspace.toString())
                     }))
@@ -370,19 +393,19 @@ object EventFeedController {
                     }
                 }
             }
-            "resource.workspace.created", "resource.workspace.updated", "resource.workspace.deleted" -> {
+            in WORKSPACE_EVENTS -> {
                 val workspace = row.aggregateId
                 if (!visible(cached, "workspace", workspace, null, workspace)) return emptyList()
                 listOf(event("workspace.$change", "workspace", workspace, JsonObject(emptyMap())))
             }
-            "resource.project.created", "resource.project.updated", "resource.project.deleted" -> {
+            in PROJECT_EVENTS -> {
                 val workspace = payload.uuid("parentId") ?: return emptyList()
                 if (!visible(cached, "project", row.aggregateId, row.aggregateId, workspace)) return emptyList()
                 listOf(event("project.$change", "project", row.aggregateId, buildJsonObject {
                     put("workspaceId", workspace.toString())
                 }))
             }
-            "resource.service.created", "resource.service.updated", "resource.service.deleted" -> {
+            in SERVICE_EVENTS -> {
                 val project = payload.uuid("parentId") ?: return emptyList()
                 val workspace = context.projectWorkspace[project] ?: return emptyList()
                 if (!visible(cached, "service", row.aggregateId, project, workspace)) return emptyList()
@@ -391,7 +414,7 @@ object EventFeedController {
                     put("workspaceId", workspace.toString())
                 }))
             }
-            "resource.variable.created", "resource.variable.updated", "resource.variable.deleted" -> {
+            in VARIABLE_EVENTS -> {
                 val scope = payload.text("scope") ?: return emptyList()
                 val parent = payload.uuid("parentId") ?: return emptyList()
                 val allowed = when (scope) {
@@ -416,7 +439,7 @@ object EventFeedController {
                 // The warning log's permission: settings write.
                 if (!cached.org.settings.canWrite()) return emptyList()
                 listOf(event(EventTypes.ALERT_RAISED, "alert", row.aggregateId, buildJsonObject {
-                    put("alertType", payload.text("alertType"))
+                    put("type", payload.text("alertType"))
                     put("subject", payload.text("subject"))
                     put("severity", payload.text("severity"))
                 }))
@@ -427,9 +450,9 @@ object EventFeedController {
 
     /**
      * Whether the caller may read the workspace, project or service — the
-     * check the dashboard's read of it makes, with the same downward
-     * inheritance: a service through its project and workspace, a project
-     * through its workspace.
+     * check the dashboard's read of it makes, with the same inheritance: a
+     * service through its project and workspace, a project through its
+     * workspace.
      */
     internal fun visible(cached: CachedPermissions, type: String, id: UUID, project: UUID?, workspace: UUID): Boolean =
         when (type) {

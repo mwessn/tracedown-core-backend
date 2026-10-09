@@ -70,24 +70,31 @@ class OutboxPurgeJob(
             // retentionDays and floor are numeric values under our control —
             // safe to inline.
             //
-            // The same statement raises the retention mark to the highest seq
-            // it deleted, so a reader walking the log by seq can tell that it
-            // has been passed: what is deleted here is not a prefix (an
-            // unpublished result row outlives newer rows), so the lowest seq
-            // left cannot say that.
+            // A row's age is how long ago it was written (inserted_at), not
+            // created_at: a probe result's row carries the run's start, so a
+            // result recorded late would be "old" the moment it lands. Rows
+            // older than the column have only created_at.
+            //
+            // The same statement moves the retention mark to the last row it
+            // deleted in the order the event feed reads (xid, then seq), so a
+            // reader can tell that it has been passed: what is deleted here is
+            // not a prefix (an unpublished result row outlives newer rows), so
+            // the first row left cannot say that.
             val cursorClause = if (floor != null) "AND seq <= $floor" else ""
             val sql = """
                 WITH gone AS (
                     DELETE FROM outbox
-                    WHERE created_at < now() - make_interval(days => $retentionDays)
+                    WHERE COALESCE(inserted_at, created_at::timestamptz) < now() - make_interval(days => $retentionDays)
                       $cursorClause
                       AND (published = true OR event_type <> 'probe_result.created')
-                    RETURNING seq
+                    RETURNING COALESCE(xid, 0) AS xid, seq
+                ), last AS (
+                    SELECT xid, seq FROM gone ORDER BY xid DESC, seq DESC LIMIT 1
                 ), mark AS (
-                    UPDATE outbox_retention
-                    SET purged_through = GREATEST(purged_through, (SELECT MAX(seq) FROM gone)),
-                        updated_at = now()
-                    WHERE id = 1 AND EXISTS (SELECT 1 FROM gone)
+                    UPDATE outbox_retention r
+                    SET purged_xid = last.xid, purged_seq = last.seq, updated_at = now()
+                    FROM last
+                    WHERE r.id = 1 AND (last.xid, last.seq) > (r.purged_xid, r.purged_seq)
                 )
                 SELECT COUNT(*) AS deleted FROM gone
             """.trimIndent()

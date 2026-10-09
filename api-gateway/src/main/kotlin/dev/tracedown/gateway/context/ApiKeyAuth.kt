@@ -5,6 +5,9 @@ import dev.tracedown.common.auth.ApiKeyResult
 import dev.tracedown.common.auth.TokenHasher
 import dev.tracedown.common.errors.ErrorCodes
 import dev.tracedown.common.models.ApiKeys
+import dev.tracedown.common.net.PathCanonicalizer
+import dev.tracedown.gateway.routes.publicapi.PublicApi
+import dev.tracedown.gateway.routes.publicapi.v1.EVENTS_PATH
 import dev.tracedown.gateway.util.ApiRateLimit
 import dev.tracedown.gateway.util.RateLimiter
 import dev.tracedown.gateway.util.TooManyRequestsException
@@ -76,7 +79,12 @@ internal object ApiKeyAuth {
             if (!admittedByMark) refuseAddress(call, spent)
         }
 
-        ApiRateLimit.spend(digest)?.let { budget ->
+        // The event feed is not metered per request: a long-poll that returns
+        // the moment something happens would otherwise spend the budget in
+        // proportion to how busy the organization is. It has a bound of its
+        // own — how many reads a key, user and organization hold open
+        // (`EventPollSlots`) — and the address limit above still applies.
+        if (!isEventFeed(call)) ApiRateLimit.spend(digest)?.let { budget ->
             call.response.headers.append("X-RateLimit-Limit", budget.limit.toString())
             call.response.headers.append("X-RateLimit-Remaining", budget.remaining.toString())
             if (!budget.allowed) {
@@ -149,6 +157,9 @@ internal object ApiKeyAuth {
         call.response.headers.append(HttpHeaders.RetryAfter, spent.retryAfterSeconds.toString())
         throw TooManyRequestsException(ErrorCodes.TOO_MANY_UNKNOWN_KEYS)
     }
+
+    private fun isEventFeed(call: ApplicationCall): Boolean =
+        PathCanonicalizer.canonicalize(call.request.local.uri) == PublicApi.V1 + EVENTS_PATH
 
     private fun recentlyMarked(digest: String, now: Long): Boolean =
         markedGood[digest]?.let { now - it < DEBOUNCE_SECONDS } ?: false

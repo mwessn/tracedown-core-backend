@@ -36,18 +36,34 @@ object Outbox : Table("outbox") {
     val claimedBy = varchar("claimed_by", 128).nullable()
     val claimedAt = timestamp("claimed_at").nullable()
 
+    /** The row's place in the log (a BIGINT identity), assigned by the database at INSERT. */
+    val seq = long("seq").databaseGenerated()
+
     /**
      * When the row was written, by the database's clock at the INSERT itself
      * (`DEFAULT clock_timestamp()`), never set from code — [createdAt] is not
-     * that: a probe result's row carries the run's start. Null on rows older
+     * that: a probe result's row carries the run's start, which can be long
+     * before it is recorded. The purge ages rows by it. Null on rows older
      * than the column.
-     *
-     * The event feed reads it to tell a hole in [seq] that a transaction still
-     * holds open (which will fill) from one a rollback left (which will not):
-     * `seq` is handed out at INSERT and becomes visible at COMMIT, so for a
-     * moment a later number can be readable while an earlier one is not.
      */
     val insertedAt = timestampWithTimeZone("inserted_at").nullable().databaseGenerated()
+
+    /**
+     * The id of the transaction that wrote the row (`DEFAULT
+     * pg_current_xact_id()`), never set from code. The event feed reads the log
+     * in (xid, seq) order and only below the oldest transaction still open, so
+     * a row that commits late is never passed over: `seq` is handed out at
+     * INSERT and seen at COMMIT, so `seq` alone is not an order a reader can
+     * trust. Null on rows older than the column.
+     */
+    val xid = long("xid").nullable().databaseGenerated()
+
+    /**
+     * The organization the row is about, for readers that want one
+     * organization's rows (the event feed). Set by the emitters; null for
+     * platform rows and rows older than the column.
+     */
+    val organizationId = javaUUID("organization_id").nullable()
 
     override val primaryKey = PrimaryKey(id)
 }

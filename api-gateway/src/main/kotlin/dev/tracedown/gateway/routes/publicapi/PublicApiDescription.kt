@@ -65,7 +65,8 @@ private val API_SUMMARY = """
     `method_not_allowed`, a path that will not reduce to one canonical spelling 400 `invalid_path` — all in the
     same shape.
 
-    **Rate budget**: 300 requests a minute per key (the operator may set another). Requests that reached a key's
+    **Rate budget**: 300 requests a minute per key (the operator may set another), except the event feed, which is
+    bounded by how many reads are open instead. Requests that reached a key's
     budget carry `X-RateLimit-Limit` and `X-RateLimit-Remaining`; a refusal is 429 `rate_limited` with
     `Retry-After` in seconds. An address that keeps sending tokens that name no key (or no token) is refused 429
     `too_many_unknown_keys`, also with `Retry-After`.
@@ -89,10 +90,12 @@ private val STATUS_CODES: Map<HttpStatusCode, String> = mapOf(
     HttpStatusCode.NotFound to "`not_found` — no such resource, or one the caller may not see.",
     HttpStatusCode.MethodNotAllowed to "`method_not_allowed`.",
     HttpStatusCode.Conflict to "`already_exists`, `version_conflict`, `binding_exists`, `script_missing`, `service_inactive`.",
-    HttpStatusCode.Gone to "`body_gone` — the step recorded a body that is no longer there.",
+    HttpStatusCode.Gone to "`body_gone` — the step recorded a body that is no longer there; `cursor_expired` — the " +
+        "event cursor is older than the events kept (`details.oldest` is where to start again).",
     HttpStatusCode.PayloadTooLarge to "`request_body_too_large` (the request), or `body_too_large` (a stored body; " +
         "`details.maxBytes`).",
-    HttpStatusCode.TooManyRequests to "`rate_limited` (the key's budget) or `too_many_unknown_keys` (the address). " +
+    HttpStatusCode.TooManyRequests to "`rate_limited` (the key's budget), `too_many_unknown_keys` (the address) or " +
+        "`too_many_event_polls` (event reads open). " +
         "`Retry-After` says when to come back.",
     HttpStatusCode.ServiceUnavailable to "`body_store_unavailable` — retry with backoff after `Retry-After`.",
 )

@@ -22,7 +22,7 @@ import kotlinx.serialization.json.put
 import org.jetbrains.exposed.v1.core.ResultRow
 import org.jetbrains.exposed.v1.core.SortOrder
 import org.jetbrains.exposed.v1.jdbc.Query
-import dev.tracedown.gateway.util.BadRequestException
+import dev.tracedown.gateway.util.fieldError
 import dev.tracedown.gateway.util.ForbiddenException
 import dev.tracedown.gateway.util.NotFoundException
 import dev.tracedown.gateway.util.ResourceResolver
@@ -109,7 +109,11 @@ object RulePresetController {
      * offers it there. Call inside a transaction.
      */
     fun scriptFor(orgId: UUID, requestingUserId: UUID, presetId: UUID, workspaceId: UUID): String {
-        val row = readable(orgId, requestingUserId, presetId)
+        val row = try {
+            readable(orgId, requestingUserId, presetId)
+        } catch (_: NotFoundException) {
+            throw presetNotFound()
+        }
         val scope = row[OrgRulePresets.workspaceId]
         if (scope != null && scope != workspaceId) throw presetNotFound()
         return row[OrgRulePresets.script]
@@ -123,13 +127,13 @@ object RulePresetController {
                 (OrgRulePresets.organizationId eq orgId) and
                 (OrgRulePresets.deleted eq false)
             }
-            .firstOrNull() ?: throw presetNotFound()
+            .firstOrNull() ?: throw NotFoundException()
         val scope = row[OrgRulePresets.workspaceId]
-        if (scope != null && visibleWorkspaceScope(cached, scope) { inOrg(orgId, it) } == null) throw presetNotFound()
+        if (scope != null && visibleWorkspaceScope(cached, scope) { inOrg(orgId, it) } == null) throw NotFoundException()
         return row
     }
 
-    /** 404, naming the preset: it is also what a create that names one it cannot read answers. */
+    /** 404 naming `presetId`: what a service create that names a preset it cannot use answers. */
     private fun presetNotFound() = ApiException(
         HttpStatusCode.NotFound, ErrorCodes.NOT_FOUND,
         details = buildJsonObject { put("field", "presetId") },
@@ -207,14 +211,9 @@ object RulePresetController {
         request.script?.let(::validScript)
 
         return transaction {
-            val row = OrgRulePresets.selectAll()
-                .where {
-                    (OrgRulePresets.id eq presetId) and
-                    (OrgRulePresets.organizationId eq orgId) and
-                    (OrgRulePresets.deleted eq false)
-                }
-                .firstOrNull() ?: throw NotFoundException()
-
+            // One the caller cannot read is not there for them — not a 403
+            // that says it exists.
+            val row = readable(orgId, requestingUserId, presetId)
             requireScopeWrite(orgId, requestingUserId, row[OrgRulePresets.workspaceId])
 
             OrgRulePresets.update({ OrgRulePresets.id eq presetId }) {
@@ -235,37 +234,30 @@ object RulePresetController {
         }
     }
 
+    /** A preset's name, trimmed. Names need not be unique. */
     private fun validName(raw: String): String {
         val name = raw.trim()
-        if (name.isEmpty()) throw BadRequestException(ErrorCodes.FIELD_REQUIRED)
-        if (name.length > 128) throw BadRequestException(ErrorCodes.FIELD_TOO_LONG)
+        if (name.isEmpty()) throw fieldError("name", ErrorCodes.FIELD_REQUIRED)
+        if (name.length > 128) throw fieldError("name", ErrorCodes.FIELD_TOO_LONG)
         return name
     }
 
     /** Never store a script that can't run — same validator the service script save path uses. */
     private fun validScript(script: String) {
-        if (script.isBlank()) throw BadRequestException(ErrorCodes.FIELD_REQUIRED)
-        try {
-            val ast = dev.lacelang.validator.parse(script)
-            val sink = dev.lacelang.validator.validate(ast)
-            if (sink.errors.isNotEmpty()) throw BadRequestException(ErrorCodes.FIELD_INVALID)
-        } catch (e: BadRequestException) {
-            throw e
+        if (script.isBlank()) throw fieldError("script", ErrorCodes.FIELD_REQUIRED)
+        val valid = try {
+            dev.lacelang.validator.validate(dev.lacelang.validator.parse(script)).errors.isEmpty()
         } catch (_: Exception) {
-            throw BadRequestException(ErrorCodes.FIELD_INVALID)
+            false
         }
+        if (!valid) throw fieldError("script")
     }
 
     /** Three-tier deletes a preset. Requires write access to its scope. */
     fun delete(orgId: UUID, requestingUserId: UUID, presetId: UUID) {
         transaction {
-            val row = OrgRulePresets.selectAll()
-                .where {
-                    (OrgRulePresets.id eq presetId) and
-                    (OrgRulePresets.organizationId eq orgId) and
-                    (OrgRulePresets.deleted eq false)
-                }
-                .firstOrNull() ?: throw NotFoundException()
+            // As [update]: one the caller cannot read is not found.
+            val row = readable(orgId, requestingUserId, presetId)
 
             requireScopeWrite(orgId, requestingUserId, row[OrgRulePresets.workspaceId])
 

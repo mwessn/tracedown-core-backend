@@ -182,12 +182,11 @@ object ServiceController {
         // A script and an enabled state, when the create carries them, meet the
         // checks a script save and an enable meet — refused before anything is
         // written when they can be decided without the service.
+        // A preset or a script, not both. The id's form was checked with the body.
+        if (request.presetId != null && !request.script.isNullOrBlank()) throw fieldError("presetId")
+        val presetId = request.presetId?.let(UUID::fromString)
         if (request.script != null && request.script.isNotBlank()) {
             validateScript(request.script).takeIf { it.isNotEmpty() }?.let { throw scriptRefused(it) }
-        }
-        val presetId = request.presetId?.let { raw ->
-            if (!request.script.isNullOrBlank()) throw fieldError("presetId")
-            runCatching { UUID.fromString(raw) }.getOrElse { throw fieldError("presetId", ErrorCodes.INVALID_UUID) }
         }
         if (request.isActive == true && request.script.isNullOrBlank() && presetId == null) {
             throw fieldError("script", ErrorCodes.FIELD_REQUIRED)
@@ -200,19 +199,22 @@ object ServiceController {
         // is saved, and the service switched, through the functions their own
         // endpoints use; the nudge and the live updates go out once, after.
         val (summary, workspaceId) = transaction {
-            val (created, workspaceId) = createRow(orgId, projectId, request, userId)
-            var summary = created
-            val id = UUID.fromString(created.id)
             // A preset is read once the caller is known to be able to create
-            // here, so a refusal says nothing about presets they could not
-            // have used; its script then takes the path a script takes.
+            // here, so a refusal says nothing about presets they could not have
+            // used — and before the row, so a refused preset writes nothing,
+            // not even an outbox row a rollback takes back.
             val script = if (presetId != null) {
-                RulePresetController.scriptFor(orgId, userId, presetId, workspaceId).also { preset ->
+                val pCtx = ResourceResolver.resolveProject(projectId, orgId)
+                requireProjectWriteAccess(projectId, pCtx.workspaceId, requireCachedPermissions(orgId, userId))
+                RulePresetController.scriptFor(orgId, userId, presetId, pCtx.workspaceId).also { preset ->
                     validateScript(preset).takeIf { it.isNotEmpty() }?.let { throw scriptRefused(it) }
                 }
             } else {
                 request.script
             }
+            val (created, workspaceId) = createRow(orgId, projectId, request, userId)
+            var summary = created
+            val id = UUID.fromString(created.id)
             if (!script.isNullOrBlank()) {
                 summary = updateRow(
                     orgId, id, UpdateServiceRequest(script = script, version = created.version), userId,

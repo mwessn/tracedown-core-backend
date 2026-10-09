@@ -6,6 +6,7 @@ import dev.tracedown.common.alerts.SystemAlertService
 import dev.tracedown.common.logging.LogContext
 import dev.tracedown.common.models.BodyStores
 import dev.tracedown.common.models.Outbox
+import dev.tracedown.common.models.OutboxEmit
 import dev.tracedown.common.models.ProbeResults
 import dev.tracedown.common.models.ProbeSteps
 import dev.tracedown.common.models.ServiceVariables
@@ -51,6 +52,31 @@ import java.util.UUID
 object ResultPersistenceService {
 
     private val log = LoggerFactory.getLogger(javaClass)
+
+    /**
+     * The outbox event of a skipped run. Not `probe_result.created`: that is
+     * what the notification consumer claims, and a run that never happened
+     * notifies nobody.
+     */
+    const val SKIPPED_EVENT = "probe_result.skipped"
+
+    /**
+     * A writeback's change to a service variable, as the gateway announces
+     * one made through the API: the variable and where it lives, never its
+     * value. Call inside the persisting transaction.
+     */
+    private fun emitWritebackEvent(change: String, variableId: UUID, serviceId: UUID, organizationId: UUID) {
+        OutboxEmit.emitResourceEvent(
+            "resource.variable.$change", "variable", variableId,
+            buildJsonObject {
+                put("id", variableId.toString())
+                put("orgId", organizationId.toString())
+                put("scope", "service")
+                put("parentId", serviceId.toString())
+            },
+            organizationId = organizationId,
+        )
+    }
 
     /** What a persist attempt did, so the caller knows whether it is the first. */
     enum class PersistOutcome {
@@ -611,8 +637,12 @@ object ResultPersistenceService {
             // 3. Update service status tracking. Skipped probes don't touch
             // it: last_status stays the last real outcome, and last_run_id
             // must keep pointing at a real result (it feeds `prev` writeback).
+            // Locked: two results of one service ingested at once would
+            // otherwise both read the same last_status, and the outbox would
+            // say the status changed twice — or not at all.
             val service = if (status == "skipped") null else Services.selectAll()
                 .where { Services.id eq serviceId }
+                .forUpdate()
                 .firstOrNull()
 
             // Captured BEFORE the status update below overwrites it. On a
@@ -677,6 +707,7 @@ object ResultPersistenceService {
                                 it[value] = valueStr
                                 it[updatedAt] = startedAt
                             }
+                            emitWritebackEvent("updated", existing[ServiceVariables.id], serviceId, organizationId)
                         } else {
                             log.warn(
                                 "writeback for service {} key '{}' skipped: target is a secret/encrypted variable, not a metric",
@@ -684,8 +715,9 @@ object ResultPersistenceService {
                             )
                         }
                     } else {
+                        val variableId = UUID.randomUUID()
                         ServiceVariables.insert {
-                            it[id] = UUID.randomUUID()
+                            it[id] = variableId
                             it[ServiceVariables.serviceId] = serviceId
                             it[key] = varKey
                             it[value] = valueStr
@@ -695,6 +727,7 @@ object ResultPersistenceService {
                             it[createdAt] = startedAt
                             it[updatedAt] = startedAt
                         }
+                        emitWritebackEvent("created", variableId, serviceId, organizationId)
                     }
                 }
             }
@@ -714,8 +747,27 @@ object ResultPersistenceService {
             }
 
             // 5. Write outbox event for downstream consumers (notification-
-            // dispatcher, etc.). Skipped probes are history-only — no events.
+            // dispatcher, etc.). A skipped probe gets an event of its own
+            // type, which no notification consumer claims — it is history,
+            // not an outcome — but a reader waiting for the run hears of it.
+            if (status == "skipped") {
+                OutboxEmit.emitResourceEvent(
+                    SKIPPED_EVENT, "probe_result", resultId,
+                    buildJsonObject {
+                        put("resultId", resultId.toString())
+                        put("serviceId", serviceId.toString())
+                        put("projectId", projectId.toString())
+                        put("workspaceId", workspaceId.toString())
+                        put("organizationId", organizationId.toString())
+                        put("status", status)
+                        put("reason", rawResult["reason"]?.jsonPrimitive?.contentOrNull ?: "unknown")
+                    },
+                    createdAt = startedAt,
+                    organizationId = organizationId,
+                )
+            }
             if (status != "skipped") Outbox.insert {
+                it[Outbox.organizationId] = organizationId
                 it[id] = UUID.randomUUID()
                 it[aggregateType] = "probe_result"
                 it[aggregateId] = resultId

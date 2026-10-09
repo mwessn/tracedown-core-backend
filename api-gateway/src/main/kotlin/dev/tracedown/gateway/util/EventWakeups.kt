@@ -1,4 +1,4 @@
-package dev.tracedown.gateway.controllers.events
+package dev.tracedown.gateway.util
 
 import dev.tracedown.common.models.OutboxEmit
 import dev.tracedown.common.redis.RedisFactory
@@ -25,7 +25,7 @@ import java.util.concurrent.ConcurrentHashMap
  *
  * Nothing here is relied on for correctness. A nudge that is lost, a process
  * that writes to the outbox without sending one, a Redis that is away: the
- * reads look again on their own every few seconds (see [EventFeedController]),
+ * reads look again on their own every few seconds (see `EventFeedController`),
  * and find the rows then.
  */
 object EventWakeups {

@@ -54,6 +54,9 @@ object OutboxEmit {
      * "workspace"), [aggregateId] the id of the affected entity, [eventType] a
      * dotted name (e.g. "resource.workspace.created"), and [payload] a compact
      * JSON body. Call within an open transaction.
+     *
+     * [organizationId] is the organization the row is about; left out, it is
+     * read from the payload's `orgId` (or `organizationId`).
      */
     fun emitResourceEvent(
         eventType: String,
@@ -61,8 +64,11 @@ object OutboxEmit {
         aggregateId: UUID,
         payload: JsonObject,
         createdAt: Instant = Instant.now(),
+        organizationId: UUID? = null,
     ) {
+        val orgId = organizationId ?: orgOf(payload)
         Outbox.insert {
+            it[Outbox.organizationId] = orgId
             it[id] = UUID.randomUUID()
             it[Outbox.aggregateType] = aggregateType
             it[Outbox.aggregateId] = aggregateId
@@ -71,10 +77,12 @@ object OutboxEmit {
             it[published] = false
             it[Outbox.createdAt] = createdAt
         }
-        val orgId = payload["orgId"]?.jsonPrimitive?.contentOrNull
-            ?.let { runCatching { UUID.fromString(it) }.getOrNull() }
         if (orgId != null) nudgeAfterCommit(orgId)
     }
+
+    private fun orgOf(payload: JsonObject): UUID? =
+        (payload["orgId"] ?: payload["organizationId"])?.jsonPrimitive?.contentOrNull
+            ?.let { runCatching { UUID.fromString(it) }.getOrNull() }
 
     private fun nudgeAfterCommit(orgId: UUID) {
         val notify = nudge ?: return

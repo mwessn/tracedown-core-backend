@@ -18,6 +18,8 @@ import dev.tracedown.common.errors.ErrorCodes
 import dev.tracedown.gateway.util.BadRequestException
 import dev.tracedown.gateway.util.ConflictException
 import dev.tracedown.gateway.util.NotFoundException
+import dev.tracedown.gateway.util.isUniqueViolation
+import org.jetbrains.exposed.v1.exceptions.ExposedSQLException
 import dev.tracedown.gateway.util.requireOrgRead
 import dev.tracedown.gateway.util.requireOrgWrite
 import org.jetbrains.exposed.v1.core.and
@@ -45,7 +47,9 @@ object NotificationTemplateController {
         validateName(request.name)
         validateText(request.text)
 
-        return transaction {
+        // Two creates of one name at once both pass the check below; the
+        // unique index decides, and the loser is told as the check would.
+        return conflictOnDuplicate { transaction {
             requireOrgWrite(orgId, userId) { it.notifications }
 
             // Check name uniqueness within org
@@ -71,7 +75,7 @@ object NotificationTemplateController {
             }
 
             // Bind to projects if provided
-            request.projectIds?.forEach { projectIdStr ->
+            request.projectIds?.distinct()?.forEach { projectIdStr ->
                 val projectId = UUID.fromString(projectIdStr)
                 requireProjectInOrg(projectId, orgId)
                 ProjectNotificationTemplates.insert {
@@ -84,7 +88,15 @@ object NotificationTemplateController {
             AuditService.log(orgId, userId, "create.notification-template", "notification-template", id.toString(), entityDisplayName = request.name)
 
             templateSummary(id)
-        }
+        } }
+    }
+
+    /** Runs [block], answering a unique violation it ends in with 409. */
+    private fun <T> conflictOnDuplicate(block: () -> T): T = try {
+        block()
+    } catch (e: ExposedSQLException) {
+        if (isUniqueViolation(e)) throw ConflictException()
+        throw e
     }
 
     /** Lists all notification templates in the organization. */
@@ -243,6 +255,18 @@ object NotificationTemplateController {
     ): NotificationTemplateSummary {
         val projectId = UUID.fromString(request.projectId)
 
+        return try {
+            bind(orgId, templateId, projectId, userId, alreadyBoundOk)
+        } catch (e: ExposedSQLException) {
+            if (!isUniqueViolation(e)) throw e
+            // A bind of the same pair committed between the check and the
+            // insert: it is bound, which is what was asked for.
+            if (!alreadyBoundOk) throw ConflictException()
+            transaction { templateSummary(templateId) }
+        }
+    }
+
+    private fun bind(orgId: UUID, templateId: UUID, projectId: UUID, userId: UUID, alreadyBoundOk: Boolean): NotificationTemplateSummary {
         return transaction {
             requireOrgWrite(orgId, userId) { it.notifications }
             requireExists(templateId, orgId)

@@ -566,6 +566,7 @@ dev.tracedown.gateway.data.alerts.PublicSystemAlert
 dev.tracedown.gateway.data.events.EventPage
   items: List<dev.tracedown.gateway.data.events.FeedEvent>
   next: kotlin.String
+  more: kotlin.Boolean optional
 
 dev.tracedown.gateway.data.events.EventResource
   type: kotlin.String
@@ -609,3 +610,19 @@ dev.tracedown.gateway.data.presets.RulePresetSummary
 dev.tracedown.gateway.data.presets.UpdateRulePresetRequest
   name: kotlin.String? optional
   script: kotlin.String? optional
+
+dev.tracedown.gateway.data.services.CreateServiceRequest
+  projectId: kotlin.String
+  name: kotlin.String
+  label: kotlin.String? optional
+  schedule: kotlin.String? optional
+  saveResponseBodies: kotlin.Boolean? optional
+  script: kotlin.String? optional
+  isActive: kotlin.Boolean? optional
+  presetId: kotlin.String? optional
+
+dev.tracedown.gateway.data.services.FailedAssertion
+  scope: kotlin.String
+  expected: kotlin.String?
+  actual: kotlin.String?
+  expression: kotlin.String? optional

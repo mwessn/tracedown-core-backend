@@ -207,10 +207,11 @@ fun Application.module() {
     dev.tracedown.common.models.OutboxEmit.onCommitted { orgId ->
         redisA.publish(dev.tracedown.common.models.OutboxEmit.NUDGE_CHANNEL, orgId.toString())
     }
-    dev.tracedown.gateway.controllers.events.EventPollSlots.init { redisA }
-    dev.tracedown.gateway.controllers.events.EventWakeups.start(appConfig.redis.aUrl)
+    dev.tracedown.gateway.util.EventPollSlots.init { redisA }
+    dev.tracedown.gateway.util.EventCursor.init(appConfig.platform.aesKey)
+    dev.tracedown.gateway.util.EventWakeups.start(appConfig.redis.aUrl)
     monitor.subscribe(io.ktor.server.application.ApplicationStopped) {
-        dev.tracedown.gateway.controllers.events.EventWakeups.stop()
+        dev.tracedown.gateway.util.EventWakeups.stop()
     }
     dev.tracedown.common.realtime.RealtimePublisher.init { redisA }
 
