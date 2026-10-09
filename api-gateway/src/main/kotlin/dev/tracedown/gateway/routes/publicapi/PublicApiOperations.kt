@@ -571,8 +571,9 @@ object PublicApiOperations {
                 "alert's episode start, otherwise when the change was made.\n\n" +
                 "**Cost.** A read does at most ${EventFeedController.MAX_LOOKS} looks for events and then answers, even " +
                 "before `wait` is up. The first look of a read that waits is free of the request budget; every look " +
-                "after it, and a read that answers without waiting (`wait=0`, or events already there), spends one " +
-                "request of it. A key holds at most ${EventPollSlots.PER_KEY} reads open at once (a user " +
+                "after it, a read that answers without waiting (`wait=0`, or events already there), and every 410 " +
+                "spends one request of it; a key whose budget is spent is refused on arrival (429 `rate_limited`). " +
+                "Answers carry no `X-RateLimit-*` headers. A key holds at most ${EventPollSlots.PER_KEY} reads open at once (a user " +
                 "${EventPollSlots.PER_USER}, an organization ${EventPollSlots.PER_ORG}); beyond that, 429 " +
                 "`too_many_event_polls` with `details.bound` and `Retry-After`. A caller who can see nothing at all " +
                 "is answered at once. A transaction left open anywhere on the database server (any database, " +

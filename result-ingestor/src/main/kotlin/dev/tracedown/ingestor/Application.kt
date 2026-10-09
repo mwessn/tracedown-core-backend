@@ -36,6 +36,8 @@ fun main(args: Array<String>) = EngineMain.main(args)
 /** Ktor module — wires DB, Redis, and the consumer loop. */
 fun Application.module() {
     val config = IngestorConfig.load(environment)
+    // The same cap the gateway applies to variables, from the same setting.
+    dev.tracedown.common.variables.VariableLimits.init(config.maxVarsPerResource)
 
     // Fail fast in production if a published dev credential is still in place.
     // No-op in dev (see SecretGuard). This service ships no credential default

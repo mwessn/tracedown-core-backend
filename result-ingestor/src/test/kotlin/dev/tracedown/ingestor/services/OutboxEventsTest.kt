@@ -305,16 +305,21 @@ class OutboxEventsTest {
     }
 
     @Test
-    fun `a writeback names at most as many keys as a service may hold`() {
-        val service = newService()
-        val max = dev.tracedown.common.variables.VariableLimits.DEFAULT_MAX_PER_RESOURCE
-        val keys = (1..max + 5).joinToString(",") { "\"k$it\": $it" }
-        persist(service, "success", """, "actions": { "variables": { $keys } }""")
-        val written = transaction {
-            dev.tracedown.common.models.ServiceVariables.selectAll()
-                .where { dev.tracedown.common.models.ServiceVariables.serviceId eq service }.count()
+    fun `a writeback names at most as many keys as a service may hold, as configured`() {
+        val limits = dev.tracedown.common.variables.VariableLimits
+        try {
+            limits.init(7)
+            val service = newService()
+            val keys = (1..12).joinToString(",") { "\"k$it\": $it" }
+            persist(service, "success", """, "actions": { "variables": { $keys } }""")
+            val written = transaction {
+                dev.tracedown.common.models.ServiceVariables.selectAll()
+                    .where { dev.tracedown.common.models.ServiceVariables.serviceId eq service }.count()
+            }
+            assertEquals(7L, written)
+        } finally {
+            limits.init(limits.DEFAULT_MAX_PER_RESOURCE)
         }
-        assertEquals(max.toLong(), written)
     }
 
     @Test

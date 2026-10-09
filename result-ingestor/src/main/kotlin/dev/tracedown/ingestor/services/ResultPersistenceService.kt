@@ -801,10 +801,11 @@ object ResultPersistenceService {
             val actions = rawResult["actions"]?.jsonObject
             val writebackVars = actions?.get("variables")?.jsonObject
             if (writebackVars != null && writebackVars.isNotEmpty()) {
-                // A run writes back at most as many keys as a service may hold;
-                // the rest are dropped, and said so. Each written key is an
-                // outbox row, so an unbounded map would be unbounded rows.
-                val maxKeys = VariableLimits.DEFAULT_MAX_PER_RESOURCE
+                // A run writes back at most as many keys as a service may hold
+                // (`MAX_VARS_PER_RESOURCE`, the gateway's setting); the rest are
+                // dropped, and said so. Each written key is an outbox row, so an
+                // unbounded map would be unbounded rows.
+                val maxKeys = VariableLimits.max()
                 if (writebackVars.size > maxKeys) {
                     log.warn(
                         "writeback for service {} carries {} keys; the {} after the first {} are ignored",

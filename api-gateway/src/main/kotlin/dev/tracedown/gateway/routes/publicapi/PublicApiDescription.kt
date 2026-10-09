@@ -94,10 +94,11 @@ private val API_SUMMARY = """
     `method_not_allowed`, a path that will not reduce to one canonical spelling 400 `invalid_path` — all in the
     same shape.
 
-    **Rate budget**: 300 requests a minute per key (the operator may set another), except the event feed, which is
-    bounded by how many reads are open instead. Requests that reached a key's
+    **Rate budget**: 300 requests a minute per key (the operator may set another). Requests that reached a key's
     budget carry `X-RateLimit-Limit` and `X-RateLimit-Remaining`; a refusal is 429 `rate_limited` with
-    `Retry-After` in seconds. An address that keeps sending tokens that name no key (or no token) is refused 429
+    `Retry-After` in seconds. The event feed (`/events`) is charged per look instead of per request: the first look
+    of a read that waits is free, and every later look, every answer given without waiting and every 410 costs one
+    request; a key whose budget is spent is refused on arrival. Its answers carry no `X-RateLimit-*` headers. An address that keeps sending tokens that name no key (or no token) is refused 429
     `too_many_unknown_keys`, also with `Retry-After`.
 
     **Lists.** Paged lists answer `{items, total, page, pageSize}` and page with `page` (from 1) and `pageSize` (at
