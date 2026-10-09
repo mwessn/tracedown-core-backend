@@ -558,7 +558,12 @@ object ResultPersistenceService {
         // was thought dead) both pass the check and one of them loses here. That
         // is the intended outcome, not an error — the row exists either way.
         try {
-        transaction {
+        // READ COMMITTED for this transaction alone: the results of one run
+        // are ingested side by side, and each counts the others under the
+        // request row's lock. At the pool's REPEATABLE READ a sibling would
+        // count from a snapshot taken before the lock was granted, or be
+        // refused with a serialization failure and retried.
+        transaction(transactionIsolation = java.sql.Connection.TRANSACTION_READ_COMMITTED) {
             // 0. A body kept in a store may only be recorded while that store
             // still exists. Locking the row holds a concurrent delete off until
             // this result commits — the delete then sees the step and is refused

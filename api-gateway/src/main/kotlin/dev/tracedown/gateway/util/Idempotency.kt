@@ -24,6 +24,7 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.intOrNull
+import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
@@ -55,22 +56,30 @@ import java.util.UUID
  *    in which case that answer said so with `Idempotency-Status: not-kept`.
  *    It never runs a second time.
  *  - **still being answered** — 409 `idempotency_in_progress`, with
- *    `Retry-After`.
+ *    `Retry-After`; once it has been answered for longer than
+ *    [IN_FLIGHT_TTL_SECONDS], 409 `idempotency_outcome_unknown` instead. The
+ *    marker stands a day, so a request that never came back is never run
+ *    again.
  *
  * The same key with a different fingerprint is 422 `idempotency_key_reused`.
  *
- * Kept answers count against a byte budget per organization per
- * [TTL_SECONDS] ([orgBudgetBytes]); once it is spent, a request carrying a
- * new key is refused before it runs — 429 `idempotency_limit_reached`, with
- * `Retry-After` — rather than run without the promise. A request carrying no
- * key is never affected.
+ * Every record written down — a kept answer or an unknown outcome — is
+ * charged, at its stored size, to a byte budget per organization
+ * ([orgBudgetBytes]), whose window is fixed at [TTL_SECONDS] from its first
+ * charge. Once it is spent, a request carrying a new key is refused before it
+ * runs — 429 `idempotency_limit_reached`, with `Retry-After` (when the window
+ * ends) — rather than run without the promise. A request carrying no key is
+ * never affected.
+ *
+ * A replay re-checks that the caller is still a member of the organization;
+ * it does not re-run the route's own permission check — the answer is what
+ * the caller was given when they could ask.
  *
  * Kept in Redis A, shared by every gateway replica. When it does not answer,
  * a request carrying a key is refused, 503 `idempotency_unavailable` with
  * `Retry-After`, and its key is let go if it had been taken. If it stops
- * answering after a handler has run, nothing can be written down: the key
- * stays held until its in-flight bound ([IN_FLIGHT_TTL_SECONDS]) and is then
- * free.
+ * answering after a handler has run, nothing can be written down: the
+ * marker stands, and a repeat is told the outcome is unknown.
  */
 object Idempotency {
 
@@ -81,7 +90,11 @@ object Idempotency {
     /** How long a kept answer, or an unknown outcome, is remembered. */
     const val TTL_SECONDS = 24 * 3600L
 
-    /** How long a request being answered holds its key before it is decided. */
+    /**
+     * How long a request may be answered before a repeat stops waiting for it:
+     * past this its marker still stands (for [TTL_SECONDS]), and a repeat is
+     * told the outcome is unknown — never run again.
+     */
     const val IN_FLIGHT_TTL_SECONDS = 300L
 
     /** The longest key accepted. */
@@ -139,7 +152,12 @@ object Idempotency {
         val fingerprint = fingerprint(call, canonicalPath)
         val storeKey = "idempotency:$apiKeyId:${sha256(key.toByteArray())}"
         val token = UUID.randomUUID().toString()
-        val marker = record("pending", fingerprint, token)
+        val marker = buildJsonObject {
+            put("state", "pending")
+            put("fp", fingerprint)
+            put("token", token)
+            put("startedAt", System.currentTimeMillis() / 1000)
+        }.toString()
 
         // Twice at most: a record that lapses between the two calls below
         // leaves the key free, and the second try takes it.
@@ -163,7 +181,10 @@ object Idempotency {
                     throw ApiException(HttpStatusCode.TooManyRequests, ErrorCodes.IDEMPOTENCY_LIMIT_REACHED)
                 }
                 val taken = try {
-                    commands.set(storeKey, marker, SetArgs().nx().ex(IN_FLIGHT_TTL_SECONDS)) != null
+                    // A day, not the in-flight bound: a marker that lapsed
+                    // while its request was still running would let a repeat
+                    // run it a second time.
+                    commands.set(storeKey, marker, SetArgs().nx().ex(TTL_SECONDS)) != null
                 } catch (e: Exception) {
                     log.warn("idempotency store unavailable: {}", e.message)
                     // It may have been taken before the error: let it go.
@@ -189,7 +210,15 @@ object Idempotency {
                     return
                 }
                 "unknown" -> throw ConflictException(ErrorCodes.IDEMPOTENCY_OUTCOME_UNKNOWN)
-                else -> throw inProgress(call)
+                else -> {
+                    // Still marked as running, past the in-flight bound: it
+                    // never came back, and may have done its work.
+                    val startedAt = held["startedAt"]?.jsonPrimitive?.longOrNull ?: 0L
+                    if (System.currentTimeMillis() / 1000 - startedAt > IN_FLIGHT_TTL_SECONDS) {
+                        throw ConflictException(ErrorCodes.IDEMPOTENCY_OUTCOME_UNKNOWN)
+                    }
+                    throw inProgress(call)
+                }
             }
         }
         throw inProgress(call)
@@ -233,7 +262,6 @@ object Idempotency {
                         put("body", Base64.getEncoder().encodeToString(body))
                     }
                     decide(commands, inFlight, answer.toString())
-                    spend(commands, inFlight.orgId, body.size.toLong())
                 }
                 // The error page of a call whose handler was cut off: what it
                 // did may have been done.
@@ -267,10 +295,15 @@ object Idempotency {
         token?.let { put("token", it) }
     }.toString()
 
-    /** Replaces this request's own marker with [value], for [TTL_SECONDS] — never another request's. */
+    /**
+     * Replaces this request's own marker with [value], for [TTL_SECONDS] —
+     * never another request's — and charges the record's size to the
+     * organization's budget in the same step, only when it was written.
+     */
     private fun decide(commands: RedisCommands<String, String>, inFlight: InFlight, value: String) {
         commands.eval<Long>(
-            DECIDE_SCRIPT, ScriptOutputType.INTEGER, arrayOf(inFlight.storeKey), inFlight.token, value, TTL_SECONDS.toString(),
+            DECIDE_SCRIPT, ScriptOutputType.INTEGER, arrayOf(inFlight.storeKey, budgetKey(inFlight.orgId)),
+            inFlight.token, value, TTL_SECONDS.toString(),
         )
     }
 
@@ -280,11 +313,6 @@ object Idempotency {
     }
 
     private fun budgetKey(orgId: UUID) = "idempotency_bytes:$orgId"
-
-    /** Counts [bytes] of kept answer against [orgId]'s budget; the window starts with the first. */
-    private fun spend(commands: RedisCommands<String, String>, orgId: UUID, bytes: Long) {
-        commands.eval<Long>(SPEND_SCRIPT, ScriptOutputType.INTEGER, arrayOf(budgetKey(orgId)), bytes.toString(), TTL_SECONDS.toString())
-    }
 
     /** Seconds until [orgId]'s budget comes back, when it is spent; null while there is some left. */
     private fun budgetRetryAfter(commands: RedisCommands<String, String>, orgId: UUID): Long? {
@@ -336,28 +364,28 @@ object Idempotency {
     /** KEYS[1] = the key, ARGV[1] = this request's token: delete it only while it is still this request's marker. */
     private val RELEASE_SCRIPT = """
         local v = redis.call('get', KEYS[1])
-        if v and string.find(v, ARGV[1], 1, true) then
+        if v and cjson.decode(v)['token'] == ARGV[1] then
             return redis.call('del', KEYS[1])
         end
         return 0
     """.trimIndent()
 
-    /** KEYS[1] = the key, ARGV = token, the new value, its TTL: replace only this request's own marker. */
+    /**
+     * KEYS[1] = the key, KEYS[2] = the organization's budget counter; ARGV =
+     * token, the new value, the TTL. Replaces only this request's own marker,
+     * and only then charges the value's size to the budget, whose window
+     * starts with its first charge and does not move after.
+     */
     private val DECIDE_SCRIPT = """
         local v = redis.call('get', KEYS[1])
-        if v and string.find(v, ARGV[1], 1, true) then
+        if v and cjson.decode(v)['token'] == ARGV[1] then
             redis.call('set', KEYS[1], ARGV[2], 'EX', ARGV[3])
+            redis.call('incrby', KEYS[2], string.len(ARGV[2]))
+            if redis.call('ttl', KEYS[2]) < 0 then
+                redis.call('expire', KEYS[2], ARGV[3])
+            end
             return 1
         end
         return 0
-    """.trimIndent()
-
-    /** KEYS[1] = the budget counter, ARGV = bytes, window: add, and start the window with the first. */
-    private val SPEND_SCRIPT = """
-        local n = redis.call('incrby', KEYS[1], ARGV[1])
-        if redis.call('ttl', KEYS[1]) < 0 then
-            redis.call('expire', KEYS[1], ARGV[2])
-        end
-        return n
     """.trimIndent()
 }

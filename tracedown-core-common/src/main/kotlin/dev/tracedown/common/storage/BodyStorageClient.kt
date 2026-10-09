@@ -738,13 +738,16 @@ open class BodyStorageClient(
             ?: throw StorageConfinementException("filesystem relocation requires a confined root")
         // Confine + canonicalize the SOURCE (rejects escapes like /app/application.conf).
         val source = confineFilePath(sourcePath)
-        if (!Files.exists(source, LinkOption.NOFOLLOW_LINKS)) {
-            throw StorageConfinementException("source body does not exist: $source")
-        }
         // The dest key is server-derived; still normalize + confine it defensively.
         val dest = root.resolve(sanitizeKey(destKey)).normalize()
         if (!dest.startsWith(root)) {
             throw StorageConfinementException("dest key $destKey escapes confined root $root")
+        }
+        if (!Files.exists(source, LinkOption.NOFOLLOW_LINKS)) {
+            // Moved already — by an earlier attempt at the same result, whose
+            // transaction then did not commit. The body is where it belongs.
+            if (Files.isRegularFile(dest, LinkOption.NOFOLLOW_LINKS)) return "file://$dest"
+            throw StorageConfinementException("source body does not exist: $source")
         }
         dest.parent?.let { Files.createDirectories(it) }
         Files.move(source, dest, StandardCopyOption.REPLACE_EXISTING)
@@ -760,6 +763,24 @@ open class BodyStorageClient(
         val prefix = conf.normalizedS3Prefix
         val cleanDest = sanitizeKey(destKey)
         val destFullKey = if (prefix.isEmpty()) cleanDest else "$prefix/$cleanDest"
+        // Moved already — by an earlier attempt at the same result, whose
+        // transaction then did not commit: the source is gone and the copy is
+        // where it belongs.
+        val sourceThere = try {
+            client.headObject(HeadObjectRequest.builder().bucket(bucket).key(key).build())
+            true
+        } catch (e: AwsServiceException) {
+            if (isMissing(e)) false else throw e
+        }
+        if (!sourceThere) {
+            val destThere = try {
+                client.headObject(HeadObjectRequest.builder().bucket(allowedBucket).key(destFullKey).build())
+                true
+            } catch (e: AwsServiceException) {
+                if (isMissing(e)) false else throw e
+            }
+            if (destThere) return "s3://$allowedBucket/$destFullKey"
+        }
         client.copyObject(
             CopyObjectRequest.builder()
                 .sourceBucket(bucket)
