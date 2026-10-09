@@ -98,6 +98,13 @@ class ResultPublisher(private val redis: RedisCommands<String, String>) {
          * An ingestor that predates the field files every run as scheduled.
          */
         trigger: String = RunTrigger.SCHEDULE,
+        /**
+         * The run somebody asked for that this result belongs to, and how
+         * many results that run publishes in all ([RunTrigger.ENVELOPE_RUN_ID],
+         * [RunTrigger.ENVELOPE_RUN_SIZE]); null for any other run.
+         */
+        runId: UUID? = null,
+        runSize: Int? = null,
     ): UUID {
         val envelope = buildJsonObject {
             put("resultId", resultId.toString())
@@ -111,6 +118,10 @@ class ResultPublisher(private val redis: RedisCommands<String, String>) {
             put("startedAt", startedAt.toString())
             put("agentEgressBytes", agentEgressBytes)
             put("trigger", trigger)
+            if (runId != null) {
+                put(RunTrigger.ENVELOPE_RUN_ID, runId.toString())
+                put(RunTrigger.ENVELOPE_RUN_SIZE, runSize ?: 1)
+            }
             if (bodiesWithheld != null) put("bodiesWithheld", bodiesWithheld)
             if (endpointKeys != null) {
                 put("endpointKeys", buildJsonArray { for (key in endpointKeys) add(key) })

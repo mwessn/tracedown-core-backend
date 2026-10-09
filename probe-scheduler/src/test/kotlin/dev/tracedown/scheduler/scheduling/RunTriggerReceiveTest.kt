@@ -31,7 +31,7 @@ class RunTriggerReceiveTest {
 
     private fun receiver(): Pair<ScheduleSyncService, MutableList<DispatchItem>> {
         val enqueued = CopyOnWriteArrayList<DispatchItem>()
-        val service = ScheduleSyncService(quartz, 60, pubSubConnection = null, claims = null) { enqueued.add(it) }
+        val service = ScheduleSyncService(quartz, 60, pubSubConnection = noPubSub(), claims = null) { enqueued.add(it) }
         return service to enqueued
     }
 
@@ -51,6 +51,21 @@ class RunTriggerReceiveTest {
         val runId = UUID.randomUUID()
         service.onMessage(RunTrigger.RUN_CHANNEL, RunTrigger.encodeRun(serviceId, runId))
         assertEquals(listOf(DispatchItem(serviceId, manual = true, runId = runId)), enqueued)
+    }
+
+    @Test
+    fun `a run that cannot be claimed is not run`() {
+        // Redis does not answer the claim: another replica may have it, and
+        // two results under one id would lose one.
+        @Suppress("UNCHECKED_CAST")
+        val failing = java.lang.reflect.Proxy.newProxyInstance(
+            io.lettuce.core.api.sync.RedisCommands::class.java.classLoader,
+            arrayOf(io.lettuce.core.api.sync.RedisCommands::class.java),
+        ) { _, _, _ -> throw io.lettuce.core.RedisConnectionException("down") } as io.lettuce.core.api.sync.RedisCommands<String, String>
+        val enqueued = CopyOnWriteArrayList<DispatchItem>()
+        val service = ScheduleSyncService(quartz, 60, noPubSub(), claims = failing) { enqueued.add(it) }
+        service.onMessage(RunTrigger.RUN_CHANNEL, RunTrigger.encodeRun(UUID.randomUUID(), UUID.randomUUID()))
+        assertTrue(enqueued.isEmpty(), "$enqueued")
     }
 
     @Test

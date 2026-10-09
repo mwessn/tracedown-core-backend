@@ -140,10 +140,53 @@ class RunTriggerIngestTest {
     }
 
     @Test
+    fun `a run on several agents is settled by the last of its results`() {
+        val run = request()
+        val startedAt = NOW.plusMillis(123)
+        persist(id = run, trigger = RunTrigger.MANUAL, run = run, runSize = 2, startedAt = startedAt)
+        assertEquals(RunState.PENDING to null, stateOf(run), "one of two results is not the run")
+        persist(trigger = RunTrigger.MANUAL, outcome = "failure", run = run, runSize = 2, startedAt = startedAt)
+        assertEquals(RunState.DONE to run, stateOf(run))
+    }
+
+    @Test
+    fun `a real result replaces the skip its run was first answered with`() {
+        val run = request()
+        persist(id = run, trigger = RunTrigger.MANUAL, outcome = "skipped", reason = RunTrigger.SKIP_ALREADY_QUEUED)
+        assertEquals(RunState.SKIPPED to run, stateOf(run))
+        persist(id = run, trigger = RunTrigger.MANUAL)
+        assertEquals(RunState.DONE to run, stateOf(run))
+        assertEquals("success", transaction { ProbeResults.selectAll().where { ProbeResults.id eq run }.single()[ProbeResults.status] })
+        // Any other skip stands: it is not the scheduler's word about a request.
+        val shed = request()
+        persist(id = shed, trigger = RunTrigger.MANUAL, outcome = "skipped", reason = "dispatch_queue_full")
+        assertEquals(
+            ResultPersistenceService.PersistOutcome.ALREADY_PERSISTED,
+            ResultPersistenceService.persist(envelope(shed, RunTrigger.MANUAL, "success", null)),
+        )
+    }
+
+    @Test
+    fun `a result settles only a request of its own service`() {
+        val run = request()
+        val other = UUID.randomUUID()
+        transaction {
+            Services.insert {
+                it[id] = other
+                it[Services.projectId] = this@RunTriggerIngestTest.projectId
+                it[name] = "Other"
+                it[createdAt] = NOW
+            }
+        }
+        persist(trigger = RunTrigger.MANUAL, run = run, service = other)
+        assertEquals(RunState.PENDING to null, stateOf(run))
+    }
+
+    @Test
     fun `a skip answering a request raises nothing`() {
         for (reason in listOf(
             RunTrigger.SKIP_SERVICE_INACTIVE, RunTrigger.SKIP_SCRIPT_MISSING, RunTrigger.SKIP_IN_SERVICE_WINDOW,
-            RunTrigger.SKIP_HELD, RunTrigger.SKIP_ALREADY_RUNNING, RunTrigger.SKIP_ALREADY_QUEUED,
+            RunTrigger.SKIP_HELD, RunTrigger.SKIP_ALREADY_RUNNING, RunTrigger.SKIP_ALREADY_QUEUED, RunTrigger.SKIP_NOT_DELIVERED,
         )) {
             assertNull(SkippedProbeAlert.alertType(reason), reason)
         }
@@ -170,10 +213,14 @@ class RunTriggerIngestTest {
         trigger: String?,
         outcome: String = "success",
         reason: String? = null,
+        run: UUID? = if (trigger == RunTrigger.MANUAL) id else null,
+        runSize: Int = 1,
+        startedAt: Instant = NOW,
+        service: UUID = serviceId,
     ): UUID {
         assertEquals(
             ResultPersistenceService.PersistOutcome.PERSISTED,
-            ResultPersistenceService.persist(envelope(id, trigger, outcome, reason)),
+            ResultPersistenceService.persist(envelope(id, trigger, outcome, reason, run, runSize, startedAt, service)),
         )
         return id
     }
@@ -187,16 +234,26 @@ class RunTriggerIngestTest {
         row[RunRequests.state] to row[RunRequests.resultId]
     }
 
-    private fun envelope(id: UUID, trigger: String?, outcome: String, reason: String?) = Json.parseToJsonElement(
+    private fun envelope(
+        id: UUID,
+        trigger: String?,
+        outcome: String,
+        reason: String?,
+        run: UUID? = if (trigger == RunTrigger.MANUAL) id else null,
+        runSize: Int = 1,
+        startedAt: Instant = NOW,
+        service: UUID = serviceId,
+    ) = Json.parseToJsonElement(
         """
         {
           "resultId": "$id",
-          "serviceId": "$serviceId",
+          "serviceId": "$service",
           "projectId": "$projectId",
           "workspaceId": "$workspaceId",
           "organizationId": "$orgId",
-          "startedAt": "$NOW",
+          "startedAt": "$startedAt",
           ${if (trigger != null) "\"trigger\": \"$trigger\"," else ""}
+          ${if (run != null) "\"runId\": \"$run\", \"runSize\": $runSize," else ""}
           "rawResult": {"outcome": "$outcome", "elapsedMs": 0${if (reason != null) ", \"reason\": \"$reason\"" else ""}}
         }
         """.trimIndent(),

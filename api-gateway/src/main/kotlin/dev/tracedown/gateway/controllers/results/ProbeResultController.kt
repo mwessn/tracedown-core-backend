@@ -372,7 +372,12 @@ object ProbeResultController {
             }
             bodyStoreId?.let(BodyStoreService::clearFailure)
             when (read) {
-                is BodyStorageClient.StoredBody.Found -> use(publicContent(read.bytes, read.contentType))
+                is BodyStorageClient.StoredBody.Found -> {
+                    // Read: the places go back, the bytes stay reserved until
+                    // the answer is written.
+                    hold.releasePlaces()
+                    use(publicContent(read.bytes, read.contentType))
+                }
                 BodyStorageClient.StoredBody.Missing -> throw GoneException(ErrorCodes.BODY_GONE)
                 is BodyStorageClient.StoredBody.TooLarge -> throw ApiException(
                     HttpStatusCode.PayloadTooLarge, ErrorCodes.BODY_TOO_LARGE,
@@ -391,9 +396,26 @@ object ProbeResultController {
     suspend fun respondStepBody(call: ApplicationCall, orgId: UUID, serviceId: UUID, resultId: UUID, stepId: UUID, userId: UUID) {
         readStepBody(orgId, serviceId, resultId, stepId, userId) { body ->
             insideGateProbe?.invoke()
-            if (body == null) call.respond(HttpStatusCode.NoContent, "") else call.respond(body)
+            if (body == null) call.respond(HttpStatusCode.NoContent, "") else writeBounded { call.respond(body) }
         }
     }
+
+    /**
+     * Runs [write] — the answer of a body read, still holding its bytes in the
+     * gate — for at most [bodyWriteTimeout]. A client that does not take the
+     * body in that time is cut off as one that went away: its call is
+     * cancelled and the bytes go back to the gate.
+     */
+    internal suspend fun writeBounded(write: suspend () -> Unit) {
+        withTimeoutOrNull(bodyWriteTimeout) { write() } ?: throw CancellationException("the client did not read the body in time")
+            .apply { initCause(io.ktor.utils.io.ConnectionClosedException("body write timed out")) }
+    }
+
+    /** How long the answer of a body read may take to be written to its client. */
+    val BODY_WRITE_TIMEOUT = 60.seconds
+
+    /** [BODY_WRITE_TIMEOUT], settable so tests need not wait the real time. */
+    internal var bodyWriteTimeout = BODY_WRITE_TIMEOUT
 
     /**
      * Answers [call] with a step's body as it was stored: the bytes, under the
@@ -410,7 +432,15 @@ object ProbeResultController {
      * held at once stay within the gate's budget: one copy of the body, not
      * the six an inline answer needs.
      */
-    suspend fun respondStepBodyRaw(call: ApplicationCall, orgId: UUID, serviceId: UUID, resultId: UUID, stepId: UUID, userId: UUID) {
+    suspend fun respondStepBodyRaw(
+        call: ApplicationCall,
+        orgId: UUID,
+        serviceId: UUID,
+        resultId: UUID,
+        stepId: UUID,
+        userId: UUID,
+        headOnly: Boolean = false,
+    ) {
         val (storageUrl, bodyStoreId) = locateStepBody(orgId, serviceId, resultId, stepId, userId)
         if (storageUrl == null) {
             call.respond(HttpStatusCode.NoContent, "")
@@ -420,24 +450,33 @@ object ProbeResultController {
         if (store == null && storageClient == null) throw GoneException(ErrorCodes.BODY_GONE)
 
         gated(store?.organizationId ?: orgId, bodyStoreId) { hold ->
+            val client = if (store != null) storeClient(store) else storageClient!!
+            // HEAD: the headers of the download, from a size (and type)
+            // lookup — nothing is downloaded.
+            if (headOnly) {
+                val stat = readingFrom(bodyStoreId, storageUrl) { hold.onIo { client.statOf(storageUrl) } }
+                    ?: throw GoneException(ErrorCodes.BODY_GONE)
+                bodyStoreId?.let(BodyStoreService::clearFailure)
+                if (stat.size > BodyStoreRegistry.MAX_BODY_BYTES) throw ApiException(
+                    HttpStatusCode.PayloadTooLarge, ErrorCodes.BODY_TOO_LARGE,
+                    details = buildJsonObject { put("maxBytes", BodyStoreRegistry.MAX_BODY_BYTES) },
+                )
+                attachmentHeaders(call, stepId)
+                val type = safeContentType(stat.contentType)?.let(ContentType::parse) ?: ContentType.Application.OctetStream
+                call.respond(SizedHead(stat.size, type))
+                return@gated
+            }
             val read = readingFrom(bodyStoreId, storageUrl) {
-                val client = if (store != null) storeClient(store) else storageClient!!
                 readSized(client, storageUrl, BodyStoreRegistry.MAX_BODY_BYTES, hold)
             }
             bodyStoreId?.let(BodyStoreService::clearFailure)
             when (read) {
                 is BodyStorageClient.StoredBody.Found -> {
+                    hold.releasePlaces()
                     insideGateProbe?.invoke()
+                    attachmentHeaders(call, stepId)
                     val type = safeContentType(read.contentType)?.let(ContentType::parse) ?: ContentType.Application.OctetStream
-                    call.response.header(
-                        HttpHeaders.ContentDisposition,
-                        ContentDisposition.Attachment.withParameter(ContentDisposition.Parameters.FileName, "body-$stepId").toString(),
-                    )
-                    call.response.header("X-Content-Type-Options", "nosniff")
-                    // Bodies carry whatever the probed endpoint answered —
-                    // tokens, personal data. Nothing on the way keeps a copy.
-                    call.response.header(HttpHeaders.CacheControl, "private, no-store")
-                    call.respondBytes(read.bytes, type, HttpStatusCode.OK)
+                    writeBounded { call.respondBytes(read.bytes, type, HttpStatusCode.OK) }
                 }
                 BodyStorageClient.StoredBody.Missing -> throw GoneException(ErrorCodes.BODY_GONE)
                 is BodyStorageClient.StoredBody.TooLarge -> throw ApiException(
@@ -446,6 +485,25 @@ object ProbeResultController {
                 )
             }
         }
+    }
+
+    /** The download's own headers: an attachment, never sniffed, never kept on the way. */
+    private fun attachmentHeaders(call: ApplicationCall, stepId: UUID) {
+        call.response.header(
+            HttpHeaders.ContentDisposition,
+            ContentDisposition.Attachment.withParameter(ContentDisposition.Parameters.FileName, "body-$stepId").toString(),
+        )
+        call.response.header("X-Content-Type-Options", "nosniff")
+        // Bodies carry whatever the probed endpoint answered — tokens,
+        // personal data. Nothing on the way keeps a copy.
+        call.response.header(HttpHeaders.CacheControl, "private, no-store")
+    }
+
+    /** A HEAD answer: the download's length and type, and no body. */
+    private class SizedHead(private val size: Long, private val type: ContentType) : io.ktor.http.content.OutgoingContent.NoContent() {
+        override val contentLength: Long get() = size
+        override val contentType: ContentType get() = type
+        override val status: HttpStatusCode get() = HttpStatusCode.OK
     }
 
     /** Called inside the gate just before a key-authenticated body is answered. For tests. */
@@ -780,10 +838,25 @@ object ProbeResultController {
             }
         }
 
+        private var placesHeld = true
+
+        /**
+         * Gives back the places (organization, store, global) once the body
+         * has been read, keeping the byte units: what is still held is the
+         * body in memory, while it is encoded and written to a client that
+         * may read slowly — and a slow reader must not keep a place another
+         * read could use. Idempotent.
+         */
+        fun releasePlaces() {
+            if (!placesHeld) return
+            placesHeld = false
+            held.asReversed().forEach { it.release() }
+        }
+
         fun release() {
             repeat(units) { bodyBytes.release() }
             units = 0
-            held.asReversed().forEach { it.release() }
+            releasePlaces()
         }
     }
 

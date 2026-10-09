@@ -278,6 +278,8 @@ class DispatchQueue(
                 agentEgressBytes = 0L, // nothing was dispatched to an agent
                 resultId = record.item.runId ?: UUID.randomUUID(),
                 trigger = record.item.trigger,
+                runId = record.item.runId,
+                runSize = 1,
             )
         } catch (e: Exception) {
             // Never let bookkeeping break the scheduling path.
@@ -615,8 +617,11 @@ class DispatchQueue(
 
             var published = 0
             // The run's id goes to its first result. In `simultaneous` mode the
-            // others are siblings of it under the same job, with ids of their own.
+            // others are siblings of it under the same job, with ids of their
+            // own; every one says which run it belongs to and how many there
+            // are, so the run reads complete only once all of them are in.
             var runId = item.runId
+            val runSize = executions.count { it.result != null }
             for (execution in executions) {
                 // No result: the backend exhausted every agent it was allowed
                 // to re-run on. Handled after the loop — in `simultaneous` mode
@@ -640,6 +645,8 @@ class DispatchQueue(
                     endpointKeys = endpointKeys,
                     resultId = runId ?: UUID.randomUUID(),
                     trigger = item.trigger,
+                    runId = item.runId,
+                    runSize = runSize,
                 )
                 runId = null
                 published++

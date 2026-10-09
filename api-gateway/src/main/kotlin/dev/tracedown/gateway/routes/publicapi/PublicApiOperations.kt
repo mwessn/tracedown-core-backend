@@ -91,6 +91,8 @@ data class PublicOperation(
      * repeat.
      */
     val idempotent: Boolean = method == HttpMethod.Post,
+    /** Answers the stored bytes (`application/octet-stream`, as an attachment) rather than JSON. */
+    val binary: Boolean = false,
 ) {
     val key: String get() = "${method.value} $path"
 
@@ -139,6 +141,17 @@ data class PublicOperation(
  * what v1 promised at the time.
  */
 object PublicApiOperations {
+
+    /** Every reason a run asked for can be skipped with, by what to do about it. */
+    private const val RUN_SKIP_REASONS =
+        "Skip reasons, by remedy — ask again later: `run_already_running`, `run_already_queued` (a run of the " +
+            "service was already under way or waiting; its result is under another id, in `/services/{id}/results`), " +
+            "`run_in_service_window`, `run_held`, `dispatch_queue_full`; fix " +
+            "the service or its configuration: `run_service_inactive`, `run_script_missing`, `variable_unreadable`, " +
+            "`target_*` (an address this installation does not probe, or a target that asked not to be), " +
+            "`unverified_*` (the verified-domain limits); the platform: `run_not_delivered` (no scheduler was " +
+            "listening — nothing will run it), `no_eligible_agent`, `agent_unreachable`, `agent_rejected`, " +
+            "`dispatch_error`."
 
     private val OK = typeOf<Map<String, Boolean>>()
 
@@ -257,18 +270,20 @@ object PublicApiOperations {
             "Switching on needs a valid script.", request = typeOf<ToggleServiceRequest>(), response = typeOf<ServiceSummary>()),
         PublicOperation(post, "/services/{id}/run", "runService", "Services", "Runs a service now",
             "Outside its schedule. Answers 202 once the request is recorded, with `runId` and `requestedAt` (whole " +
-                "seconds, UTC). Follow the run at `GET /services/{id}/runs/{runId}`: `pending`, then `done` with its " +
-                "result — filed under the same id in `/services/{id}/results` — or `skipped` with the reason it was " +
-                "not made (already running, switched off since, in its maintenance window, the queue full…), or " +
-                "`expired` when nothing was recorded in time, which means the request was lost: ask again. " +
-                "409 `script_missing` or `service_inactive` when it cannot run.",
+                "seconds, UTC). Follow the run at `GET /services/{id}/runs/{runId}` (see there for what it can answer). " +
+                "409 `script_missing` or `service_inactive` when it cannot run. Under an `Idempotency-Key`, a repeat " +
+                "answers with the same `runId` and runs nothing; after a run that ended `skipped` or `expired`, asking " +
+                "again needs a new key. " + RUN_SKIP_REASONS,
             response = typeOf<RunRequested>(), status = HttpStatusCode.Accepted, errors = CONFLICT),
         PublicOperation(get, "/services/{id}/runs/{runId}", "getServiceRun", "Services", "Returns where a run asked for stands",
-            "`state`: `pending` until the run is recorded; `done`, with `result`; `skipped`, with `result` and the " +
-                "`reason` it was not made; `expired` when nothing was recorded within the gateway's bound (10 minutes " +
-                "unless the operator set another) — the request was lost on its way, and asking again is the remedy. A " +
-                "result that arrives after that still settles it. Poll every few seconds. 404 for an id that is not a " +
-                "run of this service.",
+            "`state`: `pending` until the run is recorded; `done`, with `result`; `skipped`, with `result` (when " +
+                "there is one) and the `reason` it was not made; `expired` — no result within the gateway's bound " +
+                "(twice the scheduler's run lock and a margin: 10 minutes unless the probe timeout or the operator set " +
+                "another). An expired run may still settle: a result that arrives later is filed under the id and the " +
+                "state follows it. A service that runs on several agents at once makes one result per agent: " +
+                "`results` lists them all, `status` is the worst of them (failure, then timeout, error, success, " +
+                "skipped), and the run is `done` once every one is in, or once the bound has passed. Poll every few " +
+                "seconds. 404 for an id that is not a run of this service. " + RUN_SKIP_REASONS,
             response = typeOf<RunStatus>()),
         PublicOperation(get, "/services/{id}/agents", "listServiceAgents", "Services", "Lists the agents a service may run on",
             "By slug; an empty list means any agent.", response = typeOf<List<String>>()),
@@ -287,13 +302,18 @@ object PublicApiOperations {
         PublicOperation(get, "/services/{id}/results", "listServiceResults", "Results", "Lists a service's runs",
             "Most recent first (`order=asc` for oldest first), ties by id in the same direction. Run times are kept to " +
                 "the second; `since` and `until` are floored to the second before they are compared, and both are " +
-                "inclusive. A refused parameter is named in `details.field`.",
+                "inclusive. A refused parameter is named in `details.field`. `order=asc` with `since` is not a cursor " +
+                "for following new runs: a run is filed when it is ingested, not when it started, so one can appear " +
+                "behind the last one seen — overlap `since` by a few minutes and skip the ids already seen. " +
+                "`trigger=manual` finds runs asked for from version 0.4.59 on; earlier ones, and ones made while " +
+                "gateways and schedulers of both versions ran side by side, read as `schedule`.",
             query = listOf(
                 QueryParameter("since", typeOf<String>(), "An ISO-8601 instant: only runs started at or after it (to the second)."),
                 QueryParameter("until", typeOf<String>(), "An ISO-8601 instant: only runs started at or before it (to the second). Not before `since`."),
-                QueryParameter("status", typeOf<String>(),
-                    "Only runs with this status — `success`, `failure`, `timeout`, `error` or `skipped`. Repeat the " +
-                        "parameter, or separate values with commas, for more than one."),
+                QueryParameter("status", typeOf<List<String>>(),
+                    "Only runs with one of these statuses — `success`, `failure`, `timeout`, `error`, `skipped`. Repeat " +
+                        "the parameter (`status=failure&status=timeout`), or give them comma-separated in one " +
+                        "(`status=failure,timeout`)."),
                 QueryParameter("trigger", typeOf<String>(), "Only runs started by `schedule`, or asked for (`manual`)."),
                 QueryParameter("order", typeOf<String>(), "`desc` (default, most recent first) or `asc`."),
             ) + PAGING,
@@ -317,10 +337,11 @@ object PublicApiOperations {
             "The bytes as they were stored, not JSON: `Content-Type` is the stored type when the gateway repeats it " +
                 "(`application/octet-stream` otherwise), with `Content-Length`, `Content-Disposition: attachment` and " +
                 "`X-Content-Type-Options: nosniff`. Up to the store's own limit, 32 MiB (413 `body_too_large`, " +
-                "`details.maxBytes`); never a link to where it is kept. HEAD answers the headers alone. Otherwise as " +
+                "`details.maxBytes`); never a link to where it is kept. HEAD answers the headers alone, from a size " +
+                "lookup. A client that has not taken the body within 60 seconds is cut off. Otherwise as " +
                 "`getStepBody`: 204 when no body was stored, 410 `body_gone`, 503 `body_store_unavailable` with " +
                 "`Retry-After`. Errors are JSON.",
-            noContent = "The step stored no body.",
+            noContent = "The step stored no body.", binary = true,
             errors = listOf(HttpStatusCode.Gone, HttpStatusCode.PayloadTooLarge, HttpStatusCode.ServiceUnavailable)),
 
         // Scripts
@@ -329,10 +350,16 @@ object PublicApiOperations {
                 "every reason it would not — the Lace validator's (`code`, `callIndex`, `field`, `detail`), then " +
                 "`blocked_probe_target` per call whose target this installation does not probe, and the " +
                 "unverified-domain rules where they apply. With `serviceId`, judged with that service's variables " +
-                "and schedule, exactly as a save of its script; read access to it is enough. Without, calls whose host " +
-                "comes from a variable are listed in `targets.unresolved`. Targets are always named as the script writes " +
-                "them. It changes nothing, so a read-only key may call it, and it takes no `Idempotency-Key`.",
-            request = typeOf<ValidateScriptRequest>(), response = typeOf<ScriptValidation>(), idempotent = false),
+                "and schedule, as a save of its script; read access to it is enough (404 otherwise). It judges only " +
+                "with what the caller may know: values that are stored encrypted are used only for a caller with " +
+                "write on the service, and for anyone else a call whose host needs one is listed in " +
+                "`targets.unresolved` and judged by neither policy. Without `serviceId` there are no variables (calls " +
+                "whose host comes from one are unresolved), and verified-domain coverage is judged only for a caller " +
+                "who may read the organization's domains — `domainsChecked` says whether it was. Targets are always " +
+                "named as the script writes them. It changes nothing, so a read-only key may call it, and it takes no " +
+                "`Idempotency-Key`.",
+            request = typeOf<ValidateScriptRequest>(), response = typeOf<ScriptValidation>(), idempotent = false,
+            errors = listOf(HttpStatusCode.NotFound)),
 
         // Metrics
         PublicOperation(get, "/services/{id}/metrics", "getServiceMetrics", "Metrics", "Returns a service's current counters and state",

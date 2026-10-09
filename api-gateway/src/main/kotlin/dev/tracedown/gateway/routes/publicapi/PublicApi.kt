@@ -44,8 +44,6 @@ import io.ktor.server.http.content.HttpStatusCodeContent
 import io.ktor.http.content.OutgoingContent
 import io.ktor.http.content.TextContent
 import io.ktor.server.application.hooks.ResponseBodyReadyForSend
-import io.ktor.server.application.hooks.ResponseSent
-import kotlinx.coroutines.CancellationException
 import io.ktor.server.plugins.mutableOriginConnectionPoint
 import dev.tracedown.gateway.routes.publicapi.v1.agentRoutes
 import io.ktor.server.routing.route
@@ -287,21 +285,18 @@ object PublicApi {
                 // Step 5: a POST carrying an Idempotency-Key that was already
                 // answered is answered again from the record, and its handler
                 // does not run.
+                // Only a POST a route takes: a path nothing answers has
+                // nothing to remember. Its answer is written down as it goes
+                // out (Responses, below); a call that never answers keeps its
+                // key held until the key's in-flight bound.
                 val path = PathCanonicalizer.canonicalize(uri)
-                if (call.request.local.method == HttpMethod.Post && path != null && path !in READ_ONLY_POSTS) {
+                if (call.request.local.method == HttpMethod.Post && path != null && path !in READ_ONLY_POSTS &&
+                    isMountedPath(uri, HttpMethod.Post)
+                ) {
                     Idempotency.begin(call, caller.keyId, path)
                     if (call.response.isCommitted) return@withContext
                 }
-                // Settled once the answer is sent (ResponseSent, below) —
-                // also an error answer, which the status pages send after
-                // this has unwound. A call cancelled before any answer (the
-                // client went away) lets its key go here.
-                try {
-                    proceed()
-                } catch (e: CancellationException) {
-                    Idempotency.settle(call)
-                    throw e
-                }
+                proceed()
             }
         }
     }
@@ -336,6 +331,9 @@ object PublicApi {
     /** Marks a HEAD request being answered as its GET. */
     private val headRequest = AttributeKey<Unit>("PublicApiHead")
 
+    /** Whether [call] is a HEAD being answered by its GET's route — which may then skip the body it would send. */
+    fun isHead(call: ApplicationCall): Boolean = call.attributes.contains(headRequest)
+
     /**
      * The namespace's answers on their way out. The router's own refusals — a
      * bare 404 for a path no route matches, a bare 405 for a method a route
@@ -356,7 +354,6 @@ object PublicApi {
             if (call.attributes.contains(headRequest)) answer = HeadOnly(answer)
             if (answer !== content) transformBodyTo(answer)
         }
-        on(ResponseSent) { call -> Idempotency.settle(call) }
     }
 
     /** [original]'s status and headers, and no body. */

@@ -73,6 +73,22 @@ object RunTrigger {
     const val SKIP_ALREADY_RUNNING = "run_already_running"
     /** A dispatch of the service is already waiting in the queue, or already waiting to follow the running one. */
     const val SKIP_ALREADY_QUEUED = "run_already_queued"
+    /**
+     * No scheduler heard the request — none is running, or Redis is away —
+     * so nothing will run it. Settled by the gateway at once rather than left
+     * to expire.
+     */
+    const val SKIP_NOT_DELIVERED = "run_not_delivered"
+
+    /**
+     * Envelope fields of a run asked for under an id: the id (`runId`) and how
+     * many results the run publishes (`runSize` — more than one in
+     * `simultaneous` mode). The first result is filed under the id itself;
+     * every one of them carries both, so whichever is ingested last can say
+     * the run is complete. An ingestor that predates them ignores them.
+     */
+    const val ENVELOPE_RUN_ID = "runId"
+    const val ENVELOPE_RUN_SIZE = "runSize"
 
     /** One run request read off either channel. [runId] is null for a bare service id. */
     data class Request(val serviceId: UUID, val runId: UUID?)

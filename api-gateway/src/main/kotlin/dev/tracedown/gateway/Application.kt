@@ -260,7 +260,7 @@ fun Application.module() {
     // A run handle reads `expired` after this long without a result, and is
     // kept as long as the result it names would be.
     dev.tracedown.gateway.controllers.runs.RunRequestController.init(
-        expirySeconds = appConfig.systemLimits.runRequestExpirySeconds,
+        expirySeconds = appConfig.systemLimits.effectiveRunExpirySeconds,
         resultRetentionDays = appConfig.systemLimits.resultRetentionDays,
     )
     // Body storage, same root/bucket the agent writes and the ingestor
@@ -417,6 +417,9 @@ fun Application.module() {
     // Before ContentNegotiation on purpose: both transform the received body and
     // the first to run wins, so the cap has to see the raw channel.
     installRequestBodyLimit(appConfig.maxRequestBodyBytes)
+    // The body of a public POST carrying an Idempotency-Key is read twice:
+    // for its fingerprint, then by its handler. See Idempotency.
+    dev.tracedown.gateway.util.Idempotency.installBodyCache(this)
 
     install(ContentNegotiation) {
         json(Json {

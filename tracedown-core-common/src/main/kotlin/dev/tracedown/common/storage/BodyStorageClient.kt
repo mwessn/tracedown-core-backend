@@ -394,6 +394,30 @@ open class BodyStorageClient(
         }
     }
 
+    /** What a store says about one body without handing it over: its size, and its content type where the store keeps one. */
+    data class Stat(val size: Long, val contentType: String?)
+
+    /**
+     * [sizeOf], with the content type an object store keeps beside the body
+     * (a file has none) — the same single stat or HEAD, nothing downloaded.
+     * Null when nothing is there. Confinement applies, as for [sizeOf].
+     */
+    open fun statOf(uri: String): Stat? {
+        return when (val parsed = StorageUri.parse(uri)) {
+            is StorageUri.File -> sizeOf(uri)?.let { Stat(it, null) }
+            is StorageUri.S3 -> {
+                confineS3(parsed.bucket, parsed.key)
+                val client = s3Client ?: throw StorageUnconfiguredException("S3 config not provided but s3:// URI encountered")
+                try {
+                    val head = client.headObject(HeadObjectRequest.builder().bucket(parsed.bucket).key(parsed.key).build())
+                    Stat(head.contentLength() ?: 0L, head.contentType())
+                } catch (e: AwsServiceException) {
+                    if (isMissing(e)) null else throw e
+                }
+            }
+        }
+    }
+
     /**
      * Reads the bytes at [uri], never more than [maxBytes]. Confinement applies
      * (throws [StorageConfinementException]); an unreachable store or refused

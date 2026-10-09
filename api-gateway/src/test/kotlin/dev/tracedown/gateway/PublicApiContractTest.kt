@@ -99,7 +99,11 @@ class PublicApiContractTest {
          * it may be left out (`optional`).
          */
         data class Shape(val key: String, val fields: Map<String, Field>) {
-            data class Field(val type: String, val optional: Boolean)
+            /**
+             * One field: its type, whether it may be left out, and — for a
+             * string held to a set of values (`@JsonSchema.Enum`) — the values.
+             */
+            data class Field(val type: String, val optional: Boolean, val values: List<String>? = null)
 
             /** The class's serial name. A change of it is a break: it is what a schema is called. */
             val name: String get() = key.substringBefore('<')
@@ -109,6 +113,7 @@ class PublicApiContractTest {
                 fields.forEach { (field, f) ->
                     append("  ").append(field).append(": ").append(f.type)
                     if (f.optional) append(" optional")
+                    f.values?.let { append(" enum ").append(it.joinToString(", ", "[", "]")) }
                     append('\n')
                 }
             }
@@ -132,8 +137,10 @@ class PublicApiContractTest {
                     if (descriptor.elementsCount == 0 && kind == StructureKind.CLASS) unreadable += name
                     val fields = linkedMapOf<String, Shape.Field>()
                     for (i in 0 until descriptor.elementsCount) {
+                        val values = descriptor.getElementAnnotations(i)
+                            .filterIsInstance<io.ktor.openapi.JsonSchema.Enum>().firstOrNull()?.value?.toList()
                         fields[descriptor.getElementName(i)] =
-                            Shape.Field(typeName(descriptor.getElementDescriptor(i)), descriptor.isElementOptional(i))
+                            Shape.Field(typeName(descriptor.getElementDescriptor(i)), descriptor.isElementOptional(i), values)
                     }
                     Shape(key ?: name, fields).let { shapes[it.key] = it }
                 } else if (kind != StructureKind.LIST && kind != StructureKind.MAP) {
@@ -180,12 +187,21 @@ class PublicApiContractTest {
                 val lines = block.trim('\n').lines()
                 val fields = linkedMapOf<String, Shape.Field>()
                 for (line in lines.drop(1)) {
-                    val (field, rest) = line.trim().split(": ", limit = 2)
+                    val (field, described) = line.trim().split(": ", limit = 2)
+                    val values = described.substringAfter(" enum [", "").takeIf { it.isNotEmpty() }
+                        ?.removeSuffix("]")?.split(", ")
+                    val rest = described.substringBefore(" enum [")
                     val optional = rest.endsWith(" optional")
-                    fields[field] = Shape.Field(rest.removeSuffix(" optional"), optional)
+                    fields[field] = Shape.Field(rest.removeSuffix(" optional"), optional, values)
                 }
                 val key = lines.first()
-                shapes[key] = Shape(key, fields + (shapes[key]?.fields ?: emptyMap()))
+                // The earliest block's word stands for a field two of them
+                // name; a later block can add the field's values to it.
+                val earlier = shapes[key]?.fields ?: emptyMap()
+                val merged = fields + earlier.mapValues { (name, f) ->
+                    if (f.values == null && fields[name]?.values != null) f.copy(values = fields[name]!!.values) else f
+                }
+                shapes[key] = Shape(key, merged)
             }
             return shapes
         }
@@ -281,6 +297,8 @@ class PublicApiContractTest {
                     when {
                         g == null -> out += "${was.name}.$field was removed"
                         g.type != f.type -> out += "${was.name}.$field changed type: ${f.type} -> ${g.type}"
+                        f.values != null && !(g.values ?: emptyList()).containsAll(f.values) ->
+                            out += "${was.name}.$field lost values: ${f.values - (g.values ?: emptyList()).toSet()}"
                         f.optional && !g.optional && was.name in requestClasses ->
                             out += "${was.name}.$field became required in a request"
                     }
@@ -393,5 +411,41 @@ class PublicApiContractTest {
         assertEquals(listOf("a", "b"), pinned.getValue("A").fields.keys.sorted())
         val lost = breaks(pinned, mapOf("A" to Shape("A", mapOf("a" to Shape.Field("kotlin.String", false)))), emptySet())
         assertTrue(lost.single().contains("A.b was removed"), lost.toString())
+    }
+
+    @Test
+    fun `everything the API answers today is pinned in the baseline`() = testApplication {
+        // The baseline is only of use if it is kept up with: a route, a field
+        // or a set of values the API has and the baseline does not is a
+        // promise nobody holds it to. Append it (see PublicApiOperations).
+        lateinit var root: Route
+        application {
+            routing {
+                root = this
+                publicApiRoutes()
+            }
+        }
+        startApplication()
+        val pinnedRoutes = baseline(ROUTES_FILE).replace("\r\n", "\n").lines().filter { it.isNotBlank() }.toSet()
+        val unpinnedRoutes = operationLines(root as RoutingNode).filter { it !in pinnedRoutes }
+        assertTrue(unpinnedRoutes.isEmpty(), "Routes not in the baseline:\n${unpinnedRoutes.joinToString("\n")}")
+
+        val pinned = parseShapes(baseline(TYPES_FILE))
+        val unpinned = shapes(PUBLIC_TYPES).first.values.flatMap { shape ->
+            val was = pinned[shape.key] ?: return@flatMap listOf("${shape.key} is not pinned")
+            shape.fields.mapNotNull { (name, f) ->
+                if (was.fields[name] == f) null else "${shape.key}.$name is pinned as ${was.fields[name]}, is $f"
+            }
+        }
+        assertTrue(unpinned.isEmpty(), "Not in the baseline:\n${unpinned.joinToString("\n")}")
+    }
+
+    @Test
+    fun `a value taken out of a pinned set is a break`() {
+        val baseline = mapOf("A" to Shape("A", mapOf("s" to Shape.Field("kotlin.String", false, listOf("a", "b")))))
+        assertEquals(emptyList<String>(), breaks(baseline, mapOf("A" to Shape("A", mapOf("s" to Shape.Field("kotlin.String", false, listOf("a", "b", "c"))))), emptySet()))
+        assertTrue(breaks(baseline, mapOf("A" to Shape("A", mapOf("s" to Shape.Field("kotlin.String", false, listOf("a"))))), emptySet()).single().contains("lost values"))
+        val text = "# Entry points\nA = A\n\nA\n  s: kotlin.String\n\nA\n  s: kotlin.String enum [a, b]\n"
+        assertEquals(listOf("a", "b"), parseShapes(text).getValue("A").fields.getValue("s").values)
     }
 }

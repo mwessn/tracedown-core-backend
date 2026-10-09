@@ -156,6 +156,12 @@ data class ScriptValidation(
     val errors: List<ScriptValidationError>,
     val targets: ScriptTargets,
     val limits: ScriptLimits,
+    @JsonSchema.Description(
+        "Whether the verified-domain rules were judged: false when the installation does not ask for verified " +
+            "domains, or — without `serviceId` — when the caller may not read the organization's domains. When " +
+            "false, `targets.unverified` is empty and `limits` carries no domain limits.",
+    )
+    val domainsChecked: Boolean = false,
 )
 
 /**
@@ -172,7 +178,11 @@ data class ScriptTargets(
      * be shown. Empty when the installation does not ask for verified domains.
      */
     val unverified: List<String>,
-    /** Calls whose host is built from a variable with no value here (none at all without `serviceId`). */
+    /**
+     * Calls whose host is built from a variable with no value here: none at
+     * all without `serviceId`, and none that had to be decrypted for a caller
+     * without write on the service. Neither policy judges them.
+     */
     val unresolved: List<String>,
 )
 

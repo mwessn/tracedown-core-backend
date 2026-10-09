@@ -10,8 +10,11 @@
 --
 -- `state` is pending until the result-ingestor records the run, which sets it
 -- to done or skipped and `result_id` beside it in the same transaction as the
--- result row. `expired` is never stored: it is a pending row older than the
--- gateway's bound, and a result that arrives after that still settles it.
+-- last of its results (`expected_results` of them: more than one when the
+-- service runs on several agents at once). The gateway settles it as skipped
+-- itself, with `reason`, when no scheduler heard the request at all.
+-- `expired` is never stored: it is a pending row older than the gateway's
+-- bound, and a result that arrives after that still settles it.
 --
 -- `api_key_id` is deliberately not a foreign key, as on org_audit_log: the
 -- record of which key asked has to outlive the key. `result_id` is not one
@@ -22,6 +25,12 @@
 -- organization's result retention window, set by the gateway; NULL while
 -- results are kept forever. The rows also go with their service and
 -- organization (ON DELETE CASCADE), and outlive the user who asked (SET NULL).
+-- The foreign keys take a lock on services, organizations and users while the
+-- table is created. Give up rather than queue behind a long transaction with
+-- every request to those tables queued behind this in turn; a failed
+-- migration is retried, a stalled services table is an outage.
+SET LOCAL lock_timeout = '5s';
+
 CREATE TABLE run_requests (
     id               UUID        PRIMARY KEY,
     service_id       UUID        NOT NULL REFERENCES services(id) ON DELETE CASCADE,
@@ -31,6 +40,8 @@ CREATE TABLE run_requests (
     requested_at     TIMESTAMP   NOT NULL,
     state            VARCHAR(8)  NOT NULL DEFAULT 'pending',
     result_id        UUID,
+    expected_results SMALLINT,
+    reason           VARCHAR(64),
     purge_after      TIMESTAMP
 );
 -- The read is by id (the primary key) and then checked against the service.

@@ -21,6 +21,10 @@ object RunRequests : Table("run_requests") {
     val state = varchar("state", 8).default(RunState.PENDING)
     /** The result that settled the request; the same id as the request. */
     val resultId = javaUUID("result_id").nullable()
+    /** How many results the run publishes (more than one on several agents at once); null until the first is in. */
+    val expectedResults = short("expected_results").nullable()
+    /** Why a request settled without a result (`run_not_delivered`); null otherwise. */
+    val reason = varchar("reason", 64).nullable()
     /** When the row may be deleted; null while results are kept forever. */
     val purgeAfter = timestamp("purge_after").nullable()
 

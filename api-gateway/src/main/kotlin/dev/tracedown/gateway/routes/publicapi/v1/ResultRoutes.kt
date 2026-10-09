@@ -2,6 +2,7 @@ package dev.tracedown.gateway.routes.publicapi.v1
 
 import dev.tracedown.common.runs.RunTrigger
 import dev.tracedown.gateway.controllers.results.ProbeResultController
+import dev.tracedown.gateway.routes.publicapi.PublicApi
 import dev.tracedown.gateway.routes.publicapi.apiCaller
 import dev.tracedown.gateway.util.fieldError
 import dev.tracedown.gateway.util.publicPaging
@@ -94,7 +95,9 @@ fun Route.resultRoutes() {
         val serviceId = call.pathUuid("id")
         val resultId = call.pathUuid("resultId")
         val stepId = call.pathUuid("stepId")
-        ProbeResultController.respondStepBodyRaw(call, caller.orgId, serviceId, resultId, stepId, caller.userId)
+        ProbeResultController.respondStepBodyRaw(
+            call, caller.orgId, serviceId, resultId, stepId, caller.userId, headOnly = PublicApi.isHead(call),
+        )
     }
 }
 

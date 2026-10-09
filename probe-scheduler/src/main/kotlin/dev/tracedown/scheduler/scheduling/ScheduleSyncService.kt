@@ -31,7 +31,7 @@ import java.util.concurrent.ConcurrentHashMap
 class ScheduleSyncService(
     private val quartzManager: QuartzManager,
     private val sweepIntervalSeconds: Long,
-    private val pubSubConnection: StatefulRedisPubSubConnection<String, String>?,
+    private val pubSubConnection: StatefulRedisPubSubConnection<String, String>,
     /**
      * Where a run that names an id is claimed (see [RunTrigger.claimKey]), so
      * that of the replicas that all hear it exactly one runs it. Null claims
@@ -100,7 +100,7 @@ class ScheduleSyncService(
      *   id the gateway handed out for it.
      */
     fun startPubSub() {
-        val connection = checkNotNull(pubSubConnection) { "no pub/sub connection" }
+        val connection = pubSubConnection
         connection.addListener(object : RedisPubSubAdapter<String, String>() {
             override fun message(channel: String, message: String) {
                 onMessage(channel, message)
@@ -143,16 +143,17 @@ class ScheduleSyncService(
     /**
      * Handles a run asked for under [runId]: claimed first, because every
      * replica hears it and only one may file a result under the id, then
-     * enqueued like any trigger. A claim that cannot be made because Redis is
-     * away is not a reason to drop the run — the dispatch needs Redis for its
-     * lock anyway, and fails there with a row that says so.
+     * enqueued like any trigger. A claim that cannot be made — Redis did not
+     * answer — is not made at all: another replica may have claimed it, and
+     * two results under one id would leave one of them lost. The run is not
+     * dispatched, and its handle expires.
      */
     fun handleRun(serviceId: UUID, runId: UUID) {
         val claimed = claims == null || try {
             claims.set(RunTrigger.claimKey(runId), "1", SetArgs().nx().ex(RunTrigger.CLAIM_TTL_SECONDS)) != null
         } catch (e: Exception) {
-            log.warn("could not claim run {} of service {}: {}", runId, serviceId, e.message)
-            true
+            log.warn("could not claim run {} of service {} — not running it: {}", runId, serviceId, e.message)
+            false
         }
         if (!claimed) {
             log.debug("run {} of service {} was claimed by another replica", runId, serviceId)
@@ -186,7 +187,7 @@ class ScheduleSyncService(
     /** Stops the pub/sub subscription and periodic sweep. */
     fun stop() {
         sweepJob?.cancel()
-        try { pubSubConnection?.close() } catch (_: Exception) {}
+        try { pubSubConnection.close() } catch (_: Exception) {}
     }
 
     private companion object {

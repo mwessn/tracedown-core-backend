@@ -5,6 +5,7 @@ import dev.tracedown.common.audit.AuditService
 import dev.tracedown.common.audit.auditDiff
 import dev.tracedown.common.auth.CachedPermissions
 import dev.tracedown.common.auth.canAccessResource
+import dev.tracedown.common.auth.canRead
 import dev.tracedown.common.auth.canWriteResource
 import dev.tracedown.common.config.DeletionRetention
 import dev.tracedown.common.domain.DomainPolicy
@@ -173,7 +174,9 @@ object ServiceController {
             RunRequestController.record(runId, serviceId, orgId, userId, requestedAt)
             AuditService.log(orgId, userId, "run.service", "service", serviceId.toString(), entityDisplayName = svcRow[Services.name])
         }
-        ScheduleNudge.trigger(serviceId, runId)
+        // No scheduler heard it — none is running, or Redis is away: nothing
+        // will ever run it, so its handle says so now instead of in ten minutes.
+        if (ScheduleNudge.trigger(serviceId, runId) == 0L) RunRequestController.settleUndelivered(runId)
         return RunTicket(runId, requestedAt)
     }
 
@@ -1081,10 +1084,16 @@ object ServiceController {
      * so this cannot pass what a save refuses or refuse what it accepts. Read
      * access to the service is all it takes, and it writes nothing.
      *
-     * Without [serviceId] there are no variables: a call whose host is built
-     * from one is listed as unresolved, and the address policy does not judge
-     * it (a save would judge it against the service's values). Decrypted
-     * values are judged with and never shown: every target is named as the
+     * **It judges with what the caller could know, and no more** — otherwise
+     * it would be an oracle: a script naming `$s.TOKEN` in a host, judged
+     * against the decrypted value, would answer questions about a secret its
+     * caller may not read. So values that had to be decrypted are used only
+     * for a caller with write on the service (who may save the script, and so
+     * learn the same from the save); for a reader, a call whose host needs one
+     * is listed as unresolved and judged by neither policy. Without
+     * [serviceId] there are no variables at all, and verified-domain coverage
+     * is judged only for a caller who may read the organization's domains
+     * (`domainsChecked` says whether it was). Every target is named as the
      * script writes it.
      */
     fun validate(orgId: UUID, userId: UUID, script: String, serviceId: UUID?): ScriptValidation {
@@ -1093,6 +1102,10 @@ object ServiceController {
         return transaction {
             val vars: PolicyVars
             val schedule: String?
+            // Whether every value a save would judge with was used: only then
+            // is a call with an unresolved host judged (as a save judges it).
+            val allValues: Boolean
+            val judgeDomains: Boolean
             if (serviceId != null) {
                 val ctx = ResourceResolver.resolveService(serviceId, orgId)
                 val cached = requireCachedPermissions(orgId, userId)
@@ -1100,12 +1113,21 @@ object ServiceController {
                 schedule = Services.select(Services.schedule)
                     .where { (Services.id eq serviceId) and (Services.deleted eq false) }
                     .firstOrNull()?.get(Services.schedule) ?: throw NotFoundException()
-                vars = resolveScopedVarsForPolicy(script, serviceId)
+                val resolved = resolveScopedVarsForPolicy(script, serviceId)
+                allValues = canWriteResource(cached, "service", ctx.serviceId, listOf("project::${ctx.projectId}", "workspace::${ctx.workspaceId}"))
+                vars = if (allValues) resolved else PolicyVars(resolved.values - resolved.concealed, emptySet())
+                // The service's own coverage is shown to its readers already
+                // (its detail lists the hosts no verified domain covers).
+                judgeDomains = true
             } else {
                 // 403 not_org_member when the membership is gone.
                 requireCachedPermissions(orgId, userId)
                 schedule = null
                 vars = PolicyVars(emptyMap(), emptySet())
+                allValues = false
+                // Which hosts the organization has proven it owns is the
+                // domains section's to show.
+                judgeDomains = dev.tracedown.common.auth.resolveOrgPermissions(orgId, userId)?.domains?.canRead() == true
             }
 
             val urls = dev.tracedown.common.net.ProbeTargetPolicy.targetUrls(script)
@@ -1115,8 +1137,8 @@ object ServiceController {
                 val url = dev.tracedown.common.net.ProbeTargetPolicy.substituteVars(raw, vars.values)
                 '$' in url && dev.tracedown.common.net.ProbeTargetPolicy.hostOf(url) == null
             }.distinct()
-            val blocked = blockedTargets(script, vars).filter { serviceId != null || it.source !in unresolved }
-            val domain = domainEvaluation(script, vars, orgId)
+            val blocked = blockedTargets(script, vars).filter { allValues || it.source !in unresolved }
+            val domain = if (judgeDomains) domainEvaluation(script, vars, orgId) else null
             val tooShort = schedule != null && intervalTooShort(schedule)
             val limited = domain != null && !domain.covered
 
@@ -1129,6 +1151,7 @@ object ServiceController {
             ScriptValidation(
                 valid = errors.isEmpty(),
                 errors = errors,
+                domainsChecked = domain != null,
                 targets = ScriptTargets(
                     blocked = blocked.map { BlockedTarget(source = it.source ?: "", reason = it.reason ?: "") },
                     unverified = domain?.unverifiedHosts ?: emptyList(),

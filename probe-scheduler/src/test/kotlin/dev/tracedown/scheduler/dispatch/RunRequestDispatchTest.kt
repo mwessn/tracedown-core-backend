@@ -215,6 +215,8 @@ class RunRequestDispatchTest {
         val envelope = queued.single()
         assertEquals(runId.toString(), envelope.str("resultId"))
         assertEquals(RunTrigger.MANUAL, envelope.str("trigger"))
+        assertEquals(runId.toString(), envelope.str(RunTrigger.ENVELOPE_RUN_ID))
+        assertEquals("1", envelope.str(RunTrigger.ENVELOPE_RUN_SIZE))
         assertEquals("success", envelope["rawResult"]!!.jsonObject.str("outcome"))
     }
 
@@ -238,6 +240,9 @@ class RunRequestDispatchTest {
         assertEquals(1, queued.count { it.str("resultId") == runId.toString() })
         assertEquals(1, queued.map { it.str("jobId") }.distinct().size)
         assertTrue(queued.all { it.str("trigger") == RunTrigger.MANUAL })
+        // Every result names the run and its size, so the last one in completes it.
+        assertTrue(queued.all { it.str(RunTrigger.ENVELOPE_RUN_ID) == runId.toString() && it.str(RunTrigger.ENVELOPE_RUN_SIZE) == "2" })
+        assertEquals(1, queued.map { it.str("startedAt") }.distinct().size, "siblings share the run's start")
     }
 
     @Test
@@ -261,6 +266,28 @@ class RunRequestDispatchTest {
             assertEquals(RunTrigger.SKIP_ALREADY_RUNNING, answer["rawResult"]!!.jsonObject.str("reason"))
         } finally {
             redisSync.del("probe_active:$busy")
+        }
+
+        redisSync.del(ResultPublisher.QUEUE_KEY)
+        val windowed = seedService()
+        transaction { Services.update({ Services.id eq windowed }) { it[serviceWindow] = "FREQ=MINUTELY/60/UTC" } }
+        val windowRun = UUID.randomUUID()
+        assertEquals(
+            RunTrigger.SKIP_IN_SERVICE_WINDOW,
+            run(Backend(), 1, DispatchItem(windowed, manual = true, runId = windowRun)).single()["rawResult"]!!.jsonObject.str("reason"),
+        )
+
+        redisSync.del(ResultPublisher.QUEUE_KEY)
+        val held = seedService()
+        val gate = DispatchGate.provider
+        DispatchGate.register(object : DispatchGate.Provider { override fun allows(serviceId: UUID) = serviceId != held })
+        try {
+            val heldRun = UUID.randomUUID()
+            val answer = run(Backend(), 1, DispatchItem(held, manual = true, runId = heldRun)).single()
+            assertEquals(heldRun.toString(), answer.str("resultId"))
+            assertEquals(RunTrigger.SKIP_HELD, answer["rawResult"]!!.jsonObject.str("reason"))
+        } finally {
+            DispatchGate.register(gate)
         }
 
         redisSync.del(ResultPublisher.QUEUE_KEY)
@@ -319,11 +346,44 @@ class RunRequestDispatchTest {
     }
 
     @Test
+    fun `a run that finds its service already waiting in the queue is answered as already queued`() {
+        val busy = seedService()
+        val other = seedService()
+        val hold = CompletableDeferred<Unit>()
+        val backend = Backend(hold = hold)
+        val runId = UUID.randomUUID()
+        val queued = runBlocking {
+            val queue = queue(backend, workers = 1)
+            val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+            try {
+                queue.start(scope)
+                // The one worker is busy with another service; this one waits in the queue.
+                queue.enqueue(DispatchItem.scheduled(other))
+                val deadline = System.currentTimeMillis() + 10_000
+                while (backend.requests.isEmpty() && System.currentTimeMillis() < deadline) delay(20)
+                assertTrue(queue.enqueue(DispatchItem.scheduled(busy)))
+                assertTrue(!queue.enqueue(DispatchItem(busy, manual = true, runId = runId)), "the run is shed")
+                while (envelopes().none { it.str("resultId") == runId.toString() } && System.currentTimeMillis() < deadline) delay(50)
+                hold.complete(Unit)
+                // Both ticks finish too, before the queue closes: nothing of
+                // this test may land in the next one's queue.
+                while (envelopes().size < 3 && System.currentTimeMillis() < deadline) delay(50)
+                envelopes()
+            } finally {
+                queue.close()
+                scope.cancel()
+            }
+        }
+        val answer = queued.single { it.str("resultId") == runId.toString() }
+        assertEquals(RunTrigger.SKIP_ALREADY_QUEUED, answer["rawResult"]!!.jsonObject.str("reason"))
+    }
+
+    @Test
     fun `every replica hears a run, and one runs it`() {
         val serviceId = UUID.randomUUID()
         val runId = UUID.randomUUID()
         val enqueued = CopyOnWriteArrayList<DispatchItem>()
-        val replicas = (1..3).map { ScheduleSyncService(quartzManager, 60, pubSubConnection = null, claims = redisSync) { item -> enqueued.add(item) } }
+        val replicas = (1..3).map { ScheduleSyncService(quartzManager, 60, pubSubConnection = dev.tracedown.scheduler.scheduling.noPubSub(), claims = redisSync) { item -> enqueued.add(item) } }
         replicas.forEach { it.onMessage(RunTrigger.RUN_CHANNEL, RunTrigger.encodeRun(serviceId, runId)) }
         assertEquals(listOf(DispatchItem(serviceId, manual = true, runId = runId)), enqueued)
     }

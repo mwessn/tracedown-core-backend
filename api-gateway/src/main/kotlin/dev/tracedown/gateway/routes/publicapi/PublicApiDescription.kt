@@ -58,12 +58,16 @@ private val API_SUMMARY = """
 
     **Idempotent requests.** Every POST (but `/scripts/validate`) takes an `Idempotency-Key` header: 1–128
     printable ASCII characters of the caller's choosing, unique per request. The first request with a key is
-    remembered for 24 hours, per API key, with its answer; the same key with the same request (method, path and
-    query, body) is answered with that answer again and `Idempotent-Replayed: true`, and nothing is done twice. The
-    same key with a different request is 422 `idempotency_key_reused`; while the first is still being answered,
-    409 `idempotency_in_progress`. A request answered with a 5xx is not remembered, so a retry runs again. When the
-    store that remembers keys does not answer, a request carrying one is refused, 503 `idempotency_unavailable`,
-    rather than made without the promise.
+    remembered for 24 hours, per API key, with its answer; the same key with the same request (method, path, query
+    parameters, content type and body) is answered with that answer again and `Idempotent-Replayed: true`, and
+    nothing is done twice. That includes a refusal: a 4xx is replayed for 24 hours like a success, so a new attempt
+    after changing anything needs a new key. The same key with a different request is 422 `idempotency_key_reused`;
+    while the first is still being answered, 409 `idempotency_in_progress` with `Retry-After` — and a request whose
+    client went away before its answer holds its key that way for up to 5 minutes, since what it did may have been
+    done. Not remembered, so a repeat runs again: an answer with a 5xx, and an answer over 64 KiB. An API key's
+    first 1000 keys a day are remembered; past that, requests are answered without being remembered. When the store
+    that remembers keys does not answer, a request carrying one is refused, 503 `idempotency_unavailable`, rather
+    than made without the promise.
 
     **Base URL.** The server below is relative, so that a gateway published under a path prefix still gives the
     right addresses; code generators emit it literally — set your client's base URL to the gateway's origin (and
@@ -233,10 +237,13 @@ private fun refine(doc: JsonObject): JsonObject {
  */
 private fun publicDescriptors(types: List<KType> = PublicApiOperations.types): Map<String, SerialDescriptor> {
     val out = mutableMapOf<String, SerialDescriptor>()
-    val seen = mutableSetOf<String>()
+    // By descriptor, not by name: every list is called the same, and keying
+    // on the name stopped the walk at the second list it met — a class
+    // reached only through that list was never refined.
+    val seen = mutableSetOf<SerialDescriptor>()
     fun collect(descriptor: SerialDescriptor) {
         val name = descriptor.serialName.removeSuffix("?")
-        if (!seen.add(name + descriptor.elementsCount)) return
+        if (!seen.add(descriptor)) return
         if (descriptor.kind == StructureKind.CLASS || descriptor.kind == StructureKind.OBJECT) {
             out.putIfAbsent(componentKey(name), descriptor)
         }
@@ -325,18 +332,65 @@ private fun refinePathItem(item: JsonObject): JsonObject = JsonObject(item.mapVa
     if (key !in HTTP_METHODS || value !is JsonObject) value else refineOperation(value)
 })
 
+/** The operation ids that answer bytes rather than JSON. */
+private val BINARY_OPERATIONS = PublicApiOperations.all.filter { it.binary }.map { it.operationId }.toSet()
+
+/** Every operation that takes an `Idempotency-Key`, and so may answer with `Idempotent-Replayed`. */
+private val IDEMPOTENT_OPERATIONS = PublicApiOperations.all.filter { it.idempotent }.map { it.operationId }.toSet()
+
 private fun refineOperation(operation: JsonObject): JsonObject {
     var out = operation
+    val id = (operation["operationId"] as? JsonPrimitive)?.content
+    if (id in BINARY_OPERATIONS) out = binaryAnswer(out)
+    if (id in IDEMPOTENT_OPERATIONS) out = replayHeader(out)
     operation["parameters"]?.let { parameters ->
         out = JsonObject(out + ("parameters" to JsonArray((parameters as JsonArray).map { refineParameter(it.jsonObject) })))
     }
-    operation["responses"]?.jsonObject?.let { responses ->
+    out["responses"]?.jsonObject?.let { responses ->
         val withHeaders = responses.mapValues { (status, response) ->
             if (status != "429") response else JsonObject(response.jsonObject + ("headers" to rateLimitHeaders()))
         }
         out = JsonObject(out + ("responses" to JsonObject(withHeaders)))
     }
     return out
+}
+
+/** A download: its success answer is the stored bytes, with the header that makes it one. */
+private fun binaryAnswer(operation: JsonObject): JsonObject {
+    val responses = operation["responses"]?.jsonObject ?: return operation
+    val ok = responses["200"]?.jsonObject ?: return operation
+    val refined = JsonObject(ok - "content" + mapOf(
+        "content" to buildJsonObject {
+            put("application/octet-stream", buildJsonObject {
+                put("schema", buildJsonObject { put("type", "string"); put("format", "binary") })
+            })
+        },
+        "headers" to buildJsonObject {
+            put("Content-Disposition", buildJsonObject {
+                put("description", "`attachment`, with a file name.")
+                put("schema", buildJsonObject { put("type", "string") })
+            })
+            put("X-Content-Type-Options", buildJsonObject {
+                put("description", "`nosniff`.")
+                put("schema", buildJsonObject { put("type", "string") })
+            })
+        },
+    ))
+    return JsonObject(operation + ("responses" to JsonObject(responses + ("200" to refined))))
+}
+
+/** Declares `Idempotent-Replayed` on an idempotent operation's success answer. */
+private fun replayHeader(operation: JsonObject): JsonObject {
+    val responses = operation["responses"]?.jsonObject ?: return operation
+    val successes = responses.filterKeys { it.startsWith("2") }.mapValues { (_, response) ->
+        val r = response.jsonObject
+        val headers = r["headers"]?.jsonObject ?: JsonObject(emptyMap())
+        JsonObject(r + ("headers" to JsonObject(headers + ("Idempotent-Replayed" to buildJsonObject {
+            put("description", "`true` when this is the remembered answer of an earlier request with the same `Idempotency-Key`.")
+            put("schema", buildJsonObject { put("type", "string"); put("enum", buildJsonArray { add(JsonPrimitive("true")) }) })
+        }))))
+    }
+    return JsonObject(operation + ("responses" to JsonObject(responses + successes)))
 }
 
 private fun refineParameter(parameter: JsonObject): JsonObject {
@@ -346,6 +400,10 @@ private fun refineParameter(parameter: JsonObject): JsonObject {
         name in ID_PARAMETERS -> JsonObject(schema + ("format" to JsonPrimitive("uuid")))
         name == "since" || name == "until" -> JsonObject(schema + ("format" to JsonPrimitive("date-time")))
         name == "trigger" -> JsonObject(schema + ("enum" to JsonArray(listOf("schedule", "manual").map { JsonPrimitive(it) })))
+        name == "status" -> JsonObject(schema + ("items" to buildJsonObject {
+            put("type", "string")
+            put("enum", JsonArray(listOf("success", "failure", "timeout", "error", "skipped").map { JsonPrimitive(it) }))
+        }))
         name == "order" -> JsonObject(schema + ("enum" to JsonArray(listOf("desc", "asc").map { JsonPrimitive(it) })) +
             ("default" to JsonPrimitive("desc")))
         name == "window" -> JsonObject(schema + ("enum" to JsonArray(listOf("24h", "7d", "30d", "90d").map { JsonPrimitive(it) })) +
@@ -357,7 +415,10 @@ private fun refineParameter(parameter: JsonObject): JsonObject {
         }
         else -> schema
     }
-    return JsonObject(parameter + ("schema" to refined))
+    // `status` is repeated or comma-separated: explode=true takes the first,
+    // and the comma form is described in the parameter's text.
+    val style = if (name == "status") mapOf("style" to JsonPrimitive("form"), "explode" to JsonPrimitive(true)) else emptyMap()
+    return JsonObject(parameter + ("schema" to refined) + style)
 }
 
 private fun rateLimitHeaders(): JsonElement = buildJsonObject {

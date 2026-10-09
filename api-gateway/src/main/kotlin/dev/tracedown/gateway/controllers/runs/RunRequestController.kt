@@ -6,22 +6,29 @@ import dev.tracedown.common.models.ProbeAgents
 import dev.tracedown.common.models.ProbeResults
 import dev.tracedown.common.models.RunRequests
 import dev.tracedown.common.models.RunState
+import dev.tracedown.common.runs.RunBounds
+import dev.tracedown.common.runs.RunTrigger
 import dev.tracedown.gateway.controllers.results.ProbeResultController
 import dev.tracedown.gateway.data.results.RunStatus
 import dev.tracedown.gateway.util.NotFoundException
-import kotlinx.serialization.json.contentOrNull
-import kotlinx.serialization.json.jsonPrimitive
-import org.jetbrains.exposed.v1.core.JoinType
-import org.jetbrains.exposed.v1.core.and
-import org.jetbrains.exposed.v1.core.eq
-import org.jetbrains.exposed.v1.jdbc.insert
-import org.jetbrains.exposed.v1.jdbc.select
-import org.jetbrains.exposed.v1.jdbc.selectAll
-import org.jetbrains.exposed.v1.jdbc.transactions.transaction
 import java.time.Duration
 import java.time.Instant
 import java.time.temporal.ChronoUnit
 import java.util.UUID
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonPrimitive
+import org.jetbrains.exposed.v1.core.JoinType
+import org.jetbrains.exposed.v1.core.Op
+import org.jetbrains.exposed.v1.core.and
+import org.jetbrains.exposed.v1.core.eq
+import org.jetbrains.exposed.v1.core.greaterEq
+import org.jetbrains.exposed.v1.core.lessEq
+import org.jetbrains.exposed.v1.core.neq
+import org.jetbrains.exposed.v1.jdbc.insert
+import org.jetbrains.exposed.v1.jdbc.select
+import org.jetbrains.exposed.v1.jdbc.selectAll
+import org.jetbrains.exposed.v1.jdbc.transactions.transaction
+import org.jetbrains.exposed.v1.jdbc.update
 
 /**
  * Runs somebody asked for, by the id they were handed for each.
@@ -34,13 +41,15 @@ import java.util.UUID
  */
 object RunRequestController {
 
-    /** How long a request may go without a result before it reads `expired`. */
-    private var expiry: Duration = Duration.ofSeconds(DEFAULT_EXPIRY_SECONDS)
+    /**
+     * How long a request may go without a result before it reads `expired`.
+     * Set at startup from configuration; this is only what a gateway that
+     * never calls [init] uses, derived the same way.
+     */
+    private var expiry: Duration = Duration.ofSeconds(RunBounds.runExpirySeconds(30_000))
 
     /** The installation's result window, for an organization with none of its own. */
     private var resultRetentionDays: Int = 90
-
-    const val DEFAULT_EXPIRY_SECONDS = 600L
 
     /** Set once at startup. */
     fun init(expirySeconds: Long, resultRetentionDays: Int) {
@@ -74,6 +83,23 @@ object RunRequestController {
     }
 
     /**
+     * Settles the request for [runId] as skipped with [reason], when nothing
+     * will ever run it — no scheduler heard it ([RunTrigger.SKIP_NOT_DELIVERED]).
+     * Only while it is still pending.
+     */
+    fun settleUndelivered(runId: UUID, reason: String = RunTrigger.SKIP_NOT_DELIVERED) {
+        transaction {
+            RunRequests.update({ (RunRequests.id eq runId) and (RunRequests.state eq RunState.PENDING) }) {
+                it[state] = RunState.SKIPPED
+                it[RunRequests.reason] = reason
+            }
+        }
+    }
+
+    /** How bad each status is, worst first — the run's own status is its worst result's. */
+    private val SEVERITY = listOf("failure", "timeout", "error", "success", "skipped")
+
+    /**
      * Where the run [runId] of [serviceId] stands, for [userId]: read access
      * to the service's results is what it takes, and an id that is not a run
      * of that service in [orgId] is 404 — as is one asked for on a service the
@@ -85,32 +111,63 @@ object RunRequestController {
             .where { (RunRequests.id eq runId) and (RunRequests.serviceId eq serviceId) and (RunRequests.organizationId eq orgId) }
             .firstOrNull() ?: throw NotFoundException()
 
-        // The result is read by the request's own id. An ingestor that predates
-        // run requests files the result without settling the request, so the
-        // result, not the stored state, is what decides.
-        val result = ProbeResults
-            .join(ProbeAgents, JoinType.LEFT, ProbeResults.probeAgentId, ProbeAgents.id)
-            .select(ProbeResults.columns + ProbeAgents.slug)
-            .where { (ProbeResults.id eq runId) and (ProbeResults.serviceId eq serviceId) and (ProbeResults.organizationId eq orgId) }
-            .firstOrNull()
+        // The results are read by the request's own id and the instant they
+        // share: the first is filed under the id, and a run on several agents
+        // at once (`simultaneous`) has siblings stamped with the same start.
+        // An ingestor that predates run requests files them without settling
+        // the request, so the results, not the stored state, decide.
+        val expected = request[RunRequests.expectedResults]?.toInt() ?: 1
+        val first = resultRow(orgId, serviceId) { ProbeResults.id eq runId }
+        val results = if (first == null || expected <= 1) listOfNotNull(first) else {
+            // Siblings carry the run's id, and were started with it: read
+            // within a second of its start, on the service's own index.
+            val startedAt = first[ProbeResults.startedAt]
+            listOf(first) + resultRows(orgId, serviceId) {
+                (ProbeResults.startedAt greaterEq startedAt.minusSeconds(1)) and
+                    (ProbeResults.startedAt lessEq startedAt.plusSeconds(1)) and
+                    (ProbeResults.runId eq runId) and (ProbeResults.id neq runId)
+            }
+        }
 
         val requestedAt = request[RunRequests.requestedAt]
         val stored = request[RunRequests.state]
+        val late = Duration.between(requestedAt, now) > expiry
+        val statuses = results.map { it[ProbeResults.status] }
         val state = when {
-            result != null -> if (result[ProbeResults.status] == "skipped") RunState.SKIPPED else RunState.DONE
-            // Settled, and the result has since gone with its retention window.
+            // Complete, or as complete as it will get within the bound.
+            results.isNotEmpty() && (results.size >= expected || late) ->
+                if (statuses.all { it == "skipped" }) RunState.SKIPPED else RunState.DONE
+            results.isNotEmpty() -> RunState.PENDING
+            // Settled with no result: never delivered, or the result has since
+            // gone with its retention window.
             stored != RunState.PENDING -> stored
-            Duration.between(requestedAt, now) > expiry -> RunState.EXPIRED
+            late -> RunState.EXPIRED
             else -> RunState.PENDING
         }
-        val reason = result?.takeIf { state == RunState.SKIPPED }
-            ?.let { it[ProbeResults.rawResult]["reason"]?.jsonPrimitive?.contentOrNull }
+        val reason = when {
+            state != RunState.SKIPPED -> null
+            results.isEmpty() -> request[RunRequests.reason]
+            else -> first!![ProbeResults.rawResult]["reason"]?.jsonPrimitive?.contentOrNull
+        }
         RunStatus(
             runId = runId.toString(),
             state = state,
             requestedAt = requestedAt.toString(),
-            result = result?.let(ProbeResultController::summaryOf),
+            result = first?.let(ProbeResultController::summaryOf),
             reason = reason,
+            status = statuses.minByOrNull { SEVERITY.indexOf(it).let { i -> if (i < 0) 0 else i } },
+            results = results.map(ProbeResultController::summaryOf),
         )
     }
+
+    private fun resultRows(orgId: UUID, serviceId: UUID, where: () -> Op<Boolean>) =
+        ProbeResults
+            .join(ProbeAgents, JoinType.LEFT, ProbeResults.probeAgentId, ProbeAgents.id)
+            .select(ProbeResults.columns + ProbeAgents.slug)
+            .where { (ProbeResults.serviceId eq serviceId) and (ProbeResults.organizationId eq orgId) and where() }
+            .orderBy(ProbeResults.id)
+            .toList()
+
+    private fun resultRow(orgId: UUID, serviceId: UUID, where: () -> Op<Boolean>) =
+        resultRows(orgId, serviceId, where).firstOrNull()
 }

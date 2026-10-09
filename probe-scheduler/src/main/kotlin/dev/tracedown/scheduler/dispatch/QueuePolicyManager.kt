@@ -1,5 +1,6 @@
 package dev.tracedown.scheduler.dispatch
 
+import dev.tracedown.common.runs.RunBounds
 import io.lettuce.core.ScriptOutputType
 import io.lettuce.core.SetArgs
 import io.lettuce.core.api.sync.RedisCommands
@@ -70,12 +71,16 @@ class QueuePolicyManager(private val redis: RedisCommands<String, String>) {
         if (queuePolicy == "enqueue_once") {
             val pendingKey = "probe_pending:$serviceId"
             if (runId != null) {
-                // The id first: a pending flag without it would run under a
-                // fresh id, and the request would never see its result.
-                val attached = redis.set(pendingRunKey(serviceId), runId.toString(), SetArgs().nx().ex(ttlSeconds)) != null
-                if (!attached) return Acquisition(AcquireResult.SKIPPED, null)
-                redis.set(pendingKey, "1", SetArgs().ex(ttlSeconds))
-                return Acquisition(AcquireResult.ENQUEUED, null)
+                // The id and the flag together, in one step: a flag without
+                // the id would run under a fresh id and the request would
+                // never see its result; an id without the flag would never run.
+                val attached = redis.eval<Long>(
+                    ATTACH_PENDING_RUN_SCRIPT,
+                    ScriptOutputType.INTEGER,
+                    arrayOf(pendingRunKey(serviceId), pendingKey),
+                    runId.toString(), ttlSeconds.toString(),
+                ) == 1L
+                return Acquisition(if (attached) AcquireResult.ENQUEUED else AcquireResult.SKIPPED, null)
             }
             val alreadyPending = redis.exists(pendingKey) > 0
             if (!alreadyPending) {
@@ -93,9 +98,7 @@ class QueuePolicyManager(private val redis: RedisCommands<String, String>) {
      * the lock's owner once [release] reported a pending run.
      */
     fun takePendingRun(serviceId: UUID): UUID? {
-        val key = pendingRunKey(serviceId)
-        val raw = redis.get(key) ?: return null
-        redis.del(key)
+        val raw = redis.getdel(pendingRunKey(serviceId)) ?: return null
         return try {
             UUID.fromString(raw)
         } catch (_: IllegalArgumentException) {
@@ -156,7 +159,7 @@ class QueuePolicyManager(private val redis: RedisCommands<String, String>) {
 
     companion object {
         /** Matches AgentDispatchService's per-agent client overhead over the probe timeout. */
-        const val DISPATCH_OVERHEAD_MS = 15_000L
+        const val DISPATCH_OVERHEAD_MS = RunBounds.DISPATCH_OVERHEAD_MS
 
         /**
          * How much earlier than the window the unverified-domain throttle key
@@ -170,7 +173,7 @@ class QueuePolicyManager(private val redis: RedisCommands<String, String>) {
             (windowSeconds - UNVERIFIED_THROTTLE_TOLERANCE_SECONDS).coerceAtLeast(1L)
 
         /** Extra headroom so the lock never lapses mid-dispatch. */
-        const val SAFETY_MARGIN_MS = 15_000L
+        const val SAFETY_MARGIN_MS = RunBounds.SAFETY_MARGIN_MS
 
         /**
          * Wall clock the lock reserves for re-dispatching a run after an
@@ -186,7 +189,7 @@ class QueuePolicyManager(private val redis: RedisCommands<String, String>) {
          * margin. Retries therefore cannot push a run past its own lock and
          * let the next tick dispatch the same service concurrently.
          */
-        const val RETRY_WINDOW_MS = 20_000L
+        const val RETRY_WINDOW_MS = RunBounds.RETRY_WINDOW_MS
 
         /**
          * Attempts (initial + retries) allowed for one probe leg. Bounds the
@@ -199,12 +202,24 @@ class QueuePolicyManager(private val redis: RedisCommands<String, String>) {
         /**
          * TTL for the execution lock, in whole seconds. Sized to the longest a
          * run can legitimately take — including the retry chain above — so the
-         * lock outlives the dispatch it protects.
+         * lock outlives the dispatch it protects. Defined in [RunBounds], where
+         * the gateway reads it too: a run handle must not call a run lost
+         * while its lock may still be held.
          */
-        fun lockTtlSeconds(timeoutMs: Int): Long {
-            val ceilingMs = timeoutMs.toLong() + DISPATCH_OVERHEAD_MS + RETRY_WINDOW_MS + SAFETY_MARGIN_MS
-            return (ceilingMs + 999) / 1000 // ceil to whole seconds
-        }
+        fun lockTtlSeconds(timeoutMs: Int): Long = RunBounds.lockTtlSeconds(timeoutMs)
+
+        /**
+         * KEYS[1]=pending run id, KEYS[2]=pending flag, ARGV[1]=run id,
+         * ARGV[2]=TTL in seconds. Attaches the run to the pending run unless
+         * another run's id is already there; sets the flag with it.
+         */
+        private val ATTACH_PENDING_RUN_SCRIPT = """
+            if redis.call('set', KEYS[1], ARGV[1], 'NX', 'EX', ARGV[2]) then
+                redis.call('set', KEYS[2], '1', 'EX', ARGV[2])
+                return 1
+            end
+            return 0
+        """.trimIndent()
 
         /**
          * KEYS[1]=active, KEYS[2]=pending, ARGV[1]=token.
