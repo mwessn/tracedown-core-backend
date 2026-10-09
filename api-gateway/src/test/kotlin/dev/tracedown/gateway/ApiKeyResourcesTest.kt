@@ -4498,6 +4498,10 @@ class ApiKeyResourcesTest {
             val asOwner = obj(send(address, "POST", path, fx.writeKey, validateBody(SCRIPT, fx.service)).second)
             assertEquals("true", asOwner.str("domainsChecked"))
             assertEquals("true", asOwner.str("complete"))
+            // Without a service there is no schedule: the interval rule is not judged.
+            val noService = obj(send(address, "POST", path, fx.writeKey, validateBody(SCRIPT)).second)
+            assertEquals("true", noService.str("domainsChecked"))
+            assertEquals("false", noService.str("complete"), noService.toString())
         } finally {
             ServiceController.init(trustedDomainMode = true)
         }
