@@ -23,16 +23,19 @@ import dev.tracedown.gateway.data.projects.ProjectSummary
 import dev.tracedown.gateway.data.projects.UpdateProjectRequest
 import dev.tracedown.gateway.data.results.ProbeResultDetail
 import dev.tracedown.gateway.data.results.ProbeResultSummary
+import dev.tracedown.gateway.data.results.RunStatus
 import dev.tracedown.gateway.data.results.StepBodyContent
 import dev.tracedown.gateway.data.services.CreateServiceRequest
 import dev.tracedown.gateway.data.services.RunRequested
 import dev.tracedown.gateway.data.services.ScopedToggleResult
+import dev.tracedown.gateway.data.services.ScriptValidation
 import dev.tracedown.gateway.data.services.ServiceSnapshot
 import dev.tracedown.gateway.data.services.ServiceSummary
 import dev.tracedown.gateway.data.services.SetAllowedAgentsRequest
 import dev.tracedown.gateway.data.services.ToggleServiceRequest
 import dev.tracedown.gateway.data.services.UpdateScriptRequest
 import dev.tracedown.gateway.data.services.UpdateServiceRequest
+import dev.tracedown.gateway.data.services.ValidateScriptRequest
 import dev.tracedown.gateway.data.silences.CreateSilenceRequest
 import dev.tracedown.gateway.data.silences.SilenceSummary
 import dev.tracedown.gateway.data.silences.UpdateSilenceRequest
@@ -82,6 +85,12 @@ data class PublicOperation(
      * 403, 429), 404 on a path with an id and 413 on one with a body.
      */
     val errors: List<HttpStatusCode> = emptyList(),
+    /**
+     * Whether the operation takes an `Idempotency-Key` (see `Idempotency`):
+     * every POST, except one that changes nothing and so has nothing to
+     * repeat.
+     */
+    val idempotent: Boolean = method == HttpMethod.Post,
 ) {
     val key: String get() = "${method.value} $path"
 
@@ -92,6 +101,7 @@ data class PublicOperation(
                 (if ('{' in path) listOf(HttpStatusCode.NotFound) else emptyList()) +
                 // A request body past the gateway's size limit: 413 `request_body_too_large`.
                 (if (request != null) listOf(HttpStatusCode.PayloadTooLarge) else emptyList()) +
+                (if (idempotent) IDEMPOTENCY_ERRORS else emptyList()) +
                 errors
             ).distinct().sortedBy { it.value }
 
@@ -99,6 +109,11 @@ data class PublicOperation(
         val COMMON_ERRORS = listOf(
             HttpStatusCode.BadRequest, HttpStatusCode.Unauthorized,
             HttpStatusCode.Forbidden, HttpStatusCode.TooManyRequests,
+        )
+
+        /** `idempotency_in_progress`, `idempotency_key_reused`, `idempotency_unavailable`. */
+        val IDEMPOTENCY_ERRORS = listOf(
+            HttpStatusCode.Conflict, HttpStatusCode.UnprocessableEntity, HttpStatusCode.ServiceUnavailable,
         )
     }
 }
@@ -117,6 +132,11 @@ data class PublicOperation(
  *     edited: those files are the v1 baseline;
  *  5. a note for hosts: a host that pins the public route list (as the
  *     baseline does) will fail on the new route until it looks.
+ *
+ * A route that gains an optional query parameter appends a line of its own,
+ * with the new parameters, beside the one it already has; a type that gains a
+ * field appends its whole new block. Earlier lines and blocks stay: each is
+ * what v1 promised at the time.
  */
 object PublicApiOperations {
 
@@ -236,13 +256,20 @@ object PublicApiOperations {
         PublicOperation(patch, "/services/{id}/toggle", "toggleService", "Services", "Switches a service on or off",
             "Switching on needs a valid script.", request = typeOf<ToggleServiceRequest>(), response = typeOf<ServiceSummary>()),
         PublicOperation(post, "/services/{id}/run", "runService", "Services", "Runs a service now",
-            "Outside its schedule. Answers 202 once queued, with `requestedAt` (whole seconds, UTC). To wait for the " +
-                "run, list `/services/{id}/results?since=<requestedAt>`: the earliest result there that is not " +
-                "`skipped` is the answer (the list is newest first; a scheduled run that started after `requestedAt` " +
-                "matches too). Allow a few seconds of clock difference between the agent and the gateway; a request " +
-                "can be shed when the service's queue is full, so if nothing has arrived after a few minutes, ask " +
-                "again. 409 `script_missing` or `service_inactive` when it cannot run.",
+            "Outside its schedule. Answers 202 once the request is recorded, with `runId` and `requestedAt` (whole " +
+                "seconds, UTC). Follow the run at `GET /services/{id}/runs/{runId}`: `pending`, then `done` with its " +
+                "result — filed under the same id in `/services/{id}/results` — or `skipped` with the reason it was " +
+                "not made (already running, switched off since, in its maintenance window, the queue full…), or " +
+                "`expired` when nothing was recorded in time, which means the request was lost: ask again. " +
+                "409 `script_missing` or `service_inactive` when it cannot run.",
             response = typeOf<RunRequested>(), status = HttpStatusCode.Accepted, errors = CONFLICT),
+        PublicOperation(get, "/services/{id}/runs/{runId}", "getServiceRun", "Services", "Returns where a run asked for stands",
+            "`state`: `pending` until the run is recorded; `done`, with `result`; `skipped`, with `result` and the " +
+                "`reason` it was not made; `expired` when nothing was recorded within the gateway's bound (10 minutes " +
+                "unless the operator set another) — the request was lost on its way, and asking again is the remedy. A " +
+                "result that arrives after that still settles it. Poll every few seconds. 404 for an id that is not a " +
+                "run of this service.",
+            response = typeOf<RunStatus>()),
         PublicOperation(get, "/services/{id}/agents", "listServiceAgents", "Services", "Lists the agents a service may run on",
             "By slug; an empty list means any agent.", response = typeOf<List<String>>()),
         PublicOperation(put, "/services/{id}/agents", "setServiceAgents", "Services", "Sets the agents a service may run on",
@@ -251,12 +278,25 @@ object PublicApiOperations {
 
         // Agents
         PublicOperation(get, "/agents", "listAgents", "Agents", "Lists the agents a service can be set to run on",
-            "By slug, ordered by slug: the names `PUT /services/{id}/agents` takes.", response = typeOf<List<PublicAgentSummary>>()),
+            "By slug, ordered by slug: the names `PUT /services/{id}/agents` takes, with each agent's health as the " +
+                "dashboard shows it — `status` (`healthy`, `degraded`, `down` or `unknown`) and `lastCheckAt`, when " +
+                "its health was last checked.",
+            response = typeOf<List<PublicAgentSummary>>()),
 
         // Results
         PublicOperation(get, "/services/{id}/results", "listServiceResults", "Results", "Lists a service's runs",
-            "Most recent first. Run times are kept to the second; `since` is floored to the second before it is compared.",
-            query = listOf(QueryParameter("since", typeOf<String>(), "An ISO-8601 instant: only runs started at or after it (to the second).")) + PAGING,
+            "Most recent first (`order=asc` for oldest first), ties by id in the same direction. Run times are kept to " +
+                "the second; `since` and `until` are floored to the second before they are compared, and both are " +
+                "inclusive. A refused parameter is named in `details.field`.",
+            query = listOf(
+                QueryParameter("since", typeOf<String>(), "An ISO-8601 instant: only runs started at or after it (to the second)."),
+                QueryParameter("until", typeOf<String>(), "An ISO-8601 instant: only runs started at or before it (to the second). Not before `since`."),
+                QueryParameter("status", typeOf<String>(),
+                    "Only runs with this status — `success`, `failure`, `timeout`, `error` or `skipped`. Repeat the " +
+                        "parameter, or separate values with commas, for more than one."),
+                QueryParameter("trigger", typeOf<String>(), "Only runs started by `schedule`, or asked for (`manual`)."),
+                QueryParameter("order", typeOf<String>(), "`desc` (default, most recent first) or `asc`."),
+            ) + PAGING,
             response = typeOf<Page<ProbeResultSummary>>()),
         PublicOperation(get, "/services/{id}/results/{resultId}", "getServiceResult", "Results", "Returns a run with all of its steps",
             "`rawResult` is the run's ProbeResult as the Lace specification defines it; `calls[].response.bodyPath` is " +
@@ -266,12 +306,33 @@ object PublicApiOperations {
             "Returns a step's stored response body",
             "As text in the response: `content`, `contentType` (null when not known) and `encoding` (`base64` when the " +
                 "bytes are not UTF-8 text or the text carries control characters, null otherwise). Bodies over 4 MiB are " +
-                "refused with 413 `body_too_large` (`details.maxBytes`); a raw download endpoint is planned. 410 " +
+                "refused with 413 `body_too_large` (`details.maxBytes`); `getStepBodyRaw` serves those. 410 " +
                 "`body_gone` when the step recorded a body that is no longer there; 204 when it stored none " +
                 "(`hasBody: false`). 503 `body_store_unavailable` (with `Retry-After`) is worth retrying with backoff; " +
                 "a read can take up to about 10 seconds to be refused that way.",
             response = typeOf<StepBodyContent>(), noContent = "The step stored no body.",
             errors = listOf(HttpStatusCode.Gone, HttpStatusCode.PayloadTooLarge, HttpStatusCode.ServiceUnavailable)),
+        PublicOperation(get, "/services/{id}/results/{resultId}/steps/{stepId}/body/raw", "getStepBodyRaw", "Results",
+            "Downloads a step's stored response body",
+            "The bytes as they were stored, not JSON: `Content-Type` is the stored type when the gateway repeats it " +
+                "(`application/octet-stream` otherwise), with `Content-Length`, `Content-Disposition: attachment` and " +
+                "`X-Content-Type-Options: nosniff`. Up to the store's own limit, 32 MiB (413 `body_too_large`, " +
+                "`details.maxBytes`); never a link to where it is kept. HEAD answers the headers alone. Otherwise as " +
+                "`getStepBody`: 204 when no body was stored, 410 `body_gone`, 503 `body_store_unavailable` with " +
+                "`Retry-After`. Errors are JSON.",
+            noContent = "The step stored no body.",
+            errors = listOf(HttpStatusCode.Gone, HttpStatusCode.PayloadTooLarge, HttpStatusCode.ServiceUnavailable)),
+
+        // Scripts
+        PublicOperation(post, "/scripts/validate", "validateScript", "Scripts", "Judges a script as a save would",
+            "Without saving anything: `valid` is true exactly when a script save would accept it. `errors` lists " +
+                "every reason it would not — the Lace validator's (`code`, `callIndex`, `field`, `detail`), then " +
+                "`blocked_probe_target` per call whose target this installation does not probe, and the " +
+                "unverified-domain rules where they apply. With `serviceId`, judged with that service's variables " +
+                "and schedule, exactly as a save of its script; read access to it is enough. Without, calls whose host " +
+                "comes from a variable are listed in `targets.unresolved`. Targets are always named as the script writes " +
+                "them. It changes nothing, so a read-only key may call it, and it takes no `Idempotency-Key`.",
+            request = typeOf<ValidateScriptRequest>(), response = typeOf<ScriptValidation>(), idempotent = false),
 
         // Metrics
         PublicOperation(get, "/services/{id}/metrics", "getServiceMetrics", "Metrics", "Returns a service's current counters and state",
@@ -377,5 +438,6 @@ object PublicApiOperations {
         "Access" to "Who may see or change a workspace, project or service.",
         "Directory" to "The organization's members and groups.",
         "Webhooks" to "Attaching existing webhooks to resources.",
+        "Scripts" to "Lace scripts, judged without being saved.",
     )
 }

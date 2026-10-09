@@ -28,6 +28,10 @@ import java.util.UUID
  * - ``skip``: if active flag exists, skip this run
  * - ``enqueue_once``: if active, set a pending flag; on release, caller
  *   checks pending and re-dispatches
+ *
+ * A run somebody asked for under an id rides on the pending flag: its id is
+ * kept beside it (``probe_pending_run:{serviceId}``) and handed back with the
+ * pending run ([takePendingRun]), so the run that follows is filed under it.
  */
 class QueuePolicyManager(private val redis: RedisCommands<String, String>) {
 
@@ -47,9 +51,14 @@ class QueuePolicyManager(private val redis: RedisCommands<String, String>) {
      * @param queuePolicy "skip" or "enqueue_once"
      * @param timeoutMs the probe request timeout the dispatch will use; the lock
      *   TTL is derived from it so the lock outlives the whole dispatch
+     * @param runId the id a run somebody asked for is filed under, when it
+     *   has one. Under `enqueue_once` it becomes the pending run's id — also
+     *   when the pending run was already set by a scheduled tick, which this
+     *   run then answers for — unless another run's id is already waiting
+     *   there, in which case this run is SKIPPED.
      * @return [Acquisition] with ACQUIRED + a token, or SKIPPED/ENQUEUED
      */
-    fun tryAcquire(serviceId: UUID, queuePolicy: String, timeoutMs: Int): Acquisition {
+    fun tryAcquire(serviceId: UUID, queuePolicy: String, timeoutMs: Int, runId: UUID? = null): Acquisition {
         val activeKey = "probe_active:$serviceId"
         val ttlSeconds = lockTtlSeconds(timeoutMs)
         val token = UUID.randomUUID().toString()
@@ -60,6 +69,14 @@ class QueuePolicyManager(private val redis: RedisCommands<String, String>) {
         // Lock already held
         if (queuePolicy == "enqueue_once") {
             val pendingKey = "probe_pending:$serviceId"
+            if (runId != null) {
+                // The id first: a pending flag without it would run under a
+                // fresh id, and the request would never see its result.
+                val attached = redis.set(pendingRunKey(serviceId), runId.toString(), SetArgs().nx().ex(ttlSeconds)) != null
+                if (!attached) return Acquisition(AcquireResult.SKIPPED, null)
+                redis.set(pendingKey, "1", SetArgs().ex(ttlSeconds))
+                return Acquisition(AcquireResult.ENQUEUED, null)
+            }
             val alreadyPending = redis.exists(pendingKey) > 0
             if (!alreadyPending) {
                 redis.set(pendingKey, "1", SetArgs().ex(ttlSeconds))
@@ -69,6 +86,24 @@ class QueuePolicyManager(private val redis: RedisCommands<String, String>) {
 
         return Acquisition(AcquireResult.SKIPPED, null)
     }
+
+    /**
+     * The id of the run waiting to follow the current one, when somebody asked
+     * for it under one — taken, so it is handed to one dispatch only. Called by
+     * the lock's owner once [release] reported a pending run.
+     */
+    fun takePendingRun(serviceId: UUID): UUID? {
+        val key = pendingRunKey(serviceId)
+        val raw = redis.get(key) ?: return null
+        redis.del(key)
+        return try {
+            UUID.fromString(raw)
+        } catch (_: IllegalArgumentException) {
+            null
+        }
+    }
+
+    private fun pendingRunKey(serviceId: UUID) = "probe_pending_run:$serviceId"
 
     /**
      * Releases the execution lock IF this replica still owns it (its [token]

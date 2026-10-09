@@ -28,6 +28,8 @@ object ProbeResults : Table("probe_results") {
     val projectId = javaUUID("project_id").references(Projects.id)
     val workspaceId = javaUUID("workspace_id").references(Workspaces.id)
     val organizationId = javaUUID("organization_id").references(Organizations.id)
+    /** What started the run: `schedule` or `manual` (see `RunTrigger`). */
+    val trigger = varchar("trigger", 8).default("schedule")
 
     override val primaryKey = PrimaryKey(id)
 }

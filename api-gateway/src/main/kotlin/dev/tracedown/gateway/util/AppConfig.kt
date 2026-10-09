@@ -99,9 +99,16 @@ data class SystemLimitsConfig(
     val maxVarsPerResource: Int,
     /** Most API keys one user may hold, across every organization they belong to. */
     val maxApiKeysPerUser: Int,
+    /**
+     * How long a run somebody asked for may go without a result before its
+     * handle reads `expired`: the request that should have started it was
+     * lost (no scheduler heard it). Longer than any run takes to come back.
+     */
+    val runRequestExpirySeconds: Long = DEFAULT_RUN_REQUEST_EXPIRY_SECONDS,
 ) {
     companion object {
         const val DEFAULT_MAX_API_KEYS_PER_USER = 20
+        const val DEFAULT_RUN_REQUEST_EXPIRY_SECONDS = 600L
     }
 }
 
@@ -201,6 +208,9 @@ data class AppConfig(
                         ?: VariableLimits.DEFAULT_MAX_PER_RESOURCE,
                     maxApiKeysPerUser = config.propertyOrNull("systemLimits.maxApiKeysPerUser")?.getString()?.toInt()
                         ?: SystemLimitsConfig.DEFAULT_MAX_API_KEYS_PER_USER,
+                    runRequestExpirySeconds = config.propertyOrNull("systemLimits.runRequestExpirySeconds")
+                        ?.getString()?.toLongOrNull()?.takeIf { it > 0 }
+                        ?: SystemLimitsConfig.DEFAULT_RUN_REQUEST_EXPIRY_SECONDS,
                 ),
                 maxRequestBodyBytes = config.propertyOrNull("requestBody.maxBytes")
                     ?.getString()?.toLongOrNull()?.takeIf { it > 0 } ?: DEFAULT_MAX_REQUEST_BODY_BYTES,

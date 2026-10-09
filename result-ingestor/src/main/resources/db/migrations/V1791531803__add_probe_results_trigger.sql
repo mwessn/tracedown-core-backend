@@ -1,0 +1,14 @@
+-- What started a run: `schedule` (its cron) or `manual` (somebody asked for it,
+-- from the dashboard or the API). Carried on the result envelope by the
+-- scheduler and written by the ingestor.
+--
+-- probe_results is one of the two big tables. A constant default makes this a
+-- catalogue change (PostgreSQL 11 and later store the default and do not
+-- rewrite the table), so it holds its lock for as long as the catalogue update
+-- takes, not for a scan. Every existing row reads as `schedule`, which is what
+-- nearly all of them were; manual runs were not told apart before this.
+--
+-- No index: the results list filters on it within one service's time range,
+-- which idx_probe_results_service already narrows, and a two-valued column
+-- would not be chosen anyway.
+ALTER TABLE probe_results ADD COLUMN trigger VARCHAR(8) NOT NULL DEFAULT 'schedule';

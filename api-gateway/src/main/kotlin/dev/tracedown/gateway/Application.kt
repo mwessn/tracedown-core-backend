@@ -202,6 +202,8 @@ fun Application.module() {
     }
 
     dev.tracedown.gateway.util.ScheduleNudge.init { redisA }
+    // Remembers the key-authenticated API's idempotent POSTs, shared by every replica.
+    dev.tracedown.gateway.util.Idempotency.init({ redisA }, appConfig.maxRequestBodyBytes)
     dev.tracedown.common.realtime.RealtimePublisher.init { redisA }
 
     // Redis C (resource hierarchy cache) — optional, disabled if not configured.
@@ -255,6 +257,12 @@ fun Application.module() {
         ?: dev.tracedown.gateway.controllers.metrics.DashboardMetricsController.DEFAULT_HOURLY_BUCKET_TTL_SECONDS
     dev.tracedown.gateway.controllers.metrics.DashboardMetricsController.init({ redisB }, hourlyBucketTtlSeconds)
     dev.tracedown.gateway.controllers.metrics.UsageController.init({ redisB }, appConfig.systemLimits.resultRetentionDays)
+    // A run handle reads `expired` after this long without a result, and is
+    // kept as long as the result it names would be.
+    dev.tracedown.gateway.controllers.runs.RunRequestController.init(
+        expirySeconds = appConfig.systemLimits.runRequestExpirySeconds,
+        resultRetentionDays = appConfig.systemLimits.resultRetentionDays,
+    )
     // Body storage, same root/bucket the agent writes and the ingestor
     // relocates in. Without the S3 config an s3:// body URI cannot be
     // presigned, so "view body" would fail for object-storage deployments;

@@ -149,6 +149,14 @@ object ErrorCodes {
     /** A run was asked for a service that has no script to run. */
     const val SCRIPT_MISSING = "script_missing"
 
+    // ── Idempotent requests ──
+    /** An `Idempotency-Key` already used with a different request (method, path or body). */
+    const val IDEMPOTENCY_KEY_REUSED = "idempotency_key_reused"
+    /** A request with that `Idempotency-Key` is still being answered. */
+    const val IDEMPOTENCY_IN_PROGRESS = "idempotency_in_progress"
+    /** The store that remembers `Idempotency-Key`s is not answering, so the request cannot be made safely. */
+    const val IDEMPOTENCY_UNAVAILABLE = "idempotency_unavailable"
+
     // ── Webhook bindings ──
     /** The webhook is already bound to that resource. */
     const val BINDING_EXISTS = "binding_exists"

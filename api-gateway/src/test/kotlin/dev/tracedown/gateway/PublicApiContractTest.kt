@@ -32,10 +32,12 @@ import kotlin.reflect.KType
  * are a **baseline** — what v1 promised when it was published — and the API
  * may grow from it but not move away from it.
  *
- * Passes: a new route; a new type; a new field in a response; a new optional
- * field in a request; a required request field becoming optional.
+ * Passes: a new route; a new optional query parameter on a route; a new type;
+ * a new field in a response; a new optional field in a request; a required
+ * request field becoming optional.
  * Fails: a baseline route that is no longer mounted, or whose operation id,
- * success status, query parameters, request type or response type changed; a
+ * success status, request type or response type changed, or that lost or
+ * newly requires a query parameter; a
  * baseline field removed, renamed, retyped or made nullable; a class whose
  * serial name changed (it is what its schema is called); a request field that
  * became required, or a new required one — a client written against the
@@ -47,7 +49,10 @@ import kotlin.reflect.KType
  * class of the public API's own that keeps the old shape.
  *
  * The current routes and shapes are written under `build/public-api-contract/`
- * on every run, for review; the baseline files are only ever replaced by hand.
+ * on every run, for review; the baseline files are only ever appended to, by
+ * hand. A route that gains a parameter gets a second line beside its first,
+ * and a type that gains a field a second block after its first: each line and
+ * block is what v1 promised when it was written, and all of them hold.
  */
 class PublicApiContractTest {
 
@@ -161,11 +166,17 @@ class PublicApiContractTest {
             return out.toString()
         }
 
-        /** Reads the class shapes back out of a types file (any line endings). */
+        /**
+         * Reads the class shapes back out of a types file (any line endings).
+         * A class with more than one block — it gained fields after it was
+         * first pinned — is every field of all of them, the earliest block's
+         * word standing for a field two of them name.
+         */
         fun parseShapes(text: String): Map<String, Shape> {
             val normalized = text.replace("\r\n", "\n")
             val blocks = normalized.substringAfter("\n\n", "").split("\n\n").filter { it.isNotBlank() }
-            return blocks.associate { block ->
+            val shapes = linkedMapOf<String, Shape>()
+            for (block in blocks) {
                 val lines = block.trim('\n').lines()
                 val fields = linkedMapOf<String, Shape.Field>()
                 for (line in lines.drop(1)) {
@@ -173,8 +184,10 @@ class PublicApiContractTest {
                     val optional = rest.endsWith(" optional")
                     fields[field] = Shape.Field(rest.removeSuffix(" optional"), optional)
                 }
-                Shape(lines.first(), fields).let { it.key to it }
+                val key = lines.first()
+                shapes[key] = Shape(key, fields + (shapes[key]?.fields ?: emptyMap()))
             }
+            return shapes
         }
 
         /**
@@ -222,11 +235,37 @@ class PublicApiContractTest {
         }
 
         /**
-         * The baseline route lines [current] no longer has exactly: a route
-         * that went, or one whose operation id, status, query parameters or
-         * types changed. A route [current] adds is no change.
+         * The baseline route lines [current] no longer keeps: a route that
+         * went, or one whose operation id, status or types changed, or that
+         * lost a query parameter, or requires one it did not. A route
+         * [current] adds is no change, and neither is an optional query
+         * parameter it adds to one.
          */
-        fun routeChanges(baseline: List<String>, current: List<String>): List<String> = baseline - current.toSet()
+        fun routeChanges(baseline: List<String>, current: List<String>): List<String> {
+            val now = current.map(::parseRouteLine)
+            return baseline.filterNot { line ->
+                val was = parseRouteLine(line)
+                now.any { it.keeps(was) }
+            }
+        }
+
+        /** A route line taken apart: everything but the query parameters, and the parameters by name. */
+        private data class RouteLine(val head: String, val tail: String, val parameters: Map<String, Boolean>) {
+            /** Whether this line keeps every promise of [was]. */
+            fun keeps(was: RouteLine): Boolean =
+                head == was.head && tail == was.tail &&
+                    was.parameters.all { (name, required) -> parameters[name] == required } &&
+                    parameters.filterKeys { it !in was.parameters }.values.none { it }
+        }
+
+        private fun parseRouteLine(line: String): RouteLine {
+            val open = line.indexOf(" [")
+            val close = line.indexOf("] ", open)
+            if (open < 0 || close < 0) return RouteLine(line, "", emptyMap())
+            val parameters = line.substring(open + 2, close).split(' ').filter { it.isNotBlank() }
+                .associate { it.removeSuffix("!") to it.endsWith("!") }
+            return RouteLine(line.substring(0, open), line.substring(close + 1), parameters)
+        }
 
         /** Every way [current] moves away from [baseline] (see the class KDoc), as readable lines. */
         fun breaks(baseline: Map<String, Shape>, current: Map<String, Shape>, requestClasses: Set<String>): List<String> {
@@ -312,11 +351,18 @@ class PublicApiContractTest {
             line.replace("listThings", "getThings"),
             line.replace(" 200 ", " 202 "),
             line.replace("[page pageSize]", "[page pageSize kind!]"),
+            line.replace("[page pageSize]", "[page! pageSize]"),
+            line.replace("[page pageSize]", "[pageSize]"),
             line.replace("Page<Thing>", "List<Thing>"),
             line.replace("-> -", "-> Filter"),
         )) {
             assertEquals(baseline, routeChanges(baseline, listOf(changed)), "changed: $changed")
         }
+        // An optional parameter added is kept; so is the line that pinned it,
+        // beside the one before it.
+        val grown = line.replace("[page pageSize]", "[since page pageSize]")
+        assertEquals(emptyList<String>(), routeChanges(baseline + grown, listOf(grown)))
+        assertEquals(listOf(grown), routeChanges(baseline + grown, listOf(line)), "the parameter went again")
     }
 
     @Test
@@ -338,5 +384,14 @@ class PublicApiContractTest {
         assertTrue(breaks(baseline, current(keep + ("a" to Shape.Field("kotlin.String?", false)), baseline.getValue("Q").fields), req).single().contains("type"))
         assertTrue(breaks(baseline, current(keep + ("b" to Shape.Field("kotlin.Int", false)), baseline.getValue("Q").fields), req).single().contains("required"))
         assertTrue(breaks(baseline, current(keep + ("n" to Shape.Field("kotlin.Int", false)), baseline.getValue("Q").fields), req).single().contains("new required"))
+    }
+
+    @Test
+    fun `a type pinned in two blocks is held to both`() {
+        val text = "# Entry points\nA = A\n\nA\n  a: kotlin.String\n\nA\n  a: kotlin.String\n  b: kotlin.Int\n"
+        val pinned = parseShapes(text)
+        assertEquals(listOf("a", "b"), pinned.getValue("A").fields.keys.sorted())
+        val lost = breaks(pinned, mapOf("A" to Shape("A", mapOf("a" to Shape.Field("kotlin.String", false)))), emptySet())
+        assertTrue(lost.single().contains("A.b was removed"), lost.toString())
     }
 }

@@ -15,6 +15,9 @@ data class ProbeResultSummary(
     val totalResponseMs: Int,
     val startedAt: String,
     val agentSlug: String? = null,
+    /** What started the run: its schedule, or somebody asking for it. */
+    @JsonSchema.Enum("schedule", "manual")
+    val trigger: String = "schedule",
 )
 
 @Serializable
@@ -30,6 +33,30 @@ data class ProbeResultDetail(
     val steps: List<ProbeStepSummary>,
     /** The agent that ran it, by slug; null when it ran on none (a skipped run) or the agent is gone. */
     val agentSlug: String? = null,
+    /** What started the run: its schedule, or somebody asking for it. */
+    @JsonSchema.Enum("schedule", "manual")
+    val trigger: String = "schedule",
+)
+
+/**
+ * A run somebody asked for, by the id they were handed for it.
+ *
+ * [state] is `pending` until the run is recorded, then `done` — or `skipped`
+ * when it was not made, with [reason] saying why — and [result] is the run as
+ * the results list shows it, under the same id. `expired` when nothing was
+ * recorded within the gateway's bound: the request was lost on the way to the
+ * scheduler, and asking again is the remedy. A result that arrives later still
+ * settles it.
+ */
+@Serializable
+data class RunStatus(
+    val runId: String,
+    @JsonSchema.Enum("pending", "done", "skipped", "expired")
+    val state: String,
+    val requestedAt: String,
+    val result: ProbeResultSummary? = null,
+    @JsonSchema.Description("Why a skipped run was not made (the skipped result's reason); null otherwise.")
+    val reason: String? = null,
 )
 
 @Serializable

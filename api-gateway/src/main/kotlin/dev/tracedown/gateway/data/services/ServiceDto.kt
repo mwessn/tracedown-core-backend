@@ -110,11 +110,88 @@ data class ToggleServiceRequest(
     val isActive: Boolean,
 )
 
-/** A run that was asked for: [requestedAt] is when, as an ISO-8601 instant. */
+/**
+ * A run that was asked for: [requestedAt] is when, as an ISO-8601 instant, and
+ * [runId] the handle to follow it by — the id its result will be filed under.
+ */
 @Serializable
 data class RunRequested(
     val ok: Boolean = true,
     val requestedAt: String,
+    val runId: String,
+)
+
+/**
+ * A script to judge as a save would, without saving it: against the service
+ * named by [serviceId] — its variables, its schedule — when given, and against
+ * none otherwise.
+ */
+@Serializable
+data class ValidateScriptRequest(
+    @JsonSchema.MaxLength(65536)
+    val script: String,
+    @JsonSchema.Description("The service whose variables and schedule to judge the script with. Read access to it suffices.")
+    val serviceId: String? = null,
+) : Validatable {
+    override fun validate() = buildList {
+        Validators.maxLen("script", script, 65536)?.let(::add)
+        serviceId?.let { Validators.uuid("serviceId", it)?.let(::add) }
+    }
+}
+
+/**
+ * What a save of a script would make of it.
+ *
+ * [valid] is true exactly when a save would accept it. [errors] lists every
+ * reason it would not: the Lace validator's findings (`code`, `callIndex`,
+ * `field`, `detail`), then the platform's — `blocked_probe_target` for each
+ * call whose target this installation does not probe, and the
+ * unverified-domain rules (`unverified_domain_includes`,
+ * `unverified_domain_call_limit`, `unverified_domain_interval`) where they
+ * apply. [targets] and [limits] say what those were judged from.
+ */
+@Serializable
+data class ScriptValidation(
+    val valid: Boolean,
+    val errors: List<ScriptValidationError>,
+    val targets: ScriptTargets,
+    val limits: ScriptLimits,
+)
+
+/**
+ * The calls a script makes, as judged. Every target is named as the script
+ * writes it, never with a variable's value in it.
+ */
+@Serializable
+data class ScriptTargets(
+    /** Calls whose target this installation does not probe, with the reason (`target_*`). */
+    val blocked: List<BlockedTarget>,
+    /**
+     * Hosts no verified domain of the organization covers — or the call as
+     * written, where its host comes from a variable that is not set or may not
+     * be shown. Empty when the installation does not ask for verified domains.
+     */
+    val unverified: List<String>,
+    /** Calls whose host is built from a variable with no value here (none at all without `serviceId`). */
+    val unresolved: List<String>,
+)
+
+@Serializable
+data class BlockedTarget(
+    val source: String,
+    val reason: String,
+)
+
+/**
+ * The limits a script is held to. [maxCalls] and [minIntervalMinutes] are set
+ * when the unverified-domain limits apply to it — some target is not on a
+ * verified domain — and null when they do not.
+ */
+@Serializable
+data class ScriptLimits(
+    val callCount: Int,
+    val maxCalls: Int? = null,
+    val minIntervalMinutes: Int? = null,
 )
 
 /**

@@ -201,7 +201,7 @@ fun Application.module() {
     val pubSubConn = RedisFactory.createPubSubConnection(config.redisAUrl)
 
     // Schedule sync — bootstrap from DB, subscribe to nudge, then sweep periodically
-    val syncService = ScheduleSyncService(quartzManager, config.consistencySweepIntervalSeconds, pubSubConn)
+    val syncService = ScheduleSyncService(quartzManager, config.consistencySweepIntervalSeconds, pubSubConn, claims = redis)
     syncService.bootstrap()
     syncService.startPubSub()
 

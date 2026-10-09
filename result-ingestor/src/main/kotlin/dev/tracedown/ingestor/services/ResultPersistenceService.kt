@@ -8,6 +8,9 @@ import dev.tracedown.common.models.BodyStores
 import dev.tracedown.common.models.Outbox
 import dev.tracedown.common.models.ProbeResults
 import dev.tracedown.common.models.ProbeSteps
+import dev.tracedown.common.models.RunRequests
+import dev.tracedown.common.models.RunState
+import dev.tracedown.common.runs.RunTrigger
 import dev.tracedown.common.models.ServiceVariables
 import dev.tracedown.common.models.Services
 import dev.tracedown.common.storage.BodyStorageClient
@@ -79,6 +82,16 @@ object ResultPersistenceService {
         }
         return UUID.fromString(raw)
     }
+
+    /**
+     * What started the run this envelope describes: [RunTrigger.MANUAL] or
+     * [RunTrigger.SCHEDULE]. An envelope from a scheduler that predates the
+     * field, or carrying a value this does not know, is filed as scheduled —
+     * what nearly every run is, and what the column says of every row written
+     * before it existed.
+     */
+    fun triggerOf(envelope: JsonObject): String =
+        envelope["trigger"]?.jsonPrimitive?.contentOrNull?.takeIf { it in RunTrigger.TRIGGERS } ?: RunTrigger.SCHEDULE
 
     /**
      * When the run this envelope describes actually happened.
@@ -443,6 +456,7 @@ object ResultPersistenceService {
 
         val outcome = rawResult["outcome"]?.jsonPrimitive?.content ?: "error"
         val status = normalizeStatus(outcome)
+        val trigger = triggerOf(envelope)
 
         // `error` covers everything that is not a ProbeResult the executor
         // could produce: a script that failed to run, an executor that raised,
@@ -547,6 +561,20 @@ object ResultPersistenceService {
                 it[ProbeResults.projectId] = projectId
                 it[ProbeResults.workspaceId] = workspaceId
                 it[ProbeResults.organizationId] = organizationId
+                it[ProbeResults.trigger] = trigger
+            }
+
+            // 1b. A run somebody asked for under an id is filed under that id
+            // (see RunTrigger), so the request it settles is this row's own.
+            // In the same transaction as the result: a reader never sees the
+            // result without the request saying so, nor the other way round.
+            // No row matches a manual run that named no id, or one whose
+            // request is already gone.
+            if (trigger == RunTrigger.MANUAL) {
+                RunRequests.update({ (RunRequests.id eq resultId) and (RunRequests.state eq RunState.PENDING) }) {
+                    it[state] = if (status == "skipped") RunState.SKIPPED else RunState.DONE
+                    it[RunRequests.resultId] = resultId
+                }
             }
 
             // 2. Insert probe_steps from rawResult.calls[]

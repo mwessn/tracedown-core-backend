@@ -1,6 +1,7 @@
 package dev.tracedown.gateway.routes.publicapi
 
 import dev.tracedown.gateway.data.publicapi.PublicApiError
+import dev.tracedown.gateway.util.Idempotency
 import io.ktor.http.ContentType
 import io.ktor.http.HttpStatusCode
 import io.ktor.openapi.ExternalDocs
@@ -52,7 +53,17 @@ private val descriptionJson = Json { explicitNulls = false; encodeDefaults = tru
 private val API_SUMMARY = """
     The key-authenticated API. Every operation needs an API key, sent as `Authorization: Bearer td_…`. A key acts
     as the user who created it, in one organization, and may never do more than that user may; a read-only key is
-    refused anything but GET and HEAD (403 `api_key_read_only`). HEAD is answered on every GET path.
+    refused anything but GET and HEAD (403 `api_key_read_only`) — and `POST /scripts/validate`, which changes
+    nothing. HEAD is answered on every GET path.
+
+    **Idempotent requests.** Every POST (but `/scripts/validate`) takes an `Idempotency-Key` header: 1–128
+    printable ASCII characters of the caller's choosing, unique per request. The first request with a key is
+    remembered for 24 hours, per API key, with its answer; the same key with the same request (method, path and
+    query, body) is answered with that answer again and `Idempotent-Replayed: true`, and nothing is done twice. The
+    same key with a different request is 422 `idempotency_key_reused`; while the first is still being answered,
+    409 `idempotency_in_progress`. A request answered with a 5xx is not remembered, so a retry runs again. When the
+    store that remembers keys does not answer, a request carrying one is refused, 503 `idempotency_unavailable`,
+    rather than made without the promise.
 
     **Base URL.** The server below is relative, so that a gateway published under a path prefix still gives the
     right addresses; code generators emit it literally — set your client's base URL to the gateway's origin (and
@@ -74,27 +85,31 @@ private val API_SUMMARY = """
     most 100); there is no filtering or sorting beyond the named query parameters an operation lists. `/agents`,
     `/services/{id}/agents`, `/access/…` and the metrics histories answer bare arrays. Every order is fixed:
     oldest first (by creation, then id) for workspaces, projects, services, variables, webhooks and bindings; by
-    name, then id, for members and groups; by id for silences; most recent first for results; by slug for agents;
-    groups then users, each by name then id, for access.
+    name, then id, for members and groups; by id for silences; most recent first for results (or oldest first, with
+    `order=asc`); by slug for agents; groups then users, each by name then id, for access.
 """.trimIndent()
 
 /** Each error status, with the codes it is answered with across the API. */
 private val STATUS_CODES: Map<HttpStatusCode, String> = mapOf(
     HttpStatusCode.BadRequest to "A refused request: `field_invalid`, `field_required`, `invalid_uuid`, " +
-        "`invalid_request_body`, `invalid_path`, `no_org_selected`, and the code a validation names.",
+        "`invalid_request_body`, `invalid_path`, `no_org_selected`, and the code a validation names. A malformed " +
+        "`Idempotency-Key` is `field_invalid` with `details.field` `Idempotency-Key`.",
     HttpStatusCode.Unauthorized to "No usable key: `missing_auth_header`, `invalid_api_key`, `api_key_expired`, " +
         "`api_key_revoked`, `api_key_owner_inactive`.",
     HttpStatusCode.Forbidden to "Not allowed: `insufficient_permissions`, `api_key_read_only`, " +
         "`totp_enrollment_required`, `not_org_member`.",
     HttpStatusCode.NotFound to "`not_found` — no such resource, or one the caller may not see.",
     HttpStatusCode.MethodNotAllowed to "`method_not_allowed`.",
-    HttpStatusCode.Conflict to "`already_exists`, `version_conflict`, `binding_exists`, `script_missing`, `service_inactive`.",
+    HttpStatusCode.Conflict to "`already_exists`, `version_conflict`, `binding_exists`, `script_missing`, `service_inactive`, " +
+        "`idempotency_in_progress` (a request with the same `Idempotency-Key` is still being answered).",
+    HttpStatusCode.UnprocessableEntity to "`idempotency_key_reused` — the `Idempotency-Key` was used with a different request.",
     HttpStatusCode.Gone to "`body_gone` — the step recorded a body that is no longer there.",
     HttpStatusCode.PayloadTooLarge to "`request_body_too_large` (the request), or `body_too_large` (a stored body; " +
         "`details.maxBytes`).",
     HttpStatusCode.TooManyRequests to "`rate_limited` (the key's budget) or `too_many_unknown_keys` (the address). " +
         "`Retry-After` says when to come back.",
-    HttpStatusCode.ServiceUnavailable to "`body_store_unavailable` — retry with backoff after `Retry-After`.",
+    HttpStatusCode.ServiceUnavailable to "`body_store_unavailable` or `idempotency_unavailable` — retry with backoff " +
+        "after `Retry-After`.",
 )
 
 /**
@@ -127,13 +142,21 @@ internal fun Operation.Builder.describe(operation: PublicOperation) {
     summary = operation.summary
     operation.description?.let { description = it }
     tag(operation.tag)
-    if (operation.query.isNotEmpty()) {
+    if (operation.query.isNotEmpty() || operation.idempotent) {
         parameters {
             for (parameter in operation.query) {
                 query(parameter.name) {
                     description = parameter.description
                     required = parameter.required
                     schema = buildSchema(parameter.type)
+                }
+            }
+            if (operation.idempotent) {
+                header(Idempotency.HEADER) {
+                    description = "Makes the request safe to repeat: 1–128 printable ASCII characters, unique per " +
+                        "request. A repeat within 24 hours is answered as the first was, with `Idempotent-Replayed: true`."
+                    required = false
+                    schema = buildSchema(typeOf<String>())
                 }
             }
         }
@@ -170,7 +193,7 @@ internal fun Operation.Builder.describe(operation: PublicOperation) {
 
 /** Path and query parameters that hold an id. */
 private val ID_PARAMETERS = setOf(
-    "id", "varId", "resultId", "stepId", "resourceId", "workspaceId", "projectId",
+    "id", "varId", "resultId", "stepId", "resourceId", "workspaceId", "projectId", "runId",
 )
 
 /** Bounds and defaults of the integer query parameters: name to (minimum, maximum, default). */
@@ -321,7 +344,10 @@ private fun refineParameter(parameter: JsonObject): JsonObject {
     val schema = parameter["schema"]?.jsonObject ?: return parameter
     val refined: JsonObject = when {
         name in ID_PARAMETERS -> JsonObject(schema + ("format" to JsonPrimitive("uuid")))
-        name == "since" -> JsonObject(schema + ("format" to JsonPrimitive("date-time")))
+        name == "since" || name == "until" -> JsonObject(schema + ("format" to JsonPrimitive("date-time")))
+        name == "trigger" -> JsonObject(schema + ("enum" to JsonArray(listOf("schedule", "manual").map { JsonPrimitive(it) })))
+        name == "order" -> JsonObject(schema + ("enum" to JsonArray(listOf("desc", "asc").map { JsonPrimitive(it) })) +
+            ("default" to JsonPrimitive("desc")))
         name == "window" -> JsonObject(schema + ("enum" to JsonArray(listOf("24h", "7d", "30d", "90d").map { JsonPrimitive(it) })) +
             ("default" to JsonPrimitive("24h")))
         name == "resourceType" -> JsonObject(schema + ("enum" to JsonArray(listOf("workspace", "project", "service").map { JsonPrimitive(it) })))
