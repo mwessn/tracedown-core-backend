@@ -150,6 +150,31 @@ class RunTriggerIngestTest {
     }
 
     @Test
+    fun `twelve results of one run ingested at once settle it with every row`() {
+        val run = request()
+        val startedAt = NOW.plusMillis(456)
+        val ids = (0 until 12).map { if (it == 0) run else UUID.randomUUID() }
+        val pool = java.util.concurrent.Executors.newFixedThreadPool(12)
+        try {
+            val start = java.util.concurrent.CountDownLatch(1)
+            val outcomes = ids.map { id ->
+                pool.submit<ResultPersistenceService.PersistOutcome> {
+                    start.await()
+                    ResultPersistenceService.persist(
+                        envelope(id, RunTrigger.MANUAL, "success", null, run = run, runSize = 12, startedAt = startedAt),
+                    )
+                }
+            }
+            start.countDown()
+            outcomes.forEach { assertEquals(ResultPersistenceService.PersistOutcome.PERSISTED, it.get(60, java.util.concurrent.TimeUnit.SECONDS)) }
+        } finally {
+            pool.shutdownNow()
+        }
+        assertEquals(RunState.DONE, stateOf(run))
+        assertEquals(12L, transaction { ProbeResults.selectAll().where { ProbeResults.runId eq run }.count() })
+    }
+
+    @Test
     fun `a real result replaces the skip its run was first answered with`() {
         val run = request()
         persist(id = run, trigger = RunTrigger.MANUAL, outcome = "skipped", reason = RunTrigger.SKIP_ALREADY_QUEUED)

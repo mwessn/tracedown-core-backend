@@ -3844,12 +3844,12 @@ class ApiKeyResourcesTest {
     }
 
     @Test
-    fun `a download its client never takes is cut off at the bound, and its bytes come back`() {
+    fun `a download its client stops taking is cut off after the stall bound, and its bytes come back`() {
         val address = nextAddress()
         val fx = fixtures(address)
         val org = fx.owner.orgId
         val path = bigStep(fx)
-        ProbeResultController.bodyWriteTimeout = 2.seconds
+        ProbeResultController.bodyWriteStall = 2.seconds
         try {
             java.net.Socket("localhost", serverPort).use { socket ->
                 silentGet(socket, address, path, fx.readKey)
@@ -3857,18 +3857,45 @@ class ApiKeyResourcesTest {
                 val held = System.nanoTime()
                 assertTrue(eventually(15) { ProbeResultController.gateState(org) == ProbeResultController.idleGate }, "the bytes never came back")
                 assertTrue(Duration.ofNanos(System.nanoTime() - held) >= Duration.ofMillis(1500), "released before the bound")
-                // The connection was closed under the client: it cannot read the whole body.
                 socket.soTimeout = 10_000
                 val got = runCatching { socket.getInputStream().readAllBytes().size.toLong() }.getOrDefault(0L)
                 assertTrue(got < BIG_BODY, "the whole body arrived after the bound: $got")
             }
         } finally {
-            ProbeResultController.bodyWriteTimeout = ProbeResultController.BODY_WRITE_TIMEOUT
+            ProbeResultController.bodyWriteStall = ProbeResultController.BODY_WRITE_STALL
         }
+    }
 
-        // The bound itself, without a socket: a write that never ends is
-        // ended as one whose client went away.
-        ProbeResultController.bodyWriteTimeout = 200.milliseconds
+    @Test
+    fun `a download read steadily but too slowly is cut off at the overall cap`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val org = fx.owner.orgId
+        val path = bigStep(fx)
+        ProbeResultController.bodyWriteCap = 3.seconds
+        try {
+            java.net.Socket("localhost", serverPort).use { socket ->
+                socket.soTimeout = 10_000
+                silentGet(socket, address, path, fx.readKey)
+                val input = socket.getInputStream()
+                val buffer = ByteArray(16 * 1024)
+                var received = 0L
+                val started = System.nanoTime()
+                // About 1 MiB a second: steady progress, far too slow for 24 MiB in 3 s.
+                while (System.nanoTime() - started < Duration.ofSeconds(12).toNanos()) {
+                    val n = runCatching { input.read(buffer) }.getOrDefault(-1)
+                    if (n < 0) break
+                    received += n
+                    Thread.sleep(15)
+                }
+                assertTrue(received < BIG_BODY, "the whole body arrived past the cap: $received")
+            }
+            assertTrue(eventually(10) { ProbeResultController.gateState(org) == ProbeResultController.idleGate })
+        } finally {
+            ProbeResultController.bodyWriteCap = ProbeResultController.BODY_WRITE_CAP
+        }
+        // The bounds themselves, without a socket.
+        ProbeResultController.bodyWriteStall = 200.milliseconds
         try {
             val e = assertThrows<kotlinx.coroutines.CancellationException> {
                 runBlocking {
@@ -3877,12 +3904,45 @@ class ApiKeyResourcesTest {
                     }
                 }
             }
-            assertTrue(dev.tracedown.gateway.util.isClientDisconnect(e), "a timed-out write reads as a client gone: $e")
+            assertTrue(dev.tracedown.gateway.util.isClientDisconnect(e), "a stalled write reads as a client gone: $e")
+            // A write that keeps making progress is not a stall.
+            runBlocking {
+                kotlinx.coroutines.withTimeout(10_000) {
+                    val progress = java.util.concurrent.atomic.AtomicLong(System.nanoTime())
+                    ProbeResultController.writeBounded(progress) {
+                        repeat(10) { kotlinx.coroutines.delay(100); progress.set(System.nanoTime()) }
+                    }
+                }
+            }
         } finally {
-            ProbeResultController.bodyWriteTimeout = ProbeResultController.BODY_WRITE_TIMEOUT
+            ProbeResultController.bodyWriteStall = ProbeResultController.BODY_WRITE_STALL
         }
     }
 
+    @Test
+    fun `one organization's silent downloads take its share of the budget, never another's read`() {
+        val address = nextAddress()
+        val a = fixtures(address)
+        val b = fixtures(nextAddress())
+        val paths = (1..3).map { bigStep(a) }
+        val sockets = paths.map { java.net.Socket("localhost", serverPort).also { s -> silentGet(s, address, it, a.readKey) } }
+        try {
+            // Two 24 MiB downloads fill most of the organization's share; the
+            // third waits on it — and on nothing of anyone else's.
+            assertTrue(eventually(10) {
+                ProbeResultController.gateState(a.owner.orgId).orgByteUnits <= ProbeResultController.idleGate.orgByteUnits - 48
+            }, "${ProbeResultController.gateState(a.owner.orgId)}")
+            val started = System.nanoTime()
+            val (status, raw) = send(address, "GET", bodyPath(b, b.step), b.readKey)
+            assertEquals(200, status, raw)
+            assertTrue(Duration.ofNanos(System.nanoTime() - started) < Duration.ofSeconds(3), "another organization's small read was held up")
+            // The third of A's downloads is still waiting on A's share.
+            assertTrue(ProbeResultController.gateState(a.owner.orgId).orgByteUnits < 24, "${ProbeResultController.gateState(a.owner.orgId)}")
+        } finally {
+            sockets.forEach { it.close() }
+        }
+        assertTrue(eventually(30) { ProbeResultController.gateState(a.owner.orgId) == ProbeResultController.idleGate })
+    }
     // ── Validation judges only what its caller may know ──
 
     @Test
@@ -4070,8 +4130,9 @@ class ApiKeyResourcesTest {
         val inFlight = java.util.concurrent.CompletableFuture.supplyAsync { postIdempotent(address, slow, fx.writeKey, "{}", "slow-1") }
         try {
             runBlocking { kotlinx.coroutines.withTimeout(10_000) { slowEntered.await() } }
+            // The marker stands a day, so a request that never comes back is never run again.
             val ttl = redisCommands.ttl(idempotencyStoreKey(address, fx.writeKey, "slow-1"))
-            assertTrue(ttl in 1..Idempotency.IN_FLIGHT_TTL_SECONDS, "in flight for at most its bound: $ttl")
+            assertTrue(ttl in (Idempotency.TTL_SECONDS - 60)..Idempotency.TTL_SECONDS, "marker ttl $ttl")
             val request = Request.Builder().url("http://localhost:$serverPort$slow").post("{}".toRequestBody(jsonType))
                 .header("X-Forwarded-For", address).header("Authorization", "Bearer ${fx.writeKey}")
                 .header("Idempotency-Key", "slow-1").build()
@@ -4128,6 +4189,44 @@ class ApiKeyResourcesTest {
         assertEquals(409, status, raw)
         assertEquals("idempotency_outcome_unknown", errorOf(raw))
         assertEquals(1, bigCalls.get())
+    }
+
+    @Test
+    fun `a request still marked as running past the in-flight bound is never run again`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        flakyCalls.set(0)
+        val path = "${PublicApi.V1}/test/flaky"
+        // The marker a request left that never came back, from before the bound.
+        val first = postIdempotent(address, path, fx.writeKey, "{}", "old-1")
+        assertEquals(500, first.first)
+        val storeKey = idempotencyStoreKey(address, fx.writeKey, "old-1")
+        val fingerprintOf = postIdempotent(address, path, fx.writeKey, "{}", "probe-fp")
+        val fp = Json.parseToJsonElement(redisCommands.get(idempotencyStoreKey(address, fx.writeKey, "probe-fp"))!!).jsonObject.str("fp")
+        assertEquals(200, fingerprintOf.first)
+        val calls = flakyCalls.get()
+        redisCommands.set(
+            storeKey,
+            """{"state":"pending","fp":"$fp","token":"gone","startedAt":${System.currentTimeMillis() / 1000 - Idempotency.IN_FLIGHT_TTL_SECONDS - 60}}""",
+        )
+        val (status, raw, _) = postIdempotent(address, path, fx.writeKey, "{}", "old-1")
+        assertEquals(409, status, raw)
+        assertEquals("idempotency_outcome_unknown", errorOf(raw))
+        assertEquals(calls, flakyCalls.get(), "the handler ran again")
+    }
+
+    @Test
+    fun `an unknown outcome is charged to the budget, at the size kept`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val budgetKey = "idempotency_bytes:${fx.owner.orgId}"
+        redisCommands.del(budgetKey)
+        postIdempotent(address, "${PublicApi.V1}/test/big", fx.writeKey, "{}", "charge-1")
+        val charged = redisCommands.get(budgetKey)?.toLong() ?: 0L
+        val kept = redisCommands.get(idempotencyStoreKey(address, fx.writeKey, "charge-1"))!!
+        assertEquals(kept.length.toLong(), charged, "charged at the stored record's size")
+        val window = redisCommands.ttl(budgetKey)
+        assertTrue(window in 1..Idempotency.TTL_SECONDS, "a window of a day from the first charge: $window")
     }
 
     @Test

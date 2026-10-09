@@ -283,7 +283,7 @@ class DispatchQueue(
             )
         } catch (e: Exception) {
             // Never let bookkeeping break the scheduling path.
-            log.debug("failed to record skipped probe for {}: {}", record.item.serviceId, e.message)
+            log.warn("failed to record skipped probe for {}: {}", record.item.serviceId, e.message)
         }
     }
 
@@ -620,12 +620,16 @@ class DispatchQueue(
             // others are siblings of it under the same job, with ids of their
             // own; every one says which run it belongs to and how many there
             // are, so the run reads complete only once all of them are in.
-            var runId = item.runId
             // A run asked for under an id counts every agent it went to: one
             // that produced nothing is a skipped result of the run, naming
             // why, so the missing agent shows and the run's verdict counts it.
+            // The id itself goes to the first execution that produced a
+            // result (the first of all when none did), so the result filed
+            // under it is a real one whenever there is one.
             val runSize = executions.size
-            for (execution in executions) {
+            val idHolder = executions.indexOfFirst { it.result != null }.coerceAtLeast(0)
+            for ((index, execution) in executions.withIndex()) {
+                val resultId = if (index == idHolder) item.runId ?: UUID.randomUUID() else UUID.randomUUID()
                 // No result: the backend exhausted every agent it was allowed
                 // to re-run on. Without a run id this is handled after the loop
                 // — in `simultaneous` mode a sibling execution may still have
@@ -634,10 +638,11 @@ class DispatchQueue(
                 val result = execution.result
                 if (result == null) {
                     if (item.runId == null) continue
+                    // As a scheduled skip is recorded: no agent, nothing sent.
                     resultPublisher.publish(
                         jobId = jobId,
                         serviceId = serviceId,
-                        agentId = execution.agentId,
+                        agentId = null,
                         projectId = ctx.projectId,
                         workspaceId = ctx.workspaceId,
                         organizationId = ctx.orgId,
@@ -647,13 +652,12 @@ class DispatchQueue(
                             put("elapsedMs", 0)
                         },
                         startedAt = startedAt,
-                        agentEgressBytes = execution.egressBytes,
-                        resultId = runId ?: UUID.randomUUID(),
+                        agentEgressBytes = 0L,
+                        resultId = resultId,
                         trigger = item.trigger,
                         runId = item.runId,
                         runSize = runSize,
                     )
-                    runId = null
                     published++
                     accounted.set(true)
                     continue
@@ -673,12 +677,11 @@ class DispatchQueue(
                     agentEgressBytes = execution.egressBytes,
                     bodiesWithheld = bodiesWithheld,
                     endpointKeys = endpointKeys,
-                    resultId = runId ?: UUID.randomUUID(),
+                    resultId = resultId,
                     trigger = item.trigger,
                     runId = item.runId,
                     runSize = runSize,
                 )
-                runId = null
                 published++
                 accounted.set(true)
             }

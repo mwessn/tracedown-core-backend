@@ -72,9 +72,12 @@ private val API_SUMMARY = """
     - when the first was cut off while it ran (its client went away), or succeeded with an answer over 256 KiB (that
       answer carried `Idempotency-Status: not-kept`), 409 `idempotency_outcome_unknown` for 24 hours: it may have
       taken effect, so it is not made again — check, then use a new key.
-    The same key with a different request is 422 `idempotency_key_reused`. Remembered answers count against a budget
-    per organization (64 MiB a day unless the operator set another); once it is spent, a request with a new key is
-    refused before it runs, 429 `idempotency_limit_reached` with `Retry-After`. When the store that remembers keys
+    A request still marked as being answered after 5 minutes is answered 409 `idempotency_outcome_unknown` too. The
+    same key with a different request is 422 `idempotency_key_reused`. What is remembered — answers and unknown
+    outcomes, at their stored size — counts against a budget per organization (64 MiB unless the operator set
+    another), in a window fixed at 24 hours from its first use; once it is spent, a request with a new key is refused
+    before it runs, 429 `idempotency_limit_reached` with `Retry-After` (when the window ends). A replay checks the
+    caller is still a member of the organization, not the route's own permission again. When the store that remembers keys
     does not answer, a request carrying one is refused, 503 `idempotency_unavailable` with `Retry-After`.
 
     **Unknown values.** New values can appear in `state`, `status`, `trigger` and `reason` fields; treat one you do
