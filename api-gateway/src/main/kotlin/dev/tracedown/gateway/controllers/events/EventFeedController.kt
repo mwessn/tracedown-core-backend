@@ -34,6 +34,7 @@ import org.jetbrains.exposed.v1.jdbc.update
 import org.slf4j.LoggerFactory
 import java.util.concurrent.atomic.AtomicLong
 import dev.tracedown.gateway.util.EventWakeups
+import dev.tracedown.gateway.util.FeedHighWater
 import dev.tracedown.gateway.util.ForbiddenException
 import dev.tracedown.gateway.util.UnauthorizedException
 import dev.tracedown.gateway.util.fieldError
@@ -130,14 +131,15 @@ object EventTypes {
  * they may not see — and, when it read all there was, up to the horizon, so a
  * quiet organization's cursor keeps up with the purge.
  *
- * **Retention.** The outbox is trimmed; [OutboxRetention] says how far, and on
- * which database cluster. A position before the mark may have missed rows and
- * is refused — 410 `cursor_expired` with the oldest cursor that has missed
- * nothing — checked on every look, after its rows are read. A cursor that will
- * not open (another organization's, or sealed under a platform key since
- * changed) is refused the same way, and so is every cursor once the database
- * has been restored into another cluster, whose positions mean nothing here:
- * the mark then starts again from the present.
+ * **Retention.** The outbox is trimmed; [OutboxRetention] says how far. A
+ * position before the mark may have missed rows and is refused — 410
+ * `cursor_expired` with the oldest cursor that has missed nothing — checked on
+ * every look, after its rows are read. A cursor that will not open (another
+ * organization's, or sealed under a platform key since changed) is refused the
+ * same way, and so is every cursor once the database has gone back in history
+ * (a restore, a point-in-time recovery, a dump loaded elsewhere): a position
+ * past the horizon, or a horizon below the highest one seen ([FeedHighWater]),
+ * says so, and the feed then starts again from the present ([rebase]).
  *
  * **Who sees what** is decided on every look, from the user's permissions as
  * they are then — the checks the dashboard's reads of the same resource make
@@ -174,11 +176,6 @@ object EventFeedController {
     /** The oldest transaction still open, as the position just before everything it and later ones write. */
     private const val HORIZON = "pg_snapshot_xmin(pg_current_snapshot())::text::bigint"
 
-    /** The cluster this database runs on, or null when this role may not ask. */
-    private const val SYSTEM_IDENTIFIER =
-        "CASE WHEN has_function_privilege('pg_control_system()', 'EXECUTE') " +
-            "THEN (SELECT system_identifier FROM pg_control_system()) END"
-
     private val log = LoggerFactory.getLogger(EventFeedController::class.java)
 
     /** At most a third of the connection pool reads the feed at once. */
@@ -211,10 +208,15 @@ object EventFeedController {
         beforeLook: suspend () -> Unit = {},
     ): EventPage {
         var position: Position.At? = after?.let { cursor ->
-            EventCursor.decode(orgId, cursor)
-                ?: if (EventCursor.isSealed(cursor)) throw expired(orgId, onIo { mark() ?: start() }) else throw fieldError("after")
+            EventCursor.decode(orgId, cursor) ?: run {
+                if (!EventCursor.isSealed(cursor)) throw fieldError("after")
+                // A refusal that reads the mark is a request's worth of work too.
+                if (!spend()) throw TooManyRequestsException()
+                throw expired(orgId, onIo { mark() ?: start() })
+            }
         }
-        // An answer that will not wait costs a request, as any other does.
+        // An answer that will not wait costs a request, as any other does —
+        // spent before the work, not after.
         if (waitSeconds == 0 && !spend()) throw TooManyRequestsException()
 
         val deadline = System.nanoTime() + Duration.ofSeconds(waitSeconds.toLong()).toNanos()
@@ -227,8 +229,27 @@ object EventFeedController {
                 beforeLook()
                 beforeEachLook?.invoke()
                 if (looks > 0 && !spend()) throw TooManyRequestsException()
-                val look = gate.withPermit { onIo { look(orgId, userId, keyId, position, types, limit) } }
+                val look = try {
+                    gate.withPermit { onIo { look(orgId, userId, keyId, position, types, limit) } }
+                } catch (e: ApiException) {
+                    // A first look that was free and ends in a refusal is paid for
+                    // after all: a read that is refused cannot be made a free scan.
+                    if (e.code == ErrorCodes.CURSOR_EXPIRED && looks == 0 && waitSeconds > 0 && !spend()) {
+                        throw TooManyRequestsException()
+                    }
+                    throw e
+                }
                 looks++
+                // A history the positions do not belong to — a cursor past the
+                // horizon, or a horizon below one seen before: move the feed
+                // to the present one, refuse the cursor, and start from now.
+                if (look.beyond || FeedHighWater.wentBack(look.horizon)) {
+                    val start = Position.At(look.horizon - 1, Long.MAX_VALUE)
+                    onIo { rebase(look.xmax, start) }
+                    FeedHighWater.reset(look.horizon)
+                    if (after != null) throw expired(orgId, start)
+                    return EventPage(emptyList(), EventCursor.encode(orgId, start), more = false)
+                }
                 position = look.position
                 val remaining = Duration.ofNanos(deadline - System.nanoTime())
                 val done = look.items.isNotEmpty() || remaining.isNegative || remaining.isZero || looks >= MAX_LOOKS
@@ -253,10 +274,14 @@ object EventFeedController {
         }
     }
 
-    /** Whether [userId] could see anything in the feed at all: some read somewhere in [orgId]. */
-    fun hasAnythingToSee(orgId: UUID, userId: UUID): Boolean = transaction {
-        val cached = dev.tracedown.common.auth.resolveCachedPermissions(orgId, userId) ?: return@transaction false
-        cached.org.isOwner || cached.org.workspaces.canRead() || cached.org.settings.canRead() ||
+    /**
+     * Whether permissions [cached] could see anything in the feed at all: some
+     * read somewhere in the organization. Decided from what the key's
+     * admission already resolved — no database work.
+     */
+    fun hasAnythingToSee(cached: CachedPermissions?): Boolean {
+        if (cached == null) return false
+        return cached.org.isOwner || cached.org.workspaces.canRead() || cached.org.settings.canRead() ||
             cached.resources.values.any { it.canRead() }
     }
 
@@ -281,7 +306,16 @@ object EventFeedController {
         ?.takeIf { it > Position.At(0, 0) }
 
     /** One look's outcome: what it found, how far it read, and whether more may be there already. */
-    internal data class Look(val items: List<FeedEvent>, val position: Position.At, val more: Boolean)
+    internal data class Look(
+        val items: List<FeedEvent>,
+        val position: Position.At,
+        val more: Boolean,
+        /** The oldest transaction open when the look read, and the next id to be given out. */
+        val horizon: Long = 0,
+        val xmax: Long = 0,
+        /** The position read from lies at or past the horizon: impossible in one history. */
+        val beyond: Boolean = false,
+    )
 
     /** One outbox row as a look reads it. */
     private data class Row(
@@ -293,8 +327,8 @@ object EventFeedController {
         val payload: JsonObject,
     )
 
-    /** What a look read: the rows, and the horizon they were read below. */
-    private class Read(val rows: List<Row>, val horizon: Long)
+    /** What a look read: the rows, the horizon they were read below, and the next transaction id. */
+    private class Read(val rows: List<Row>, val horizon: Long, val xmax: Long)
 
     /** One look, in the caller's transaction. [after] null reads from now. */
     internal fun look(orgId: UUID, userId: UUID, keyId: UUID, after: Position.At?, types: Set<String>?, limit: Int): Look {
@@ -312,8 +346,13 @@ object EventFeedController {
 
         val read = readRows(orgId, after)
         val start = Position.At(read.horizon - 1, Long.MAX_VALUE)
-        checkRetention(orgId, after, start)
-        if (after == null) return Look(emptyList(), start, more = false)
+        // A position at or past the oldest open transaction cannot have been
+        // handed out in this database's history: it was taken on another.
+        if (after != null && after.xid >= read.horizon) {
+            return Look(emptyList(), start, more = false, horizon = read.horizon, xmax = read.xmax, beyond = true)
+        }
+        checkRetention(orgId, after)
+        if (after == null) return Look(emptyList(), start, more = false, horizon = read.horizon, xmax = read.xmax)
 
         val rows = read.rows
         val context = Context.load(orgId, rows)
@@ -338,45 +377,40 @@ object EventFeedController {
         // position can move up to it, so a cursor that sees nothing still
         // keeps up with the purge.
         if (readAll && position < start) position = start
-        return Look(items, position, more = !readAll)
+        return Look(items, position, more = !readAll, horizon = read.horizon, xmax = read.xmax)
     }
 
-    /**
-     * Refuses a position the purge has passed, and every position once the
-     * database has been restored into another cluster — whose transaction
-     * ids mean nothing here; the mark then starts again from [start].
-     */
-    private fun checkRetention(orgId: UUID, after: Position.At?, start: Position.At) {
-        val row = OutboxRetention.selectAll().where { OutboxRetention.id eq 1 }.firstOrNull() ?: return
-        val stored = row[OutboxRetention.systemIdentifier]
-        val current = connection().prepareStatement("SELECT $SYSTEM_IDENTIFIER").use { stmt ->
-            stmt.executeQuery().use { rs -> rs.next(); rs.getLong(1).takeIf { !rs.wasNull() } }
-        }
-        if (stored != null && current != null && stored != current) {
-            log.warn(
-                "The database is not the cluster the event feed's positions were taken on ({} now, {} before): " +
-                    "every cursor is refused, and the feed starts again from the present",
-                current, stored,
-            )
-            OutboxRetention.update({ OutboxRetention.id eq 1 }) {
-                it[purgedXid] = start.xid
-                it[purgedSeq] = start.seq
-                it[systemIdentifier] = current
-                it[updatedAt] = java.time.Instant.now()
-            }
-            commitThen { throw expired(orgId, start) }
-        }
+    /** Refuses a position the purge has passed. */
+    private fun checkRetention(orgId: UUID, after: Position.At?) {
         if (after == null) return
-        val mark = Position.At(row[OutboxRetention.purgedXid], row[OutboxRetention.purgedSeq])
+        val mark = OutboxRetention.selectAll().where { OutboxRetention.id eq 1 }.firstOrNull()
+            ?.let { Position.At(it[OutboxRetention.purgedXid], it[OutboxRetention.purgedSeq]) } ?: return
         // After the read: a purge that passed the position meanwhile may have
         // taken rows the read never saw.
         if (after < mark) throw expired(orgId, mark)
     }
 
-    /** Commits the current transaction's writes, then runs [block] — which throws, and must not undo them. */
-    private fun commitThen(block: () -> Nothing): Nothing {
-        TransactionManager.current().commit()
-        block()
+    /**
+     * Moves the feed to the history the database now has: rows whose
+     * transaction id it has not reached yet were written in another history
+     * and lose their place (their `xid` is cleared, so they are neither
+     * delivered nor counted by the purge), and the mark starts at the
+     * present, so every position taken before is refused.
+     */
+    private fun rebase(xmax: Long, start: Position.At) {
+        log.warn(
+            "The event feed's positions do not belong to this database's history (restored, or rewound): " +
+                "every cursor is refused, and the feed starts again from the present",
+        )
+        connection().prepareStatement("UPDATE outbox SET xid = NULL WHERE xid >= ?").use { stmt ->
+            stmt.setLong(1, xmax)
+            stmt.executeUpdate()
+        }
+        OutboxRetention.update({ OutboxRetention.id eq 1 }) {
+            it[purgedXid] = start.xid
+            it[purgedSeq] = start.seq
+            it[updatedAt] = java.time.Instant.now()
+        }
     }
 
     /**
@@ -421,8 +455,8 @@ object EventFeedController {
      */
     private fun readRows(orgId: UUID, after: Position.At?): Read {
         val sql = """
-            SELECT h.x AS horizon, o.seq, o.xid, o.id, o.event_type, o.aggregate_id, o.created_at, o.payload::text AS payload
-            FROM (SELECT $HORIZON AS x) h
+            SELECT h.x AS horizon, h.xmax, o.seq, o.xid, o.id, o.event_type, o.aggregate_id, o.created_at, o.payload::text AS payload
+            FROM (SELECT $HORIZON AS x, pg_snapshot_xmax(pg_current_snapshot())::text::bigint AS xmax) h
             LEFT JOIN LATERAL (
                 SELECT seq, xid, id, event_type, aggregate_id, created_at, payload
                 FROM outbox
@@ -433,6 +467,7 @@ object EventFeedController {
         """.trimIndent()
         val rows = mutableListOf<Row>()
         var horizon = 0L
+        var xmax = 0L
         connection().prepareStatement(sql).use { stmt ->
             stmt.setBoolean(1, after != null)
             stmt.setObject(2, orgId)
@@ -442,6 +477,7 @@ object EventFeedController {
             stmt.executeQuery().use { rs ->
                 while (rs.next()) {
                     horizon = rs.getLong("horizon")
+                    xmax = rs.getLong("xmax")
                     if (rs.getObject("seq") == null) continue
                     rows += Row(
                         position = Position.At(rs.getLong("xid"), rs.getLong("seq")),
@@ -454,7 +490,7 @@ object EventFeedController {
                 }
             }
         }
-        return Read(rows, horizon)
+        return Read(rows, horizon, xmax)
     }
 
     private val RESULT_EVENTS = setOf("probe_result.created", OutboxEmit.PROBE_RESULT_SKIPPED)

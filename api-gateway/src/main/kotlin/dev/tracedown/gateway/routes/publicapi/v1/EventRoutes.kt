@@ -3,6 +3,7 @@ package dev.tracedown.gateway.routes.publicapi.v1
 import dev.tracedown.common.errors.ErrorCodes
 import dev.tracedown.gateway.controllers.events.EventFeedController
 import dev.tracedown.gateway.controllers.events.EventTypes
+import dev.tracedown.gateway.data.events.EventPage
 import dev.tracedown.gateway.routes.publicapi.apiCaller
 import dev.tracedown.gateway.util.EventPollSlots
 import dev.tracedown.gateway.context.ApiKeyAuth
@@ -49,22 +50,27 @@ fun Route.eventRoutes() {
 
         // Someone who can see nothing at all is answered at once — there is
         // nothing to wait for — and holds no slot.
-        val effectiveWait = if (EventFeedController.hasAnythingToSee(caller.orgId, caller.userId)) wait else 0
-        // A slot for as long as the read may take, and a little more.
-        val slot = when (val outcome = EventPollSlots.tryAcquire(caller.keyId, caller.userId, caller.orgId, (effectiveWait + 10) * 1000L)) {
-            is EventPollSlots.Outcome.Held -> outcome.slot
-            is EventPollSlots.Outcome.Refused -> throw ApiException(
-                HttpStatusCode.TooManyRequests, ErrorCodes.TOO_MANY_EVENT_POLLS,
-                details = buildJsonObject { put("bound", outcome.bound.wire) },
+        val anything = EventFeedController.hasAnythingToSee(ApiKeyAuth.permissionsOf(call))
+        val read: suspend (Int) -> EventPage = { effectiveWait ->
+            EventFeedController.read(
+                caller.orgId, caller.userId, caller.keyId, after, effectiveWait, types, limit,
+                spend = { ApiKeyAuth.spendAgain(call) },
+                beforeLook = { PublicApi.recheckGuards(caller, call) },
             )
         }
         val page = try {
-            slot.use {
-                EventFeedController.read(
-                    caller.orgId, caller.userId, caller.keyId, after, effectiveWait, types, limit,
-                    spend = { ApiKeyAuth.spendAgain(call) },
-                    beforeLook = { PublicApi.recheckGuards(caller, call) },
-                )
+            if (!anything) {
+                read(0)
+            } else {
+                // A slot for as long as the read may take, and a little more.
+                val slot = when (val outcome = EventPollSlots.tryAcquire(caller.keyId, caller.userId, caller.orgId, (wait + 10) * 1000L)) {
+                    is EventPollSlots.Outcome.Held -> outcome.slot
+                    is EventPollSlots.Outcome.Refused -> throw ApiException(
+                        HttpStatusCode.TooManyRequests, ErrorCodes.TOO_MANY_EVENT_POLLS,
+                        details = buildJsonObject { put("bound", outcome.bound.wire) },
+                    )
+                }
+                slot.use { read(wait) }
             }
         } catch (_: PublicApi.AnsweredByGuard) {
             return@get

@@ -37,29 +37,14 @@ ALTER TABLE outbox ALTER COLUMN inserted_at SET DEFAULT clock_timestamp();
 -- feed cursor before it may have missed a row and is refused rather than
 -- served with a silent hole. One row, only ever moved forward, by the purge in
 -- its own DELETE statement.
---
--- system_identifier: the database cluster the positions were taken on. xids
--- are a cluster's own count; a dump restored into another cluster starts
--- counting again, from wherever that cluster is, and every cursor handed out
--- before names positions that mean nothing there. The feed compares this with
--- the cluster it runs on, and on a mismatch refuses old cursors (410) and
--- starts the mark again from the present. NULL when the function is not
--- available to this role; the check is then skipped.
 CREATE TABLE outbox_retention (
-    id                  SMALLINT    PRIMARY KEY CHECK (id = 1),
-    purged_xid          BIGINT      NOT NULL DEFAULT 0,
-    purged_seq          BIGINT      NOT NULL DEFAULT 0,
-    system_identifier   BIGINT,
-    updated_at          TIMESTAMP   NOT NULL DEFAULT now()
+    id          SMALLINT    PRIMARY KEY CHECK (id = 1),
+    purged_xid  BIGINT      NOT NULL DEFAULT 0,
+    purged_seq  BIGINT      NOT NULL DEFAULT 0,
+    updated_at  TIMESTAMP   NOT NULL DEFAULT now()
 );
 
 -- No cursor exists yet — the feed is new with this migration — so nothing
 -- handed out can lie before what earlier purges took; the mark starts at the
 -- beginning and the next purge moves it.
-INSERT INTO outbox_retention (id, purged_xid, purged_seq, system_identifier, updated_at)
-VALUES (
-    1, 0, 0,
-    CASE WHEN has_function_privilege('pg_control_system()', 'EXECUTE')
-         THEN (SELECT system_identifier FROM pg_control_system()) END,
-    now()
-);
+INSERT INTO outbox_retention (id, purged_xid, purged_seq, updated_at) VALUES (1, 0, 0, now());

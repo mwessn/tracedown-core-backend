@@ -541,9 +541,10 @@ object PublicApiOperations {
                 "To wait for a run, take a cursor before `POST /services/{id}/run`, then read for its `run.settled`. " +
                 "Events are kept 7 days; a cursor older than that is 410 `cursor_expired` with `details.oldest`, the " +
                 "cursor to start again from — after taking a new snapshot. A cursor works only for the organization it " +
-                "was given in, and only on the database it was given on: one from another organization, one sealed " +
-                "before the platform key changed, and every cursor after the database is restored from a dump are 410 " +
-                "the same way.\n\n" +
+                "was given in, and only in the database history it was given in: one from another organization, one " +
+                "sealed before the platform key changed, and every cursor once the database has gone back in time (a " +
+                "backup restored, a point-in-time recovery, a dump loaded) are 410 the same way, with a fresh start " +
+                "in `details.oldest`.\n\n" +
                 "**Types** and their `data` (exactly these fields):\n\n" +
                 "| type | resource | data |\n|---|---|---|\n" +
                 EventTypes.DATA.entries.joinToString("\n") { (type, fields) ->
@@ -561,8 +562,9 @@ object PublicApiOperations {
                 "children are not announced; drop them. `alert.raised` is a new episode of a system alert and needs " +
                 "what the warning log needs; nothing announces an alert's end (see `GET /alerts`). `run.settled` is a " +
                 "run asked for by `POST /services/{id}/run` reaching `done` or `skipped` (`state`): `status` is the " +
-                "run's worst result's, null when it never ran (`reason` `run_not_delivered`: no scheduler took it), " +
-                "`skipped` when it ran and was skipped (with that `reason`). A run settled once can settle again — a " +
+                "run's worst result's, null when it never ran (`reason` `run_not_delivered`: no scheduler took it); " +
+                "`reason` is set only when the whole run was skipped — `status` `skipped` with `state` `done` means " +
+                "some of its agents did not run it, and carries none. A run settled once can settle again — a " +
                 "skip that a result replaces, a late result after `run_not_delivered` — with `superseded: true`: the " +
                 "last `run.settled` for a `runId` wins. An `expired` run is never an event; it is what " +
                 "`GET /services/{id}/runs/{runId}` says once nothing has come. `occurredAt`: a result's run start, an " +

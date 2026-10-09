@@ -12,19 +12,15 @@ import org.jetbrains.exposed.v1.javatime.timestamp
  * result's row until that row is published, however old — so the first row
  * still present says nothing about what is gone. This does: a reader
  * positioned before it may have missed a deleted row, and one at or after it
- * has missed nothing. It only ever moves forward.
+ * has missed nothing. The purge only moves it forward, and never past the
+ * oldest transaction still open. The event feed sets it to the present when it
+ * finds the database was rewound or restored — positions taken before then
+ * mean nothing after.
  */
 object OutboxRetention : Table("outbox_retention") {
     val id = short("id")
     val purgedXid = long("purged_xid").default(0)
     val purgedSeq = long("purged_seq").default(0)
-
-    /**
-     * The database cluster [purgedXid] and every feed position were taken on
-     * (`pg_control_system().system_identifier`); null when this role may not
-     * read it. A different one means the database was restored elsewhere.
-     */
-    val systemIdentifier = long("system_identifier").nullable()
     val updatedAt = timestamp("updated_at")
 
     override val primaryKey = PrimaryKey(id)

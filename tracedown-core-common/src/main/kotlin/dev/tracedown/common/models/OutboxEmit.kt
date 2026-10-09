@@ -11,6 +11,9 @@ import org.jetbrains.exposed.v1.jdbc.transactions.TransactionManager
 import org.slf4j.LoggerFactory
 import java.time.Instant
 import java.util.UUID
+import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
 
 /**
  * Emits durable events onto the transactional [Outbox].
@@ -87,6 +90,28 @@ object OutboxEmit {
         if (orgId != null) nudgeAfterCommit(orgId)
     }
 
+    /**
+     * Sends nudges off the committing thread: fire and forget, one at a time,
+     * and dropped when too many are waiting. The committing thread may still
+     * hold its connection, and a nudge that waits on a slow or absent Redis
+     * must not hold it too. A dropped nudge costs a reader a few seconds.
+     */
+    private val sender = ThreadPoolExecutor(
+        1, 1, 0L, TimeUnit.MILLISECONDS, ArrayBlockingQueue(1_000),
+        { runnable -> Thread(runnable, "outbox-nudge").apply { isDaemon = true } },
+        ThreadPoolExecutor.DiscardPolicy(),
+    )
+
+    private fun send(notify: (UUID) -> Unit, org: UUID) {
+        sender.execute {
+            try {
+                notify(org)
+            } catch (e: Exception) {
+                log.debug("outbox nudge for {} not sent: {}", org, e.message)
+            }
+        }
+    }
+
     private fun orgOf(payload: JsonObject): UUID? =
         (payload["orgId"] ?: payload["organizationId"])?.jsonPrimitive?.contentOrNull
             ?.let { runCatching { UUID.fromString(it) }.getOrNull() }
@@ -99,13 +124,7 @@ object OutboxEmit {
             transaction.registerInterceptor(object : StatementInterceptor {
                 override fun afterCommit(transaction: Transaction) {
                     val sent = synchronized(orgs) { orgs.toList().also { orgs.clear() } }
-                    for (org in sent) {
-                        try {
-                            notify(org)
-                        } catch (e: Exception) {
-                            log.debug("outbox nudge for {} not sent: {}", org, e.message)
-                        }
-                    }
+                    for (org in sent) send(notify, org)
                 }
             })
         }

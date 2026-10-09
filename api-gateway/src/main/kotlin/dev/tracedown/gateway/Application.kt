@@ -194,12 +194,14 @@ fun Application.module() {
         dev.tracedown.common.agents.AgentEnrolmentAddress.fixed(appConfig.platform.publicUrl),
     )
 
-    // Redis A (operational) — lazy init, only connects when first accessed
-    val redisA by lazy {
-        val conn = RedisFactory.createConnection(appConfig.redis.aUrl)
-        monitor.subscribe(io.ktor.server.application.ApplicationStopped) { conn.close() }
-        conn.sync()
-    }
+    // Redis A (operational) — connects on first use. Every Redis here is
+    // reached from inside requests, some inside database transactions (cache
+    // puts, live updates), so a Redis that is not there must answer at once:
+    // `LazyRedis` tries once and then backs off, where a plain `lazy` retried
+    // the connect for half a minute on every touch.
+    val redisALink = dev.tracedown.common.redis.LazyRedis(appConfig.redis.aUrl)
+    monitor.subscribe(io.ktor.server.application.ApplicationStopped) { redisALink.close() }
+    val redisA by redisALink
 
     dev.tracedown.gateway.util.ScheduleNudge.init { redisA }
     // Remembers the key-authenticated API's idempotent POSTs, shared by every replica.
@@ -215,6 +217,7 @@ fun Application.module() {
         redisA.publish(dev.tracedown.common.models.OutboxEmit.NUDGE_CHANNEL, orgId.toString())
     }
     dev.tracedown.gateway.util.EventPollSlots.init { redisA }
+    dev.tracedown.gateway.util.FeedHighWater.init { redisA }
     dev.tracedown.gateway.util.EventCursor.init(appConfig.platform.aesKey)
     dev.tracedown.gateway.util.EventWakeups.start(appConfig.redis.aUrl)
     monitor.subscribe(io.ktor.server.application.ApplicationStopped) {
@@ -226,11 +229,9 @@ fun Application.module() {
     // Lazy like A and B: the cache is an optimisation, and connecting to it
     // during module init let an unreachable instance stop Ktor from binding.
     val resourceCache = if (appConfig.redis.cUrl != null) {
-        val redisC by lazy {
-            val conn = RedisFactory.createConnection(appConfig.redis.cUrl!!)
-            monitor.subscribe(io.ktor.server.application.ApplicationStopped) { conn.close() }
-            conn.sync()
-        }
+        val redisCLink = dev.tracedown.common.redis.LazyRedis(appConfig.redis.cUrl!!)
+        monitor.subscribe(io.ktor.server.application.ApplicationStopped) { redisCLink.close() }
+        val redisC by redisCLink
         dev.tracedown.common.cache.ResourceCache({ redisC }, appConfig.redis.cacheTtlSeconds)
     } else {
         log.info("Redis C not configured — resource cache disabled (DB-only mode)")
@@ -239,11 +240,9 @@ fun Application.module() {
     ResourceResolver.init(resourceCache)
 
     // Redis B (ephemeral cache) — rate limiting
-    val redisB by lazy {
-        val conn = RedisFactory.createConnection(appConfig.redis.bUrl)
-        monitor.subscribe(io.ktor.server.application.ApplicationStopped) { conn.close() }
-        conn.sync()
-    }
+    val redisBLink = dev.tracedown.common.redis.LazyRedis(appConfig.redis.bUrl)
+    monitor.subscribe(io.ktor.server.application.ApplicationStopped) { redisBLink.close() }
+    val redisB by redisBLink
 
     val rateLimitConfig = RateLimitConfig.load(environment.config)
     // A hop count that is too low is invisible from the inside: the limiter

@@ -2,6 +2,7 @@ package dev.tracedown.gateway.context
 
 import dev.tracedown.common.auth.ApiKeyAuthenticator
 import dev.tracedown.common.auth.ApiKeyResult
+import dev.tracedown.common.auth.CachedPermissions
 import dev.tracedown.common.auth.TokenHasher
 import dev.tracedown.common.errors.ErrorCodes
 import dev.tracedown.common.models.ApiKeys
@@ -65,6 +66,12 @@ internal object ApiKeyAuth {
      */
     private val markedGood = ConcurrentHashMap<String, Long>()
 
+    /** The permissions the key's user held when the key was let in. */
+    private val permissionsKey = AttributeKey<CachedPermissions>("ApiKeyPermissions")
+
+    /** What [permissionsKey] holds for this call, if a key was let in. */
+    fun permissionsOf(call: ApplicationCall): CachedPermissions? = call.attributes.getOrNull(permissionsKey)
+
     /** The presented key's digest, for spending its budget later in the call. */
     private val digestKey = AttributeKey<String>("ApiKeyDigest")
 
@@ -103,7 +110,14 @@ internal object ApiKeyAuth {
         // a long-poll that returns the moment something happens cost in
         // proportion to how busy the organization is. What it does charge is
         // every answer given without waiting and every look after the first.
-        if (!isEventFeed(call)) ApiRateLimit.spend(digest)?.let { budget ->
+        // A key with nothing left is still refused here, before any lookup —
+        // only without spending.
+        if (isEventFeed(call)) {
+            ApiRateLimit.peek(digest)?.takeIf { !it.allowed }?.let { budget ->
+                call.response.headers.append(HttpHeaders.RetryAfter, budget.retryAfterSeconds.toString())
+                throw TooManyRequestsException()
+            }
+        } else ApiRateLimit.spend(digest)?.let { budget ->
             call.response.headers.append("X-RateLimit-Limit", budget.limit.toString())
             call.response.headers.append("X-RateLimit-Remaining", budget.remaining.toString())
             if (!budget.allowed) {
@@ -136,6 +150,7 @@ internal object ApiKeyAuth {
             }
         }
 
+        ctx.permissions?.let { call.attributes.put(permissionsKey, it) }
         return ResolvedCaller(
             principal = AuthPrincipal(
                 userId = ctx.userId,

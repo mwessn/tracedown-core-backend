@@ -2892,31 +2892,124 @@ class ApiKeyResourcesTest {
         }
     }
 
+    private val At = dev.tracedown.gateway.util.EventCursor.Position::At
+
+    /** The oldest transaction open now, and the next id to be given out. */
+    private fun horizonNow(): Pair<Long, Long> = transaction {
+        var out = 0L to 0L
+        exec("SELECT pg_snapshot_xmin(pg_current_snapshot())::text::bigint, pg_snapshot_xmax(pg_current_snapshot())::text::bigint") { rs ->
+            rs.next(); out = rs.getLong(1) to rs.getLong(2)
+        }
+        out
+    }
+
+    private fun markNow(): dev.tracedown.gateway.util.EventCursor.Position.At = transaction {
+        dev.tracedown.common.models.OutboxRetention.selectAll().single().let {
+            At(it[dev.tracedown.common.models.OutboxRetention.purgedXid], it[dev.tracedown.common.models.OutboxRetention.purgedSeq])
+        }
+    }
+
     @Test
     @org.junit.jupiter.api.parallel.ResourceLock("outbox_retention")
-    fun `after a restore into another cluster every cursor is refused, and the feed starts again from the present`() {
+    fun `a cursor from another history is refused, and the feed starts again from the present`() {
         val address = nextAddress()
         val fx = fixtures(address)
-        val cursor = events(address, fx.readKey).str("next")
-        val real = transaction {
-            dev.tracedown.common.models.OutboxRetention.selectAll().single()[dev.tracedown.common.models.OutboxRetention.systemIdentifier]
+        val (horizon, xmax) = horizonNow()
+        // A row of another history: written by a transaction this database has not reached.
+        transaction {
+            exec(
+                "INSERT INTO outbox (id, aggregate_type, aggregate_id, event_type, payload, published, created_at, organization_id, xid) " +
+                    "VALUES (gen_random_uuid(), 'workspace', '${fx.workspace}', 'resource.workspace.updated', " +
+                    "'{\"id\":\"${fx.workspace}\",\"orgId\":\"${fx.owner.orgId}\"}'::jsonb, false, now(), '${fx.owner.orgId}', ${xmax + 1_000_000})",
+            )
         }
-        assertNotNull(real, "The test database's cluster is recorded")
         try {
-            transaction {
-                dev.tracedown.common.models.OutboxRetention.update({ dev.tracedown.common.models.OutboxRetention.id eq 1 }) {
-                    it[systemIdentifier] = real!! + 1
-                }
-            }
-            val (status, raw) = send(address, "GET", "${PublicApi.V1}/events?after=$cursor", fx.readKey)
+            // Past the horizon: no position this history handed out.
+            val beyond = dev.tracedown.gateway.util.EventCursor.encode(fx.owner.orgId, At(horizon + 1_000, 0))
+            val (status, raw) = send(address, "GET", "${PublicApi.V1}/events?after=$beyond", fx.readKey)
             assertEquals(410, status, raw)
             val oldest = obj(raw)["details"]!!.jsonObject.str("oldest")
-            val stored = transaction { dev.tracedown.common.models.OutboxRetention.selectAll().single() }
-            assertEquals(real, stored[dev.tracedown.common.models.OutboxRetention.systemIdentifier], "The cluster is recorded again")
-            ServiceController.update(fx.owner.orgId, fx.service, UpdateServiceRequest(name = "After restore"), fx.owner.userId)
+            // The fresh start is a cursor that works.
+            events(address, fx.readKey, "?after=$oldest")
+            assertTrue(markNow() >= At(horizon - 1, Long.MAX_VALUE), "the mark starts at the present: ${markNow()}")
+            // The other history's row lost its place: never delivered, never counted.
+            val stray = transaction {
+                Outbox.selectAll().where { Outbox.organizationId eq fx.owner.orgId }.map { it[Outbox.xid] }.filter { it == null }
+            }
+            assertEquals(1, stray.size)
+            ServiceController.update(fx.owner.orgId, fx.service, UpdateServiceRequest(name = "After the move"), fx.owner.userId)
             assertEquals(listOf("service.updated"), events(address, fx.readKey, "?after=$oldest").types())
         } finally {
             setMark(0, 0)
+        }
+    }
+
+    @Test
+    @org.junit.jupiter.api.parallel.ResourceLock("outbox_retention")
+    fun `a database that went back in time is noticed by the horizon it has seen`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val cursor = events(address, fx.readKey).str("next")
+        val redis = io.lettuce.core.RedisClient.create(TestRedis.url).connect()
+        try {
+            // A horizon seen before, far above today's: what a restore looks like from here.
+            redis.sync().set("feed:hw", Long.MAX_VALUE.div(4).toString())
+            val (status, raw) = send(address, "GET", "${PublicApi.V1}/events?after=$cursor", fx.readKey)
+            assertEquals(410, status, raw)
+            val oldest = obj(raw)["details"]!!.jsonObject.str("oldest")
+            assertTrue(redis.sync().get("feed:hw")!!.toLong() < Long.MAX_VALUE / 4, "the high-water mark starts again")
+            assertEquals(200, send(address, "GET", "${PublicApi.V1}/events?after=$oldest", fx.readKey).first)
+            // Seen once, settled: the next read is ordinary.
+            assertEquals(200, send(address, "GET", "${PublicApi.V1}/events?after=$oldest", fx.readKey).first)
+        } finally {
+            redis.close()
+            setMark(0, 0)
+        }
+    }
+
+    @Test
+    @org.junit.jupiter.api.parallel.ResourceLock("outbox_retention")
+    fun `a key with no budget left is refused before any work, and a refused cursor is paid for`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val key = mintKey(fx.ownerSession, "read", address)
+        val cursor = events(address, key).str("next")
+
+        // A refusal that reads the mark is a request's worth of work.
+        ServiceController.update(fx.owner.orgId, fx.service, UpdateServiceRequest(name = "Past it"), fx.owner.userId)
+        val passed = lastPosition(fx)
+        try {
+            setMark(passed.xid, passed.seq)
+            var before = budgetLeft(key)
+            assertEquals(410, send(address, "GET", "${PublicApi.V1}/events?after=$cursor&wait=2", key).first)
+            assertEquals(2L, before - budgetLeft(key), "the refused first look was charged")
+            before = budgetLeft(key)
+            val foreign = fixtures(nextAddress()).let { events(nextAddress(), it.readKey).str("next") }
+            assertEquals(410, send(address, "GET", "${PublicApi.V1}/events?after=$foreign&wait=2", key).first)
+            assertEquals(2L, before - budgetLeft(key), "a cursor that does not open was charged")
+        } finally {
+            setMark(0, 0)
+        }
+
+        // Spent out: refused at the door — no look, and nothing more spent.
+        val digest = dev.tracedown.common.auth.TokenHasher.sha256Hex(key)
+        val window = System.currentTimeMillis() / 1000 / ONE_WINDOW.toLong()
+        val redis = io.lettuce.core.RedisClient.create(TestRedis.url).connect()
+        val looks = AtomicInteger(0)
+        dev.tracedown.gateway.controllers.events.EventFeedController.beforeEachLook = { looks.incrementAndGet() }
+        try {
+            redis.sync().set("rate:api:$digest:$window", "1000000")
+            repeat(3) {
+                val (status, raw) = send(address, "GET", "${PublicApi.V1}/events?after=$cursor", key)
+                assertEquals(429, status, raw)
+                assertEquals("rate_limited", errorOf(raw))
+            }
+            assertEquals(0, looks.get(), "a refused read looked at the feed")
+            assertEquals("1000000", redis.sync().get("rate:api:$digest:$window"), "a refused read spent budget")
+        } finally {
+            clearLookHook()
+            redis.sync().del("rate:api:$digest:$window")
+            redis.close()
         }
     }
 

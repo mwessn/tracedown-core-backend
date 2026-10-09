@@ -117,7 +117,15 @@ class OutboxPurgeJob(
                 )
                 RETURNING COALESCE(xid, 0) AS xid, seq
             ), last AS (
-                SELECT xid, seq FROM gone ORDER BY xid DESC, seq DESC LIMIT 1
+                -- Never past the oldest transaction still open: a reader's
+                -- position cannot be there yet, and a row past it (one of
+                -- another history, whose xid this database has not reached)
+                -- must not drag the mark beyond every reader.
+                SELECT
+                    CASE WHEN g.xid >= h.x THEN h.x - 1 ELSE g.xid END AS xid,
+                    CASE WHEN g.xid >= h.x THEN 9223372036854775807 ELSE g.seq END AS seq
+                FROM (SELECT xid, seq FROM gone ORDER BY xid DESC, seq DESC LIMIT 1) g,
+                     (SELECT pg_snapshot_xmin(pg_current_snapshot())::text::bigint AS x) h
             ), mark AS (
                 UPDATE outbox_retention r
                 SET purged_xid = last.xid, purged_seq = last.seq, updated_at = now()

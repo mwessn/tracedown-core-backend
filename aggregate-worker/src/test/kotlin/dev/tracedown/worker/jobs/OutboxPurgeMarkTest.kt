@@ -186,4 +186,18 @@ class OutboxPurgeMarkTest {
         val (xid, seq) = mark()
         assertTrue(xid > 0 && seq > 0)
     }
+
+    @Test
+    fun `a row of another history cannot drag the mark past the oldest open transaction`() = runBlocking {
+        val stray = row("resource.service.updated", Instant.now().minus(30, ChronoUnit.DAYS), writtenDaysAgo = 30)
+        transaction { exec("UPDATE outbox SET xid = pg_snapshot_xmax(pg_current_snapshot())::text::bigint + 1000000 WHERE id = '$stray'") }
+        OutboxPurgeJob(retentionDays = 7).execute()
+        assertEquals(emptySet<UUID>(), present())
+        val horizon = transaction {
+            var x = 0L
+            exec("SELECT pg_snapshot_xmin(pg_current_snapshot())::text::bigint") { rs -> rs.next(); x = rs.getLong(1) }
+            x
+        }
+        assertTrue(mark().first < horizon, "the mark went to ${mark()}, past the horizon $horizon")
+    }
 }
