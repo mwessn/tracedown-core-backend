@@ -5,7 +5,12 @@ import dev.tracedown.gateway.controllers.events.EventFeedController
 import dev.tracedown.gateway.controllers.events.EventTypes
 import dev.tracedown.gateway.routes.publicapi.apiCaller
 import dev.tracedown.gateway.util.EventPollSlots
-import dev.tracedown.gateway.util.TooManyRequestsException
+import dev.tracedown.gateway.context.ApiKeyAuth
+import dev.tracedown.gateway.routes.publicapi.PublicApi
+import dev.tracedown.gateway.util.ApiException
+import io.ktor.http.HttpStatusCode
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 import dev.tracedown.gateway.util.fieldError
 import io.ktor.server.response.respond
 import io.ktor.server.routing.Route
@@ -42,11 +47,27 @@ fun Route.eventRoutes() {
             ?.toSet()
             ?.also { asked -> if (asked.isEmpty() || !EventTypes.ALL.containsAll(asked)) throw fieldError("types") }
 
+        // Someone who can see nothing at all is answered at once — there is
+        // nothing to wait for — and holds no slot.
+        val effectiveWait = if (EventFeedController.hasAnythingToSee(caller.orgId, caller.userId)) wait else 0
         // A slot for as long as the read may take, and a little more.
-        val slot = EventPollSlots.tryAcquire(caller.keyId, caller.userId, caller.orgId, (wait + 10) * 1000L)
-            ?: throw TooManyRequestsException(ErrorCodes.TOO_MANY_EVENT_POLLS)
-        val page = slot.use {
-            EventFeedController.read(caller.orgId, caller.userId, caller.keyId, after, wait, types, limit)
+        val slot = when (val outcome = EventPollSlots.tryAcquire(caller.keyId, caller.userId, caller.orgId, (effectiveWait + 10) * 1000L)) {
+            is EventPollSlots.Outcome.Held -> outcome.slot
+            is EventPollSlots.Outcome.Refused -> throw ApiException(
+                HttpStatusCode.TooManyRequests, ErrorCodes.TOO_MANY_EVENT_POLLS,
+                details = buildJsonObject { put("bound", outcome.bound.wire) },
+            )
+        }
+        val page = try {
+            slot.use {
+                EventFeedController.read(
+                    caller.orgId, caller.userId, caller.keyId, after, effectiveWait, types, limit,
+                    spend = { ApiKeyAuth.spendAgain(call) },
+                    beforeLook = { PublicApi.recheckGuards(caller, call) },
+                )
+            }
+        } catch (_: PublicApi.AnsweredByGuard) {
+            return@get
         }
         call.respond(page)
     }

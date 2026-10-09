@@ -96,6 +96,18 @@ fun Application.module() {
         conn.sync()
     }
 
+    // Redis A, only to wake the event feed's waiting reads once what this
+    // process wrote to the outbox has committed. Lazy, like B: an outage must
+    // not stop the worker starting, and a nudge is best-effort.
+    val redisA by lazy {
+        val conn = RedisFactory.createConnection(config.redisAUrl)
+        monitor.subscribe(io.ktor.server.application.ApplicationStopped) { conn.close() }
+        conn.sync()
+    }
+    dev.tracedown.common.models.OutboxEmit.onCommitted { orgId ->
+        redisA.publish(dev.tracedown.common.models.OutboxEmit.NUDGE_CHANNEL, orgId.toString())
+    }
+
     // Job scope
     val jobScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     val intervals = config.jobIntervals

@@ -22,75 +22,87 @@ import javax.crypto.spec.SecretKeySpec
  * every time (it is deterministic on purpose, and the only thing a repeat
  * reveals is the equality of two positions of one organization).
  *
- * `ev2.` marks this form. `ev1:` cursors, the bare `seq` an earlier build of
- * this branch handed out, are still read ([decode] returns them as
- * [Position.Legacy]).
+ * `ev2.` marks this form. A cursor of that form that does not open — sealed
+ * for another organization, or under a platform key since changed — is told
+ * apart from one that is not a cursor at all ([isSealed]).
  */
 object EventCursor {
 
-    /** A position the cursor names. */
+    /** A position the cursor names: read on from the row after `(xid, seq)`. */
     sealed interface Position {
-        /** Read on from the row after `(xid, seq)`. */
         data class At(val xid: Long, val seq: Long) : Position, Comparable<At> {
             override fun compareTo(other: At): Int = compareValuesBy(this, other, At::xid, At::seq)
         }
-
-        /** A bare `seq`, from a cursor of the first form. */
-        data class Legacy(val seq: Long) : Position
     }
 
     private const val PREFIX = "ev2."
-    private const val LEGACY_PREFIX = "ev1:"
     private const val NONCE_BYTES = 12
     private const val TAG_BITS = 128
 
-    @Volatile
-    private var key: ByteArray? = null
+    /** The two keys, each derived from the platform key under a label of its own. */
+    private class Keys(val nonce: ByteArray, val seal: ByteArray)
 
-    /** Derives the cursor key from the platform key. Call once at startup. */
+    @Volatile
+    private var keys: Keys? = null
+
+    /** Derives the cursor keys from the platform key. Call once at startup. */
     fun init(platformKeyHex: String) {
-        val mac = Mac.getInstance("HmacSHA256")
-        mac.init(SecretKeySpec(VariableCryptoEngine.parseKeyHex(platformKeyHex), "HmacSHA256"))
-        key = mac.doFinal("tracedown event feed cursor".toByteArray())
+        val platform = VariableCryptoEngine.parseKeyHex(platformKeyHex)
+        keys = Keys(nonce = derive(platform, "tracedown event cursor nonce"), seal = derive(platform, "tracedown event cursor seal"))
     }
 
-    private fun key(): ByteArray = key ?: error("EventCursor.init was not called")
+    private fun derive(platform: ByteArray, label: String): ByteArray {
+        val mac = Mac.getInstance("HmacSHA256")
+        mac.init(SecretKeySpec(platform, "HmacSHA256"))
+        return mac.doFinal(label.toByteArray())
+    }
+
+    private fun keys(): Keys = keys ?: error("EventCursor.init was not called")
+
+    /** Nonce, 16 bytes of position, 16 of tag. */
+    private const val SEALED_BYTES = NONCE_BYTES + 16 + TAG_BITS / 8
 
     /** The cursor for [position] in [orgId]. */
     fun encode(orgId: UUID, position: Position.At): String {
         val plain = ByteBuffer.allocate(16).putLong(position.xid).putLong(position.seq).array()
         val aad = uuidBytes(orgId)
         val mac = Mac.getInstance("HmacSHA256")
-        mac.init(SecretKeySpec(key(), "HmacSHA256"))
+        mac.init(SecretKeySpec(keys().nonce, "HmacSHA256"))
         mac.update(aad)
         val nonce = mac.doFinal(plain).copyOf(NONCE_BYTES)
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-        cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(key(), "AES"), GCMParameterSpec(TAG_BITS, nonce))
+        cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(keys().seal, "AES"), GCMParameterSpec(TAG_BITS, nonce))
         cipher.updateAAD(aad)
         val sealed = cipher.doFinal(plain)
         return PREFIX + Base64.getUrlEncoder().withoutPadding().encodeToString(nonce + sealed)
     }
 
-    /** The position [cursor] names in [orgId], or null when it is not a cursor of that organization. */
-    fun decode(orgId: UUID, cursor: String): Position? {
-        if (cursor.startsWith(PREFIX)) {
-            return runCatching {
-                val bytes = Base64.getUrlDecoder().decode(cursor.removePrefix(PREFIX))
-                val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-                cipher.init(
-                    Cipher.DECRYPT_MODE, SecretKeySpec(key(), "AES"),
-                    GCMParameterSpec(TAG_BITS, bytes.copyOf(NONCE_BYTES)),
-                )
-                cipher.updateAAD(uuidBytes(orgId))
-                val plain = ByteBuffer.wrap(cipher.doFinal(bytes.copyOfRange(NONCE_BYTES, bytes.size)))
-                Position.At(plain.long, plain.long)
-            }.getOrNull()
-        }
+    /** The position [cursor] names in [orgId], or null when it does not open there. */
+    fun decode(orgId: UUID, cursor: String): Position.At? {
+        val bytes = sealedBytes(cursor) ?: return null
         return runCatching {
-            val text = String(Base64.getUrlDecoder().decode(cursor))
-            text.removePrefix(LEGACY_PREFIX).takeIf { text.startsWith(LEGACY_PREFIX) }?.toLong()
-                ?.takeIf { it >= 0 }?.let { Position.Legacy(it) }
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(
+                Cipher.DECRYPT_MODE, SecretKeySpec(keys().seal, "AES"),
+                GCMParameterSpec(TAG_BITS, bytes.copyOf(NONCE_BYTES)),
+            )
+            cipher.updateAAD(uuidBytes(orgId))
+            val plain = ByteBuffer.wrap(cipher.doFinal(bytes.copyOfRange(NONCE_BYTES, bytes.size)))
+            Position.At(plain.long, plain.long)
         }.getOrNull()
+    }
+
+    /**
+     * Whether [cursor] has the form of a sealed cursor — whatever it opens to.
+     * One that does and does not open was sealed elsewhere, or before the
+     * platform key changed: a cursor that has stopped working, not a typo.
+     */
+    fun isSealed(cursor: String): Boolean = sealedBytes(cursor) != null
+
+    private fun sealedBytes(cursor: String): ByteArray? {
+        if (!cursor.startsWith(PREFIX)) return null
+        return runCatching { Base64.getUrlDecoder().decode(cursor.removePrefix(PREFIX)) }.getOrNull()
+            ?.takeIf { it.size == SEALED_BYTES }
     }
 
     private fun uuidBytes(id: UUID): ByteArray =

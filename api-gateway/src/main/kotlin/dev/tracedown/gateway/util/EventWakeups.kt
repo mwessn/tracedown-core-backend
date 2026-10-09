@@ -76,7 +76,9 @@ object EventWakeups {
      */
     fun register(orgId: UUID): CompletableDeferred<Unit> {
         val signal = CompletableDeferred<Unit>()
-        waiters.computeIfAbsent(orgId) { ConcurrentHashMap.newKeySet() }.add(signal)
+        // Added inside the map's own update: a release that empties the set
+        // and drops it must not race an add into the set it is dropping.
+        waiters.compute(orgId) { _, set -> (set ?: ConcurrentHashMap.newKeySet()).apply { add(signal) } }
         return signal
     }
 

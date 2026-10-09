@@ -15,6 +15,7 @@ import dev.tracedown.gateway.util.UnauthorizedException
 import dev.tracedown.gateway.util.clientIp
 import io.ktor.http.HttpHeaders
 import io.ktor.server.application.ApplicationCall
+import io.ktor.util.AttributeKey
 import org.jetbrains.exposed.v1.core.eq
 import org.jetbrains.exposed.v1.jdbc.transactions.TransactionManager
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
@@ -64,8 +65,26 @@ internal object ApiKeyAuth {
      */
     private val markedGood = ConcurrentHashMap<String, Long>()
 
+    /** The presented key's digest, for spending its budget later in the call. */
+    private val digestKey = AttributeKey<String>("ApiKeyDigest")
+
+    /**
+     * Spends one more unit of the calling key's request budget, for a call
+     * that does more than one request's worth of work (the event feed). False,
+     * with `Retry-After` set, when the budget is spent; true when there is no
+     * key or no limiter.
+     */
+    fun spendAgain(call: ApplicationCall): Boolean {
+        val digest = call.attributes.getOrNull(digestKey) ?: return true
+        val budget = ApiRateLimit.spend(digest) ?: return true
+        if (budget.allowed) return true
+        if (!call.response.isCommitted) call.response.headers.append(HttpHeaders.RetryAfter, budget.retryAfterSeconds.toString())
+        return false
+    }
+
     fun authenticate(call: ApplicationCall, token: String): ResolvedCaller {
         val digest = TokenHasher.sha256Hex(token)
+        call.attributes.put(digestKey, digest)
         val clientIp = call.clientIp()
         val now = Instant.now().epochSecond
 
@@ -79,11 +98,11 @@ internal object ApiKeyAuth {
             if (!admittedByMark) refuseAddress(call, spent)
         }
 
-        // The event feed is not metered per request: a long-poll that returns
-        // the moment something happens would otherwise spend the budget in
-        // proportion to how busy the organization is. It has a bound of its
-        // own — how many reads a key, user and organization hold open
-        // (`EventPollSlots`) — and the address limit above still applies.
+        // The event feed spends the budget itself (`spendAgain`): a read that
+        // waits is one long request, and charging it here as well would make
+        // a long-poll that returns the moment something happens cost in
+        // proportion to how busy the organization is. What it does charge is
+        // every answer given without waiting and every look after the first.
         if (!isEventFeed(call)) ApiRateLimit.spend(digest)?.let { budget ->
             call.response.headers.append("X-RateLimit-Limit", budget.limit.toString())
             call.response.headers.append("X-RateLimit-Remaining", budget.remaining.toString())

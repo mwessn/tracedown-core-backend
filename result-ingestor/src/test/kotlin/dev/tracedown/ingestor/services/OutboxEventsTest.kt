@@ -109,9 +109,22 @@ class OutboxEventsTest {
         return id
     }
 
-    private fun persist(serviceId: UUID, outcome: String, extra: String = "", runId: UUID? = null): UUID {
-        val resultId = runId ?: UUID.randomUUID()
-        val run = if (runId == null) "" else ""","trigger": "manual", "runId": "$runId""""
+    private fun persist(serviceId: UUID, outcome: String, extra: String = "", runId: UUID? = null): UUID =
+        persistRun(serviceId, outcome, extra, resultId = runId ?: UUID.randomUUID(), runId = runId).let {
+            assertEquals(ResultPersistenceService.PersistOutcome.PERSISTED, it.second)
+            it.first
+        }
+
+    /** Persists one result, of a run asked for when [runId] is given; answers its id and what the persist did. */
+    private fun persistRun(
+        serviceId: UUID,
+        outcome: String,
+        extra: String = "",
+        resultId: UUID = UUID.randomUUID(),
+        runId: UUID? = null,
+        runSize: Int = 1,
+    ): Pair<UUID, ResultPersistenceService.PersistOutcome> {
+        val run = if (runId == null) "" else ""","trigger": "manual", "runId": "$runId", "runSize": $runSize"""
         val envelope = Json.parseToJsonElement(
             """
             {
@@ -125,8 +138,30 @@ class OutboxEventsTest {
             }
             """.trimIndent(),
         ).jsonObject
-        assertEquals(ResultPersistenceService.PersistOutcome.PERSISTED, ResultPersistenceService.persist(envelope))
-        return resultId
+        return resultId to ResultPersistenceService.persist(envelope)
+    }
+
+    /** A pending request for a run of [service]. */
+    private fun requestRun(service: UUID): UUID {
+        val runId = UUID.randomUUID()
+        transaction {
+            RunRequests.insert {
+                it[id] = runId
+                it[serviceId] = service
+                it[organizationId] = orgId
+                it[requestedAt] = NOW
+                it[state] = RunState.PENDING
+            }
+        }
+        return runId
+    }
+
+    /** The settlements written for [runId], oldest first. */
+    private fun settlements(runId: UUID): List<JsonObject> = transaction {
+        Outbox.selectAll().where { Outbox.eventType eq RunState.SETTLED_EVENT }
+            .orderBy(Outbox.seq, SortOrder.ASC)
+            .map { it[Outbox.payload] }
+            .filter { it["runId"]!!.jsonPrimitive.content == runId.toString() }
     }
 
     /** The outbox rows about [aggregateId], with their organization column. */
@@ -157,7 +192,7 @@ class OutboxEventsTest {
     fun `a skipped run is an event of its own type, with its reason`() {
         val service = newService()
         val (type, payload, org) = rowsOf(persist(service, "skipped", """, "reason": "dispatch_queue_full"""")).single()
-        assertEquals(ResultPersistenceService.SKIPPED_EVENT, type)
+        assertEquals(dev.tracedown.common.models.OutboxEmit.PROBE_RESULT_SKIPPED, type)
         assertEquals(orgId, org)
         assertEquals("skipped", payload["status"]!!.jsonPrimitive.content)
         assertEquals("dispatch_queue_full", payload["reason"]!!.jsonPrimitive.content)
@@ -207,5 +242,114 @@ class OutboxEventsTest {
         assertEquals("failure", settled.first["status"]!!.jsonPrimitive.content)
         assertEquals(service.toString(), settled.first["serviceId"]!!.jsonPrimitive.content)
         assertNull(settled.first["reason"])
+    }
+
+    @Test
+    fun `a result's event carries exactly its documented fields`() {
+        val service = newService()
+        val first = rowsOf(persist(service, "success")).single().second
+        assertEquals(
+            setOf("resultId", "serviceId", "projectId", "workspaceId", "organizationId", "status", "runDurationMs", "statusChanged"),
+            first.keys,
+        )
+        val second = rowsOf(persist(service, "failure")).single().second
+        assertEquals(first.keys + "previousStatus", second.keys)
+    }
+
+    @Test
+    fun `a run on several agents settles once, on its last result, with the worst status`() {
+        val service = newService()
+        val runId = requestRun(service)
+        persistRun(service, "success", resultId = runId, runId = runId, runSize = 2)
+        assertEquals(emptyList<JsonObject>(), settlements(runId), "not settled on the first of two")
+        persistRun(service, "failure", runId = runId, runSize = 2)
+        val settled = settlements(runId).single()
+        assertEquals("done", settled["state"]!!.jsonPrimitive.content)
+        assertEquals("failure", settled["status"]!!.jsonPrimitive.content)
+        assertNull(settled["superseded"])
+
+        // A redelivery of a result already in changes nothing, and says nothing.
+        assertEquals(
+            ResultPersistenceService.PersistOutcome.ALREADY_PERSISTED,
+            persistRun(service, "success", resultId = runId, runId = runId, runSize = 2).second,
+        )
+        assertEquals(1, settlements(runId).size)
+    }
+
+    @Test
+    fun `a run skipped says why, and a result that replaces the skip settles it again as superseded`() {
+        val service = newService()
+        val runId = requestRun(service)
+        persistRun(service, "skipped", ""","reason": "run_already_running"""", resultId = runId, runId = runId)
+        val skipped = settlements(runId).single()
+        assertEquals("skipped", skipped["state"]!!.jsonPrimitive.content)
+        assertEquals("run_already_running", skipped["reason"]!!.jsonPrimitive.content)
+
+        persistRun(service, "success", resultId = runId, runId = runId)
+        val (first, second) = settlements(runId)
+        assertEquals(skipped, first)
+        assertEquals("done", second["state"]!!.jsonPrimitive.content)
+        assertEquals("true", second["superseded"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun `a metric written back with the value it has is not a change`() {
+        val service = newService()
+        repeat(2) { persist(service, "success", """, "actions": { "variables": { "same": 1 } }""") }
+        val changes = transaction {
+            Outbox.selectAll().where { Outbox.eventType like "resource.variable.%" }
+                .filter { it[Outbox.payload]["parentId"]?.jsonPrimitive?.content == service.toString() }
+                .map { it[Outbox.eventType] }
+        }
+        assertEquals(listOf("resource.variable.created"), changes)
+    }
+
+    @Test
+    fun `a writeback names at most as many keys as a service may hold`() {
+        val service = newService()
+        val max = dev.tracedown.common.variables.VariableLimits.DEFAULT_MAX_PER_RESOURCE
+        val keys = (1..max + 5).joinToString(",") { "\"k$it\": $it" }
+        persist(service, "success", """, "actions": { "variables": { $keys } }""")
+        val written = transaction {
+            dev.tracedown.common.models.ServiceVariables.selectAll()
+                .where { dev.tracedown.common.models.ServiceVariables.serviceId eq service }.count()
+        }
+        assertEquals(max.toLong(), written)
+    }
+
+    @Test
+    fun `results of one service ingested at once agree on one status change, without deadlocking`() {
+        val service = newService()
+        persist(service, "success")
+        val deadlocksBefore = deadlocks()
+        val pool = java.util.concurrent.Executors.newFixedThreadPool(8)
+        val ids = try {
+            (1..8).map {
+                pool.submit<UUID> { retrying { persist(service, "failure") } }
+            }.map { it.get() }
+        } finally {
+            pool.shutdownNow()
+        }
+        val changed = ids.map { rowsOf(it).single().second["statusChanged"]!!.jsonPrimitive.content }
+        assertEquals(1, changed.count { it == "true" }, "$changed")
+        assertEquals(deadlocksBefore, deadlocks(), "a deadlock was detected")
+    }
+
+    /** Runs [block] again on a failure — a serialization failure is what the consumer redelivers on. */
+    private fun <T> retrying(block: () -> T): T {
+        repeat(20) {
+            try {
+                return block()
+            } catch (_: Exception) {
+                Thread.sleep(20)
+            }
+        }
+        return block()
+    }
+
+    private fun deadlocks(): Long = transaction {
+        var n = 0L
+        exec("SELECT deadlocks FROM pg_stat_database WHERE datname = current_database()") { rs -> if (rs.next()) n = rs.getLong(1) }
+        n
     }
 }

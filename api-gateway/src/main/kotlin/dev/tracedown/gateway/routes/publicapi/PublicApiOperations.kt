@@ -6,6 +6,7 @@ import dev.tracedown.gateway.data.UpdateVariableRequest
 import dev.tracedown.gateway.data.VariableHierarchyResponse
 import dev.tracedown.gateway.data.VariableSummary
 import dev.tracedown.gateway.util.EventPollSlots
+import dev.tracedown.gateway.controllers.events.EventFeedController
 import dev.tracedown.gateway.controllers.events.EventTypes
 import dev.tracedown.gateway.data.agents.PublicAgentSummary
 import dev.tracedown.gateway.data.alerts.PublicSystemAlert
@@ -187,11 +188,6 @@ object PublicApiOperations {
 
     private val CONFLICT = listOf(HttpStatusCode.Conflict)
 
-    /** What each event type's `resource.type` is, by the type's first word. */
-    private val EVENT_RESOURCE = mapOf(
-        "result" to "service", "service" to "service", "workspace" to "workspace",
-        "project" to "project", "variable" to "variable", "alert" to "alert", "run" to "service",
-    )
 
     private fun variables(scope: String, prefix: String, tagHierarchy: Boolean): List<PublicOperation> {
         val name = scope.replaceFirstChar { it.uppercase() }
@@ -509,11 +505,16 @@ object PublicApiOperations {
         PublicOperation(get, "/alerts", "listAlerts", "Alerts", "Lists the organization's system alerts",
             "`state=active` (default): the latest alert of each type the caller has not dismissed, as the dashboard's " +
                 "banners show them, most recently seen first. `state=all`: every episode, newest first, ties by id, each " +
-                "with when the caller dismissed it. Needs write on the organization's settings, as the banners do.",
+                "with when the caller dismissed it. Needs write on the organization's settings, as the banners do. " +
+                "An alert is never cleared by an event: it ends when the caller dismisses it (for them alone), and a " +
+                "condition that returns after a quiet spell is a new episode — so an integration re-reads this list " +
+                "rather than tracking alerts from the feed's `alert.raised`.",
             query = listOf(QueryParameter("state", typeOf<String>(), "`active` (default) or `all`.")) + PAGING,
             response = typeOf<Page<PublicSystemAlert>>()),
         PublicOperation(post, "/alerts/{id}/dismiss", "dismissAlert", "Alerts", "Dismisses an alert for the caller",
-            "For the caller only, as in the dashboard; dismissing one twice changes nothing.", response = OK),
+            "For the caller only, as in the dashboard; dismissing one twice changes nothing. A dismissal is the " +
+                "caller's own view of the warning log, not a change to the organization, so — as in the dashboard — it " +
+                "is not written to the audit log.", response = OK),
 
         // Events
         PublicOperation(get, "/events", "listEvents", "Events", "Reads the event feed",
@@ -521,41 +522,54 @@ object PublicApiOperations {
                 "decided on every read with the checks the dashboard's reads of the same resources make, so a grant " +
                 "withdrawn stops delivery at once, and one given shows only what happens from then on (re-list " +
                 "periodically to pick up what a new grant reveals). With none there, waits up to `wait` seconds for the " +
-                "first, and answers an empty page when none came. Pass `next` as `after` to read on; it moves even on " +
-                "an empty page. `more: true` means more may be there already: read on at once. A page holds at most " +
-                "`limit` events, or one more when a result and the status change it caused arrive together.\n\n" +
+                "first, and answers an empty page when none came — or sooner, see **Cost**. Pass `next` as `after` to " +
+                "read on; it moves even on an empty page. `more: true` means more may be there already: read on at " +
+                "once. A page holds at most `limit` events, or one more when a result and the status change it caused " +
+                "arrive together.\n\n" +
                 "**Starting.** Read once without `after` and keep `next`; then take your snapshot of what you track " +
                 "(the lists); then read from that cursor, applying each event by its `id` — delivery is at least once, " +
                 "so an event may come twice, and one read before the snapshot may show what the snapshot already has. " +
-                "Events are kept 7 days (the operator may set another window); a cursor older than that is 410 " +
-                "`cursor_expired` with `details.oldest`, the cursor to start again from — after taking a new snapshot. " +
-                "A cursor works only for the organization it was given in.\n\n" +
+                "To wait for a run, take a cursor before `POST /services/{id}/run`, then read for its `run.settled`. " +
+                "Events are kept 7 days; a cursor older than that is 410 `cursor_expired` with `details.oldest`, the " +
+                "cursor to start again from — after taking a new snapshot. A cursor works only for the organization it " +
+                "was given in, and only on the database it was given on: one from another organization, one sealed " +
+                "before the platform key changed, and every cursor after the database is restored from a dump are 410 " +
+                "the same way.\n\n" +
                 "**Types** and their `data` (exactly these fields):\n\n" +
                 "| type | resource | data |\n|---|---|---|\n" +
                 EventTypes.DATA.entries.joinToString("\n") { (type, fields) ->
-                    "| `$type` | `${EVENT_RESOURCE.getValue(type.substringBefore('.'))}` | " +
+                    "| `$type` | `${EventTypes.RESOURCE.getValue(type)}` | " +
                         (fields.joinToString(", ") { "`$it`" }.ifEmpty { "—" }) + " |"
                 } + "\n\n" +
                 "`result.recorded`: `status` is the run's (`success`, `failure`, `timeout`, `error`, `skipped`); " +
                 "`runDurationMs` is null for a skipped run and `reason` is set only for one. `service.status_changed` " +
                 "follows the result that changed it, `previousStatus` null on a service's first run. A variable's " +
                 "events carry its scope (`org`, `workspace`, `project`, `service`), that scope's id and the key — " +
-                "never the value; a script's writeback of a metric is a `variable.updated` (or `created`) too. " +
-                "Deleting a workspace or project deletes everything in it: there is one event, for the container — " +
-                "drop all its children. `alert.raised` is a new episode of a system alert, and needs what the warning " +
-                "log needs. `run.settled` is a run asked for by `POST /services/{id}/run` reaching `done` or `skipped` " +
-                "(`state`), with the run's worst result `status` and, when skipped, the `reason` " +
-                "(`run_not_delivered` when no scheduler took it); an `expired` run is never an event — it is what " +
+                "never the value; `key` is null when the variable has since been purged. A script's writeback of a " +
+                "metric is a `variable.created`, or a `variable.updated` when its value changed. On `service.created`, " +
+                "re-list the service's variables: the platform seeds some that are not announced. Deleting a " +
+                "workspace or project deletes everything in it, and there is one event, for the container — its " +
+                "children are not announced; drop them. `alert.raised` is a new episode of a system alert and needs " +
+                "what the warning log needs; nothing announces an alert's end (see `GET /alerts`). `run.settled` is a " +
+                "run asked for by `POST /services/{id}/run` reaching `done` or `skipped` (`state`): `status` is the " +
+                "run's worst result's, null when it never ran (`reason` `run_not_delivered`: no scheduler took it), " +
+                "`skipped` when it ran and was skipped (with that `reason`). A run settled once can settle again — a " +
+                "skip that a result replaces, a late result after `run_not_delivered` — with `superseded: true`: the " +
+                "last `run.settled` for a `runId` wins. An `expired` run is never an event; it is what " +
                 "`GET /services/{id}/runs/{runId}` says once nothing has come. `occurredAt`: a result's run start, an " +
                 "alert's episode start, otherwise when the change was made.\n\n" +
-                "Not metered by the request budget; instead a key holds at most ${EventPollSlots.PER_KEY} reads open " +
-                "at once (a user ${EventPollSlots.PER_USER}, an organization ${EventPollSlots.PER_ORG}), 429 " +
-                "`too_many_event_polls` with `Retry-After` beyond that. A transaction left open on the platform holds " +
-                "the feed back until it ends.",
+                "**Cost.** A read does at most ${EventFeedController.MAX_LOOKS} looks for events and then answers, even " +
+                "before `wait` is up. The first look of a read that waits is free of the request budget; every look " +
+                "after it, and a read that answers without waiting (`wait=0`, or events already there), spends one " +
+                "request of it. A key holds at most ${EventPollSlots.PER_KEY} reads open at once (a user " +
+                "${EventPollSlots.PER_USER}, an organization ${EventPollSlots.PER_ORG}); beyond that, 429 " +
+                "`too_many_event_polls` with `details.bound` and `Retry-After`. A caller who can see nothing at all " +
+                "is answered at once. A transaction left open anywhere on the database server (any database, " +
+                "including prepared transactions) holds the feed back until it ends.",
             query = listOf(
                 QueryParameter("after", typeOf<String>(), "A cursor: `next` of an earlier read."),
                 QueryParameter("wait", typeOf<Int>(), "Seconds to wait for an event when there is none, 0–30. Default 0."),
-                QueryParameter("types", typeOf<String>(), "Only these event types: comma-separated, or the parameter repeated."),
+                QueryParameter("types", typeOf<List<String>>(), "Only these event types: comma-separated, or the parameter repeated."),
                 QueryParameter("limit", typeOf<Int>(), "Events per page, 1–100. Default 100."),
             ),
             response = typeOf<EventPage>(), errors = listOf(HttpStatusCode.Gone, HttpStatusCode.TooManyRequests)),
@@ -572,15 +586,16 @@ object PublicApiOperations {
     /** The operation for [method] on [path] (relative to [PublicApi.V1]), if this module provides it. */
     fun find(method: HttpMethod, path: String): PublicOperation? = byKey["${method.value} $path"]
 
-    /** Every type a public handler receives or answers with, and the error body. */
     /** How a template's text is written — said on each operation that takes one. */
     private const val TEMPLATE_TEXT =
         "The text is plain, with `${'$'}{name}` placeholders filled in by name when a notification is sent — " +
-            "`${'$'}{s.name}`, `${'$'}{w.name}`, `${'$'}{p.name}` (service, workspace, project), `${'$'}{url}`, " +
-            "`${'$'}{trigger}`, `${'$'}{conditions}`, `${'$'}{expected}`, `${'$'}{actual}`, `${'$'}{ms}`, " +
-            "`${'$'}{downtime}`, `${'$'}{text}`. It is not checked when saved. A script sends it by the template's " +
-            "`name`, and only from a project the template is bound to."
+            "`${'$'}{s.name}`, `${'$'}{s.schedule}`, `${'$'}{w.name}`, `${'$'}{p.name}` (service, its schedule, " +
+            "workspace, project), `${'$'}{url}`, `${'$'}{status}`, `${'$'}{trigger}`, `${'$'}{conditions}`, " +
+            "`${'$'}{expected}`, `${'$'}{actual}`, `${'$'}{ms}`, `${'$'}{downtime}`, `${'$'}{text}`; an unknown name " +
+            "renders empty, and `\\${'$'}{` writes a literal `${'$'}{`. It is not checked when saved. A script sends it " +
+            "by the template's `name`, and only from a project the template is bound to."
 
+    /** Every type a public handler receives or answers with, and the error body. */
     val types: List<KType> =
         (all.flatMap { listOfNotNull(it.request, it.response) } + typeOf<PublicApiError>()).distinctBy { it.toString() }
 

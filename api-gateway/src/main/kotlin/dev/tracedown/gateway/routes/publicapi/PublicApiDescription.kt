@@ -1,6 +1,9 @@
 package dev.tracedown.gateway.routes.publicapi
 
+import dev.tracedown.gateway.controllers.events.EventFeedController
+import dev.tracedown.gateway.controllers.events.EventTypes
 import dev.tracedown.gateway.data.publicapi.PublicApiError
+import dev.tracedown.gateway.util.EventPollSlots
 import dev.tracedown.gateway.util.Idempotency
 import io.ktor.http.ContentType
 import io.ktor.http.HttpStatusCode
@@ -200,7 +203,7 @@ internal fun Operation.Builder.describe(operation: PublicOperation) {
 
 /** Path and query parameters that hold an id. */
 private val ID_PARAMETERS = setOf(
-    "id", "varId", "resultId", "stepId", "resourceId", "workspaceId", "projectId", "runId",
+    "id", "varId", "resultId", "stepId", "resourceId", "workspaceId", "projectId", "runId", "templateId",
 )
 
 /** Bounds and defaults of the integer query parameters: name to (minimum, maximum, default). */
@@ -209,6 +212,20 @@ private val INTEGER_PARAMETERS = mapOf(
     "pageSize" to Triple(1, 100, 50),
     "hours" to Triple(1, 168, 24),
     "days" to Triple(1, 365, 90),
+    "wait" to Triple(0, EventFeedController.MAX_WAIT_SECONDS, 0),
+    "limit" to Triple(1, EventFeedController.MAX_LIMIT, EventFeedController.MAX_LIMIT),
+)
+
+/**
+ * The closed value sets of string fields, by component and property — kept
+ * here, beside their sources, rather than as annotations that could drift
+ * from them.
+ */
+private val FIELD_ENUMS: Map<String, Map<String, List<String>>> = mapOf(
+    "FeedEvent" to mapOf("type" to EventTypes.ALL),
+    "EventResource" to mapOf("type" to EventTypes.RESOURCE.values.distinct()),
+    "PublicSystemAlert" to mapOf("severity" to listOf("warning", "error")),
+    "RulePresetSummary" to mapOf("scope" to listOf("org", "workspace")),
 )
 
 /** String fields that hold an instant, beyond those named `…At`. */
@@ -225,7 +242,9 @@ private fun refine(doc: JsonObject): JsonObject {
             // Any JSON value, not an object: rawResult, a header value, an assertion field.
             key == "JsonElement" -> buildJsonObject { put("description", "Any JSON value.") }
             key == "PublicApiError" -> errorSchema()
-            else -> descriptors[key]?.let { refineClass(schema.jsonObject, it, responseOnly = key !in requestClasses) } ?: schema
+            else -> descriptors[key]?.let {
+                withEnums(refineClass(schema.jsonObject, it, responseOnly = key !in requestClasses), FIELD_ENUMS[key])
+            } ?: schema
         }
     }
     val paths = doc["paths"]?.jsonObject?.mapValues { (_, item) -> refinePathItem(item.jsonObject) } ?: emptyMap()
@@ -258,6 +277,17 @@ private fun publicDescriptors(types: List<KType> = PublicApiOperations.types): M
 
 private fun componentKey(serialName: String): String =
     serialName.split('.').dropWhile { it.firstOrNull()?.isLowerCase() == true }.joinToString(".")
+
+/** [schema] with the closed value sets [enums] declared on its properties. */
+private fun withEnums(schema: JsonObject, enums: Map<String, List<String>>?): JsonObject {
+    if (enums == null) return schema
+    val properties = schema["properties"]?.jsonObject ?: return schema
+    val refined = properties.mapValues { (name, property) ->
+        val values = enums[name] ?: return@mapValues property
+        JsonObject(property.jsonObject + ("enum" to JsonArray(values.map { JsonPrimitive(it) })))
+    }
+    return JsonObject(schema + ("properties" to JsonObject(refined)))
+}
 
 private fun refineClass(schema: JsonObject, descriptor: SerialDescriptor, responseOnly: Boolean): JsonObject {
     val properties = schema["properties"]?.jsonObject ?: return schema
@@ -323,6 +353,15 @@ private fun errorSchema(): JsonObject = buildJsonObject {
                     put("description", "A script's validation errors: `{code, callIndex, field, detail}`.")
                 })
                 put("reason", buildJsonObject { put("type", "string"); put("description", "A short cause.") })
+                put("oldest", buildJsonObject {
+                    put("type", "string")
+                    put("description", "On `cursor_expired`: the event cursor to start again from.")
+                })
+                put("bound", buildJsonObject {
+                    put("type", "string")
+                    put("enum", JsonArray(EventPollSlots.Bound.entries.map { JsonPrimitive(it.wire) }))
+                    put("description", "On `too_many_event_polls`: which bound is reached.")
+                })
             })
             put("additionalProperties", buildJsonObject { })
         })
@@ -412,6 +451,12 @@ private fun refineParameter(parameter: JsonObject): JsonObject {
         name == "window" -> JsonObject(schema + ("enum" to JsonArray(listOf("24h", "7d", "30d", "90d").map { JsonPrimitive(it) })) +
             ("default" to JsonPrimitive("24h")))
         name == "resourceType" -> JsonObject(schema + ("enum" to JsonArray(listOf("workspace", "project", "service").map { JsonPrimitive(it) })))
+        name == "state" -> JsonObject(schema + ("enum" to JsonArray(listOf("active", "all").map { JsonPrimitive(it) })) +
+            ("default" to JsonPrimitive("active")))
+        name == "types" -> JsonObject(schema + ("items" to buildJsonObject {
+            put("type", "string")
+            put("enum", JsonArray(EventTypes.ALL.map { JsonPrimitive(it) }))
+        }))
         name in INTEGER_PARAMETERS -> {
             val (min, max, default) = INTEGER_PARAMETERS.getValue(name)
             JsonObject(schema + ("minimum" to JsonPrimitive(min)) + ("maximum" to JsonPrimitive(max)) + ("default" to JsonPrimitive(default)))
@@ -420,7 +465,7 @@ private fun refineParameter(parameter: JsonObject): JsonObject {
     }
     // `status` is repeated or comma-separated: explode=true takes the first,
     // and the comma form is described in the parameter's text.
-    val style = if (name == "status") mapOf("style" to JsonPrimitive("form"), "explode" to JsonPrimitive(true)) else emptyMap()
+    val style = if (name == "status" || name == "types") mapOf("style" to JsonPrimitive("form"), "explode" to JsonPrimitive(true)) else emptyMap()
     return JsonObject(parameter + ("schema" to refined) + style)
 }
 

@@ -408,6 +408,22 @@ object PublicApi {
     private val READ_METHODS = setOf(HttpMethod.Get, HttpMethod.Head)
 
     /**
+     * Runs every registered [guard] again for a call already admitted — for a
+     * handler whose call outlasts its admission (a long-poll), so a host's
+     * refusal made meanwhile applies from its next step. Throws what a guard
+     * throws, and [AnsweredByGuard] when one answered the call itself.
+     */
+    internal suspend fun recheckGuards(caller: ApiCaller, call: ApplicationCall) {
+        for (guard in guards) {
+            guard(caller, call)
+            if (call.response.isCommitted) throw AnsweredByGuard()
+        }
+    }
+
+    /** A guard answered the call while its handler was still working: nothing more is to be sent. */
+    internal class AnsweredByGuard : RuntimeException(null, null, false, false)
+
+    /**
      * POSTs that change nothing — a POST only because what they are given
      * does not fit in a query. A read-only key may make them (they are the one
      * exception to step 2), and they take no `Idempotency-Key`: there is

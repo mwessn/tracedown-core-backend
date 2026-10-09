@@ -6,6 +6,8 @@ import dev.tracedown.common.alerts.SystemAlertService
 import dev.tracedown.common.logging.LogContext
 import dev.tracedown.common.models.BodyStores
 import dev.tracedown.common.models.Outbox
+import org.jetbrains.exposed.v1.core.vendors.ForUpdateOption
+import dev.tracedown.common.variables.VariableLimits
 import dev.tracedown.common.models.OutboxEmit
 import dev.tracedown.common.models.ProbeResults
 import dev.tracedown.common.models.ProbeSteps
@@ -60,13 +62,6 @@ import java.util.UUID
 object ResultPersistenceService {
 
     private val log = LoggerFactory.getLogger(javaClass)
-
-    /**
-     * The outbox event of a skipped run. Not `probe_result.created`: that is
-     * what the notification consumer claims, and a run that never happened
-     * notifies nobody.
-     */
-    const val SKIPPED_EVENT = "probe_result.skipped"
 
     /**
      * A writeback's change to a service variable, as the gateway announces
@@ -644,7 +639,13 @@ object ResultPersistenceService {
                 val match = (RunRequests.id eq runId) and (RunRequests.serviceId eq serviceId) and
                     (RunRequests.organizationId eq organizationId) and (RunRequests.state neq RunState.DONE)
                 val settled = if (siblings.all { s -> s == "skipped" }) RunState.SKIPPED else RunState.DONE
-                val updated = RunRequests.update({ match }) {
+                // The state before this result, read under the lock the
+                // update would take anyway, so two results of one run cannot
+                // both see it pending.
+                val before = RunRequests.select(RunRequests.state).where { match }
+                    .forUpdate(ForUpdateOption.PostgreSQL.ForNoKeyUpdate())
+                    .firstOrNull()?.get(RunRequests.state)
+                RunRequests.update({ match }) {
                     it[expectedResults] = runSize.toShort()
                     if (siblings.size >= runSize) {
                         it[state] = settled
@@ -652,8 +653,11 @@ object ResultPersistenceService {
                     }
                 }
                 // The settlement, for readers of the event feed — in the same
-                // transaction, so it is there exactly when the state is.
-                if (updated > 0 && siblings.size >= runSize) {
+                // transaction, so it is there exactly when the state is. Once
+                // per change of state: a pending request settling, or a
+                // settled one moving on (a replaced skip, a late result after
+                // "not delivered"), which is said to supersede the first.
+                if (before != null && siblings.size >= runSize && before != settled) {
                     OutboxEmit.emitResourceEvent(
                         RunState.SETTLED_EVENT, "run_request", runId,
                         buildJsonObject {
@@ -662,6 +666,7 @@ object ResultPersistenceService {
                             put("orgId", organizationId.toString())
                             put("state", settled)
                             put("status", RunState.worst(siblings))
+                            if (before != RunState.PENDING) put("superseded", true)
                             if (settled == RunState.SKIPPED) {
                                 put("reason", rawResult["reason"]?.jsonPrimitive?.contentOrNull ?: "unknown")
                             }
@@ -738,7 +743,10 @@ object ResultPersistenceService {
             // say the status changed twice — or not at all.
             val service = if (status == "skipped") null else Services.selectAll()
                 .where { Services.id eq serviceId }
-                .forUpdate()
+                // NO KEY: the row's key is not changing, and a full FOR UPDATE
+                // conflicts with the foreign-key share locks every result and
+                // step insert takes on it — concurrent ingests deadlocked.
+                .forUpdate(ForUpdateOption.PostgreSQL.ForNoKeyUpdate())
                 .firstOrNull()
 
             // Captured BEFORE the status update below overwrites it. On a
@@ -774,7 +782,17 @@ object ResultPersistenceService {
             val actions = rawResult["actions"]?.jsonObject
             val writebackVars = actions?.get("variables")?.jsonObject
             if (writebackVars != null && writebackVars.isNotEmpty()) {
-                for ((varKey, varValue) in writebackVars) {
+                // A run writes back at most as many keys as a service may hold;
+                // the rest are dropped, and said so. Each written key is an
+                // outbox row, so an unbounded map would be unbounded rows.
+                val maxKeys = VariableLimits.DEFAULT_MAX_PER_RESOURCE
+                if (writebackVars.size > maxKeys) {
+                    log.warn(
+                        "writeback for service {} carries {} keys; the {} after the first {} are ignored",
+                        serviceId, writebackVars.size, writebackVars.size - maxKeys, maxKeys,
+                    )
+                }
+                for ((varKey, varValue) in writebackVars.entries.take(maxKeys)) {
                     val valueStr = if (varValue is JsonPrimitive) varValue.content else varValue.toString()
 
                     val existing = ServiceVariables.selectAll()
@@ -803,7 +821,10 @@ object ResultPersistenceService {
                                 it[value] = valueStr
                                 it[updatedAt] = startedAt
                             }
-                            emitWritebackEvent("updated", existing[ServiceVariables.id], serviceId, organizationId)
+                            // A refresh with the same value is not a change.
+                            if (existing[ServiceVariables.value] != valueStr) {
+                                emitWritebackEvent("updated", existing[ServiceVariables.id], serviceId, organizationId)
+                            }
                         } else {
                             log.warn(
                                 "writeback for service {} key '{}' skipped: target is a secret/encrypted variable, not a metric",
@@ -848,7 +869,7 @@ object ResultPersistenceService {
             // not an outcome — but a reader waiting for the run hears of it.
             if (status == "skipped") {
                 OutboxEmit.emitResourceEvent(
-                    SKIPPED_EVENT, "probe_result", resultId,
+                    OutboxEmit.PROBE_RESULT_SKIPPED, "probe_result", resultId,
                     buildJsonObject {
                         put("resultId", resultId.toString())
                         put("serviceId", serviceId.toString())

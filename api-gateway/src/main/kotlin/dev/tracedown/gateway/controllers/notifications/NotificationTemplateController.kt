@@ -15,10 +15,10 @@ import dev.tracedown.gateway.data.notifications.CreateNotificationTemplateReques
 import dev.tracedown.gateway.data.notifications.NotificationTemplateSummary
 import dev.tracedown.gateway.data.notifications.UpdateNotificationTemplateRequest
 import dev.tracedown.common.errors.ErrorCodes
-import dev.tracedown.gateway.util.BadRequestException
 import dev.tracedown.gateway.util.ConflictException
 import dev.tracedown.gateway.util.NotFoundException
 import dev.tracedown.gateway.util.isUniqueViolation
+import dev.tracedown.gateway.util.fieldError
 import org.jetbrains.exposed.v1.exceptions.ExposedSQLException
 import dev.tracedown.gateway.util.requireOrgRead
 import dev.tracedown.gateway.util.requireOrgWrite
@@ -177,7 +177,8 @@ object NotificationTemplateController {
         request.name?.let { validateName(it) }
         request.text?.let { validateText(it) }
 
-        return transaction {
+        // As create: a rename racing another to the same name is 409, not 500.
+        return conflictOnDuplicate { transaction {
             requireOrgWrite(orgId, userId) { it.notifications }
             requireExists(templateId, orgId)
 
@@ -215,7 +216,7 @@ object NotificationTemplateController {
             )
 
             templateSummary(templateId)
-        }
+        } }
     }
 
     /** Soft-deletes a notification template. */
@@ -329,12 +330,12 @@ object NotificationTemplateController {
     // ── Internals ──
 
     private fun validateName(name: String) {
-        if (name.isBlank()) throw BadRequestException(ErrorCodes.FIELD_REQUIRED)
-        if (name.length > 64) throw BadRequestException(ErrorCodes.FIELD_TOO_LONG)
+        if (name.isBlank()) throw fieldError("name", ErrorCodes.FIELD_REQUIRED)
+        if (name.length > 64) throw fieldError("name", ErrorCodes.FIELD_TOO_LONG)
     }
 
     private fun validateText(text: String) {
-        if (text.isBlank()) throw BadRequestException(ErrorCodes.FIELD_REQUIRED)
+        if (text.isBlank()) throw fieldError("text", ErrorCodes.FIELD_REQUIRED)
     }
 
     private fun requireExists(templateId: UUID, orgId: UUID) {

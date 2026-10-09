@@ -16,6 +16,7 @@ import org.jetbrains.exposed.v1.jdbc.selectAll
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
 import org.jetbrains.exposed.v1.jdbc.update
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.BeforeAll
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
@@ -125,5 +126,64 @@ class OutboxPurgeMarkTest {
         OutboxPurgeJob(retentionDays = 7).execute()
         assertEquals(setOf(late), present())
         assertEquals(0L to 0L, mark())
+    }
+
+    @Test
+    fun `the mark never moves back`() = runBlocking {
+        transaction {
+            OutboxRetention.update({ OutboxRetention.id eq 1 }) {
+                it[purgedXid] = Long.MAX_VALUE / 2
+                it[purgedSeq] = 7
+            }
+        }
+        row("resource.service.updated", Instant.now().minus(30, ChronoUnit.DAYS), writtenDaysAgo = 30)
+        OutboxPurgeJob(retentionDays = 7).execute()
+        assertEquals(emptySet<UUID>(), present())
+        assertEquals(Long.MAX_VALUE / 2 to 7L, mark())
+    }
+
+    @Test
+    fun `the mark is the last deleted row in the order of transactions, not of numbers`() = runBlocking {
+        // The first transaction takes its id before the second, and writes its
+        // row after: its seq is the higher, its xid the lower.
+        val early = java.sql.DriverManager.getConnection(postgres.jdbcUrl, postgres.username, postgres.password)
+        val earlyId = UUID.randomUUID()
+        try {
+            early.autoCommit = false
+            early.prepareStatement("SELECT pg_current_xact_id()").use { it.executeQuery().close() }
+            val later = row("resource.service.updated", Instant.now().minus(30, ChronoUnit.DAYS), writtenDaysAgo = 30)
+            early.prepareStatement(
+                "INSERT INTO outbox (id, aggregate_type, aggregate_id, event_type, payload, published, created_at, inserted_at) " +
+                    "VALUES (?, 'x', ?, 'resource.service.updated', '{}'::jsonb, false, now() - interval '30 days', now() - interval '30 days')",
+            ).use { stmt ->
+                stmt.setObject(1, earlyId)
+                stmt.setObject(2, UUID.randomUUID())
+                stmt.executeUpdate()
+            }
+            early.commit()
+            val (earlyXid, earlySeq) = position(earlyId)
+            val (laterXid, laterSeq) = position(later)
+            assertTrue(earlyXid < laterXid && earlySeq > laterSeq, "the setup did not cross the orders")
+
+            OutboxPurgeJob(retentionDays = 7).execute()
+            assertEquals(laterXid to laterSeq, mark(), "the row of the later transaction, though its seq is the lower")
+        } finally {
+            early.close()
+        }
+    }
+
+    @Test
+    fun `a backlog larger than a batch is purged in several, and all of it goes`() = runBlocking {
+        transaction {
+            exec(
+                "INSERT INTO outbox (id, aggregate_type, aggregate_id, event_type, payload, published, created_at, inserted_at) " +
+                    "SELECT gen_random_uuid(), 'x', gen_random_uuid(), 'resource.service.updated', '{}'::jsonb, false, " +
+                    "now() - interval '30 days', now() - interval '30 days' FROM generate_series(1, 5001)",
+            )
+        }
+        OutboxPurgeJob(retentionDays = 7).execute()
+        assertEquals(emptySet<UUID>(), present())
+        val (xid, seq) = mark()
+        assertTrue(xid > 0 && seq > 0)
     }
 }

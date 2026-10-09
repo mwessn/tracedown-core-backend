@@ -25,6 +25,10 @@
 -- inside a transaction across the whole run, and CREATE INDEX CONCURRENTLY
 -- waits for every transaction that can see the table — including Flyway's own.
 -- It does not fail, it hangs. See V1789461261.
+-- A wait for the table's lock is bounded: behind a busy writer this fails
+-- fast and can be run again, rather than queueing every writer behind it.
+SET LOCAL lock_timeout = '5s';
+
 CREATE INDEX IF NOT EXISTS idx_outbox_organization_feed
     ON outbox (organization_id, xid, seq)
     WHERE organization_id IS NOT NULL;

@@ -91,6 +91,11 @@ fun Application.module() {
 
     // Realtime events (system alerts raised on shed probes)
     dev.tracedown.common.realtime.RealtimePublisher.init { redis }
+    // Wake the event feed's waiting reads once what this process wrote to the
+    // outbox has committed.
+    dev.tracedown.common.models.OutboxEmit.onCommitted { orgId ->
+        redis.publish(dev.tracedown.common.models.OutboxEmit.NUDGE_CHANNEL, orgId.toString())
+    }
 
     // Body storage: relocate agent-uploaded bodies to server-derived, tenant-scoped
     // keys. Confined to the shared filesystem root / S3 bucket+prefix the agent

@@ -2,6 +2,7 @@ package dev.tracedown.gateway.data.presets
 
 import dev.tracedown.common.validation.Validatable
 import dev.tracedown.common.validation.Validators
+import io.ktor.openapi.JsonSchema
 import kotlinx.serialization.Serializable
 
 /** One script preset as offered by the editor's template picker. */
@@ -19,7 +20,9 @@ data class RulePresetSummary(
 /** Creates an org preset; `workspaceId` scopes it to one workspace. */
 @Serializable
 data class CreateRulePresetRequest(
+    @JsonSchema.MaxLength(128)
     val name: String,
+    @JsonSchema.MaxLength(16384)
     val script: String,
     val workspaceId: String? = null,
 ) : Validatable {
@@ -35,7 +38,9 @@ data class CreateRulePresetRequest(
 /** Renames a preset or replaces its script. Fields left out are unchanged; its scope does not move. */
 @Serializable
 data class UpdateRulePresetRequest(
+    @JsonSchema.MaxLength(128)
     val name: String? = null,
+    @JsonSchema.MaxLength(16384)
     val script: String? = null,
 ) : Validatable {
     override fun validate() = buildList {

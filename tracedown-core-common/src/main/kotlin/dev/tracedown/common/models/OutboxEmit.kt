@@ -31,6 +31,13 @@ object OutboxEmit {
      */
     const val NUDGE_CHANNEL = "outbox:nudge"
 
+    /**
+     * The event of a skipped run. Not `probe_result.created`: that is what the
+     * notification consumer claims, and a run that never happened notifies
+     * nobody.
+     */
+    const val PROBE_RESULT_SKIPPED = "probe_result.skipped"
+
     private val log = LoggerFactory.getLogger(OutboxEmit::class.java)
 
     @Volatile
