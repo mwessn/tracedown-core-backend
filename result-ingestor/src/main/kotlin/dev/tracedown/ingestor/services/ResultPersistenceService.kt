@@ -9,6 +9,9 @@ import dev.tracedown.common.models.Outbox
 import dev.tracedown.common.models.OutboxEmit
 import dev.tracedown.common.models.ProbeResults
 import dev.tracedown.common.models.ProbeSteps
+import dev.tracedown.common.models.RunRequests
+import dev.tracedown.common.models.RunState
+import dev.tracedown.common.runs.RunTrigger
 import dev.tracedown.common.models.ServiceVariables
 import dev.tracedown.common.models.Services
 import dev.tracedown.common.storage.BodyStorageClient
@@ -22,7 +25,12 @@ import dev.tracedown.common.storage.StoreEndpointBlockedException
 import kotlinx.serialization.json.*
 import org.jetbrains.exposed.v1.core.and
 import org.jetbrains.exposed.v1.core.eq
+import org.jetbrains.exposed.v1.core.greaterEq
+import org.jetbrains.exposed.v1.core.lessEq
+import org.jetbrains.exposed.v1.core.neq
+import org.jetbrains.exposed.v1.jdbc.deleteWhere
 import org.jetbrains.exposed.v1.jdbc.insert
+import org.jetbrains.exposed.v1.jdbc.select
 import org.jetbrains.exposed.v1.jdbc.selectAll
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
 import org.jetbrains.exposed.v1.jdbc.update
@@ -105,6 +113,27 @@ object ResultPersistenceService {
         }
         return UUID.fromString(raw)
     }
+
+    /**
+     * What started the run this envelope describes: [RunTrigger.MANUAL] or
+     * [RunTrigger.SCHEDULE]. An envelope from a scheduler that predates the
+     * field, or carrying a value this does not know, is filed as scheduled —
+     * what nearly every run is, and what the column says of every row written
+     * before it existed.
+     */
+    fun triggerOf(envelope: JsonObject): String =
+        envelope["trigger"]?.jsonPrimitive?.contentOrNull?.takeIf { it in RunTrigger.TRIGGERS } ?: RunTrigger.SCHEDULE
+
+    /** The run somebody asked for that this result belongs to, when the envelope names one. */
+    fun runIdOf(envelope: JsonObject): UUID? =
+        envelope[RunTrigger.ENVELOPE_RUN_ID]?.jsonPrimitive?.contentOrNull?.let { runCatching { UUID.fromString(it) }.getOrNull() }
+
+    /** How many results that run publishes: at least 1, and never more than a run can make. */
+    fun runSizeOf(envelope: JsonObject): Int =
+        (envelope[RunTrigger.ENVELOPE_RUN_SIZE]?.jsonPrimitive?.intOrNull ?: 1).coerceIn(1, MAX_RUN_SIZE)
+
+    /** A ceiling on `runSize`: no fleet runs one service on more agents at once. */
+    private const val MAX_RUN_SIZE = 1000
 
     /**
      * When the run this envelope describes actually happened.
@@ -459,16 +488,26 @@ object ResultPersistenceService {
         // the message from its processing list. Re-running the body relocation
         // and the transaction would be wasted at best; the status counters in
         // step 3 would double-count at worst.
-        val alreadyPersisted = transaction {
-            ProbeResults.selectAll().where { ProbeResults.id eq resultId }.limit(1).any()
+        val outcome = rawResult["outcome"]?.jsonPrimitive?.content ?: "error"
+        val status = normalizeStatus(outcome)
+        val trigger = triggerOf(envelope)
+
+        val existing = transaction {
+            ProbeResults.select(ProbeResults.status, ProbeResults.rawResult)
+                .where { ProbeResults.id eq resultId }.limit(1).firstOrNull()
         }
-        if (alreadyPersisted) {
+        // One exception: a run somebody asked for that was answered with a
+        // `run_*` skip under its id, and then made after all. The skip was the
+        // scheduler's word that it would not run; the result is what happened,
+        // and it is never thrown away behind the skip.
+        val replacesSkip = existing != null && status != "skipped" &&
+            existing[ProbeResults.status] == "skipped" &&
+            existing[ProbeResults.rawResult]["reason"]?.jsonPrimitive?.contentOrNull?.startsWith(RunTrigger.SKIP_PREFIX) == true
+        if (existing != null && !replacesSkip) {
             log.info("result {} for service {} was already persisted — redelivery ignored", resultId, serviceId)
             return PersistOutcome.ALREADY_PERSISTED
         }
-
-        val outcome = rawResult["outcome"]?.jsonPrimitive?.content ?: "error"
-        val status = normalizeStatus(outcome)
+        if (replacesSkip) log.info("result {} for service {} replaces the skip it was first answered with", resultId, serviceId)
 
         // `error` covers everything that is not a ProbeResult the executor
         // could produce: a script that failed to run, an executor that raised,
@@ -555,7 +594,11 @@ object ResultPersistenceService {
                 }
             }
 
-            // 1. Insert probe_results
+            // 1. Insert probe_results — in place of the skip it replaces, if any
+            // (a skip has no steps).
+            if (replacesSkip) {
+                ProbeResults.deleteWhere { (ProbeResults.id eq resultId) and (ProbeResults.status eq "skipped") }
+            }
             ProbeResults.insert {
                 it[id] = resultId
                 it[ProbeResults.serviceId] = serviceId
@@ -573,6 +616,40 @@ object ResultPersistenceService {
                 it[ProbeResults.projectId] = projectId
                 it[ProbeResults.workspaceId] = workspaceId
                 it[ProbeResults.organizationId] = organizationId
+                it[ProbeResults.trigger] = trigger
+                if (trigger == RunTrigger.MANUAL) it[ProbeResults.runId] = runIdOf(envelope)
+            }
+
+            // 1b. A run somebody asked for under an id (see RunTrigger): its
+            // first result is filed under the id, and every result names it and
+            // how many the run publishes. The request is settled with the last
+            // of them to arrive — in the same transaction, so a reader never
+            // sees the run complete without its results, nor the other way
+            // round. Matched on id, service and organization together: an
+            // envelope can only settle a request of its own service.
+            val runId = runIdOf(envelope)
+            if (trigger == RunTrigger.MANUAL && runId != null) {
+                val runSize = runSizeOf(envelope)
+                // Every result of the run carries its id and the instant the
+                // run started; read within a second of it, on the service's
+                // own index (start times are kept to the second).
+                val siblings = if (runSize <= 1) listOf(status) else ProbeResults.select(ProbeResults.status)
+                    .where {
+                        (ProbeResults.serviceId eq serviceId) and
+                            (ProbeResults.startedAt greaterEq startedAt.minusSeconds(1)) and
+                            (ProbeResults.startedAt lessEq startedAt.plusSeconds(1)) and
+                            (ProbeResults.runId eq runId)
+                    }
+                    .map { it[ProbeResults.status] }
+                val match = (RunRequests.id eq runId) and (RunRequests.serviceId eq serviceId) and
+                    (RunRequests.organizationId eq organizationId) and (RunRequests.state neq RunState.DONE)
+                RunRequests.update({ match }) {
+                    it[expectedResults] = runSize.toShort()
+                    if (siblings.size >= runSize) {
+                        it[state] = if (siblings.all { s -> s == "skipped" }) RunState.SKIPPED else RunState.DONE
+                        it[RunRequests.resultId] = runId
+                    }
+                }
             }
 
             // 2. Insert probe_steps from rawResult.calls[]

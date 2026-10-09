@@ -29,9 +29,14 @@ import dev.tracedown.gateway.util.GoneException
 import dev.tracedown.gateway.util.NotFoundException
 import dev.tracedown.gateway.util.ResourceResolver
 import dev.tracedown.gateway.util.requireCachedPermissions
+import io.ktor.http.ContentDisposition
+import io.ktor.http.ContentType
+import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.ApplicationCall
+import io.ktor.server.response.header
 import io.ktor.server.response.respond
+import io.ktor.server.response.respondBytes
 import java.nio.ByteBuffer
 import java.nio.charset.CodingErrorAction
 import java.time.Instant
@@ -59,6 +64,8 @@ import org.jetbrains.exposed.v1.core.and
 import org.jetbrains.exposed.v1.core.eq
 import org.jetbrains.exposed.v1.core.greater
 import org.jetbrains.exposed.v1.core.greaterEq
+import org.jetbrains.exposed.v1.core.inList
+import org.jetbrains.exposed.v1.core.lessEq
 import org.jetbrains.exposed.v1.jdbc.andWhere
 import org.jetbrains.exposed.v1.jdbc.select
 import org.jetbrains.exposed.v1.jdbc.selectAll
@@ -84,19 +91,41 @@ object ProbeResultController {
     }
 
     /**
-     * Lists probe results for a service, ordered by most recent first (ties by
-     * id). [since], when given, keeps only results started at or after it,
-     * floored to the second the start times are kept to.
+     * Which of a service's results a list keeps, and in which order. Every
+     * bound is optional. [since] and [until] are compared to the second the
+     * start times are kept to (both inclusive); [statuses] and [trigger] keep
+     * the results with one of those values. [ascending] lists oldest first;
+     * either way ties go by id in the same direction.
+     *
+     * Every shape is served by `idx_probe_results_service (service_id,
+     * started_at DESC)`: the time bounds are a range on it, `ascending` reads
+     * it backwards, and status and trigger are filters on the rows that range
+     * yields. No index of their own — `probe_results` is big, and a filter on
+     * a handful of values inside one service's range does not need one.
      */
-    fun list(orgId: UUID, serviceId: UUID, userId: UUID, pfs: PfsParams, since: Instant? = null): Page<ProbeResultSummary> {
-        return transaction {
-            val ctx = ResourceResolver.resolveService(serviceId, orgId)
-            val cached = requireCachedPermissions(orgId, userId)
-            val parentChain = listOf("project::${ctx.projectId}", "workspace::${ctx.workspaceId}")
-            if (!canAccessResource(cached, "service", ctx.serviceId, parentChain)) {
-                throw NotFoundException()
-            }
+    data class ResultFilter(
+        val since: Instant? = null,
+        val until: Instant? = null,
+        val statuses: Set<String> = emptySet(),
+        val trigger: String? = null,
+        val ascending: Boolean = false,
+    )
 
+    /**
+     * Lists probe results for a service, ordered by most recent first (ties by
+     * id) unless [filter] asks for oldest first, and narrowed by it.
+     */
+    fun list(
+        orgId: UUID,
+        serviceId: UUID,
+        userId: UUID,
+        pfs: PfsParams,
+        filter: ResultFilter = ResultFilter(),
+    ): Page<ProbeResultSummary> {
+        return transaction {
+            requireResultsRead(orgId, serviceId, userId)
+
+            val order = if (filter.ascending) SortOrder.ASC else SortOrder.DESC
             val query = ProbeResults
                 .join(ProbeAgents, JoinType.LEFT, ProbeResults.probeAgentId, ProbeAgents.id)
                 .select(ProbeResults.columns + ProbeAgents.slug)
@@ -104,23 +133,41 @@ object ProbeResultController {
                     (ProbeResults.serviceId eq serviceId) and
                         (ProbeResults.organizationId eq orgId)
                 }
-                .orderBy(ProbeResults.startedAt to SortOrder.DESC, ProbeResults.id to SortOrder.DESC)
-            // Run times are stored to the second; a `since` with a fraction would
-            // miss a run started in its own second.
-            if (since != null) query.andWhere { ProbeResults.startedAt greaterEq since.truncatedTo(ChronoUnit.SECONDS) }
+                .orderBy(ProbeResults.startedAt to order, ProbeResults.id to order)
+            // Run times are stored to the second; a bound with a fraction would
+            // miss (or, for `until`, cut short) a run started in its own second.
+            filter.since?.let { since -> query.andWhere { ProbeResults.startedAt greaterEq since.truncatedTo(ChronoUnit.SECONDS) } }
+            filter.until?.let { until -> query.andWhere { ProbeResults.startedAt lessEq until.truncatedTo(ChronoUnit.SECONDS) } }
+            if (filter.statuses.isNotEmpty()) query.andWhere { ProbeResults.status inList filter.statuses }
+            filter.trigger?.let { trigger -> query.andWhere { ProbeResults.trigger eq trigger } }
 
             val (pagedQuery, total) = query.applyPfs(pfs)
-            val items = pagedQuery.map { row ->
-                ProbeResultSummary(
-                    id = row[ProbeResults.id].toString(),
-                    status = row[ProbeResults.status],
-                    runDurationMs = row[ProbeResults.runDurationMs],
-                    totalResponseMs = row[ProbeResults.totalResponseMs],
-                    startedAt = row[ProbeResults.startedAt].toString(),
-                    agentSlug = row[ProbeAgents.slug],
-                )
-            }
+            val items = pagedQuery.map(::summaryOf)
             Page(items = items, total = total, page = pfs.page, pageSize = pfs.pageSize)
+        }
+    }
+
+    /** A result row (joined with its agent's slug) as the list shows it. */
+    internal fun summaryOf(row: org.jetbrains.exposed.v1.core.ResultRow) = ProbeResultSummary(
+        id = row[ProbeResults.id].toString(),
+        status = row[ProbeResults.status],
+        runDurationMs = row[ProbeResults.runDurationMs],
+        totalResponseMs = row[ProbeResults.totalResponseMs],
+        startedAt = row[ProbeResults.startedAt].toString(),
+        agentSlug = row[ProbeAgents.slug],
+        trigger = row[ProbeResults.trigger],
+    )
+
+    /**
+     * Read access to a service's results for [userId] — 404 when the service
+     * is not theirs to see, as for the service itself. Inside a transaction.
+     */
+    internal fun requireResultsRead(orgId: UUID, serviceId: UUID, userId: UUID) {
+        val ctx = ResourceResolver.resolveService(serviceId, orgId)
+        val cached = requireCachedPermissions(orgId, userId)
+        val parentChain = listOf("project::${ctx.projectId}", "workspace::${ctx.workspaceId}")
+        if (!canAccessResource(cached, "service", ctx.serviceId, parentChain)) {
+            throw NotFoundException()
         }
     }
 
@@ -203,6 +250,7 @@ object ProbeResultController {
                 agentSlug = row[ProbeAgents.slug],
                 rawResult = row[ProbeResults.rawResult],
                 steps = steps,
+                trigger = row[ProbeResults.trigger],
             )
         }
     }
@@ -324,7 +372,12 @@ object ProbeResultController {
             }
             bodyStoreId?.let(BodyStoreService::clearFailure)
             when (read) {
-                is BodyStorageClient.StoredBody.Found -> use(publicContent(read.bytes, read.contentType))
+                is BodyStorageClient.StoredBody.Found -> {
+                    // Read: the places go back, the bytes stay reserved until
+                    // the answer is written.
+                    hold.releasePlaces()
+                    use(publicContent(read.bytes, read.contentType))
+                }
                 BodyStorageClient.StoredBody.Missing -> throw GoneException(ErrorCodes.BODY_GONE)
                 is BodyStorageClient.StoredBody.TooLarge -> throw ApiException(
                     HttpStatusCode.PayloadTooLarge, ErrorCodes.BODY_TOO_LARGE,
@@ -343,8 +396,114 @@ object ProbeResultController {
     suspend fun respondStepBody(call: ApplicationCall, orgId: UUID, serviceId: UUID, resultId: UUID, stepId: UUID, userId: UUID) {
         readStepBody(orgId, serviceId, resultId, stepId, userId) { body ->
             insideGateProbe?.invoke()
-            if (body == null) call.respond(HttpStatusCode.NoContent, "") else call.respond(body)
+            if (body == null) call.respond(HttpStatusCode.NoContent, "") else writeBounded { call.respond(body) }
         }
+    }
+
+    /**
+     * Runs [write] — the answer of a body read, still holding its bytes in the
+     * gate — for at most [bodyWriteTimeout]. A client that does not take the
+     * body in that time is cut off as one that went away: its call is
+     * cancelled and the bytes go back to the gate.
+     */
+    internal suspend fun writeBounded(write: suspend () -> Unit) {
+        withTimeoutOrNull(bodyWriteTimeout) { write() } ?: throw CancellationException("the client did not read the body in time")
+            .apply { initCause(io.ktor.utils.io.ConnectionClosedException("body write timed out")) }
+    }
+
+    /** How long the answer of a body read may take to be written to its client. */
+    val BODY_WRITE_TIMEOUT = 60.seconds
+
+    /** [BODY_WRITE_TIMEOUT], settable so tests need not wait the real time. */
+    internal var bodyWriteTimeout = BODY_WRITE_TIMEOUT
+
+    /**
+     * Answers [call] with a step's body as it was stored: the bytes, under the
+     * stored content type when it is one the gateway repeats
+     * (`application/octet-stream` otherwise), as an attachment, never sniffed
+     * — or 204 when none was stored. The key-authenticated API's download, for
+     * what [respondStepBody] will not inline.
+     *
+     * Same access check, confinement, gate and errors as the other reads;
+     * capped by the store's own limit ([BodyStoreRegistry.MAX_BODY_BYTES],
+     * 413 `body_too_large` with `details.maxBytes` past it), not by the inline
+     * cap. Never a link to where it is kept. The read reserves what the store
+     * reports (up to the cap) and answers from inside the gate, so the bytes
+     * held at once stay within the gate's budget: one copy of the body, not
+     * the six an inline answer needs.
+     */
+    suspend fun respondStepBodyRaw(
+        call: ApplicationCall,
+        orgId: UUID,
+        serviceId: UUID,
+        resultId: UUID,
+        stepId: UUID,
+        userId: UUID,
+        headOnly: Boolean = false,
+    ) {
+        val (storageUrl, bodyStoreId) = locateStepBody(orgId, serviceId, resultId, stepId, userId)
+        if (storageUrl == null) {
+            call.respond(HttpStatusCode.NoContent, "")
+            return
+        }
+        val store = bodyStoreId?.let { BodyStoreRegistry.load(it) ?: throw GoneException(ErrorCodes.BODY_GONE) }
+        if (store == null && storageClient == null) throw GoneException(ErrorCodes.BODY_GONE)
+
+        gated(store?.organizationId ?: orgId, bodyStoreId) { hold ->
+            val client = if (store != null) storeClient(store) else storageClient!!
+            // HEAD: the headers of the download, from a size (and type)
+            // lookup — nothing is downloaded.
+            if (headOnly) {
+                val stat = readingFrom(bodyStoreId, storageUrl) { hold.onIo { client.statOf(storageUrl) } }
+                    ?: throw GoneException(ErrorCodes.BODY_GONE)
+                bodyStoreId?.let(BodyStoreService::clearFailure)
+                if (stat.size > BodyStoreRegistry.MAX_BODY_BYTES) throw ApiException(
+                    HttpStatusCode.PayloadTooLarge, ErrorCodes.BODY_TOO_LARGE,
+                    details = buildJsonObject { put("maxBytes", BodyStoreRegistry.MAX_BODY_BYTES) },
+                )
+                attachmentHeaders(call, stepId)
+                val type = safeContentType(stat.contentType)?.let(ContentType::parse) ?: ContentType.Application.OctetStream
+                call.respond(SizedHead(stat.size, type))
+                return@gated
+            }
+            val read = readingFrom(bodyStoreId, storageUrl) {
+                readSized(client, storageUrl, BodyStoreRegistry.MAX_BODY_BYTES, hold)
+            }
+            bodyStoreId?.let(BodyStoreService::clearFailure)
+            when (read) {
+                is BodyStorageClient.StoredBody.Found -> {
+                    hold.releasePlaces()
+                    insideGateProbe?.invoke()
+                    attachmentHeaders(call, stepId)
+                    val type = safeContentType(read.contentType)?.let(ContentType::parse) ?: ContentType.Application.OctetStream
+                    writeBounded { call.respondBytes(read.bytes, type, HttpStatusCode.OK) }
+                }
+                BodyStorageClient.StoredBody.Missing -> throw GoneException(ErrorCodes.BODY_GONE)
+                is BodyStorageClient.StoredBody.TooLarge -> throw ApiException(
+                    HttpStatusCode.PayloadTooLarge, ErrorCodes.BODY_TOO_LARGE,
+                    details = buildJsonObject { put("maxBytes", BodyStoreRegistry.MAX_BODY_BYTES) },
+                )
+            }
+        }
+    }
+
+    /** The download's own headers: an attachment, never sniffed, never kept on the way. */
+    private fun attachmentHeaders(call: ApplicationCall, stepId: UUID) {
+        call.response.header(
+            HttpHeaders.ContentDisposition,
+            ContentDisposition.Attachment.withParameter(ContentDisposition.Parameters.FileName, "body-$stepId").toString(),
+        )
+        call.response.header("X-Content-Type-Options", "nosniff")
+        // Bodies carry whatever the probed endpoint answered — tokens,
+        // personal data. Nothing on the way keeps a copy.
+        call.response.header(HttpHeaders.CacheControl, "private, no-store")
+    }
+
+    /** A HEAD answer: the download's length and type, and no body. */
+    private class SizedHead(private val size: Long, private val type: ContentType) : io.ktor.http.content.OutgoingContent.NoContent() {
+        override val contentLength: Long get() = size
+        override val contentType: ContentType get() = type
+        override val status: HttpStatusCode get() = HttpStatusCode.OK
     }
 
     /** Called inside the gate just before a key-authenticated body is answered. For tests. */
@@ -679,10 +838,25 @@ object ProbeResultController {
             }
         }
 
+        private var placesHeld = true
+
+        /**
+         * Gives back the places (organization, store, global) once the body
+         * has been read, keeping the byte units: what is still held is the
+         * body in memory, while it is encoded and written to a client that
+         * may read slowly — and a slow reader must not keep a place another
+         * read could use. Idempotent.
+         */
+        fun releasePlaces() {
+            if (!placesHeld) return
+            placesHeld = false
+            held.asReversed().forEach { it.release() }
+        }
+
         fun release() {
             repeat(units) { bodyBytes.release() }
             units = 0
-            held.asReversed().forEach { it.release() }
+            releasePlaces()
         }
     }
 

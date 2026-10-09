@@ -202,6 +202,8 @@ fun Application.module() {
     }
 
     dev.tracedown.gateway.util.ScheduleNudge.init { redisA }
+    // Remembers the key-authenticated API's idempotent POSTs, shared by every replica.
+    dev.tracedown.gateway.util.Idempotency.init({ redisA }, appConfig.maxRequestBodyBytes)
     // The event feed: tell waiting reads when this process has written to the
     // outbox, wake them on any process's nudge, and bound how many a key holds.
     dev.tracedown.common.models.OutboxEmit.onCommitted { orgId ->
@@ -266,6 +268,12 @@ fun Application.module() {
         ?: dev.tracedown.gateway.controllers.metrics.DashboardMetricsController.DEFAULT_HOURLY_BUCKET_TTL_SECONDS
     dev.tracedown.gateway.controllers.metrics.DashboardMetricsController.init({ redisB }, hourlyBucketTtlSeconds)
     dev.tracedown.gateway.controllers.metrics.UsageController.init({ redisB }, appConfig.systemLimits.resultRetentionDays)
+    // A run handle reads `expired` after this long without a result, and is
+    // kept as long as the result it names would be.
+    dev.tracedown.gateway.controllers.runs.RunRequestController.init(
+        expirySeconds = appConfig.systemLimits.effectiveRunExpirySeconds,
+        resultRetentionDays = appConfig.systemLimits.resultRetentionDays,
+    )
     // Body storage, same root/bucket the agent writes and the ingestor
     // relocates in. Without the S3 config an s3:// body URI cannot be
     // presigned, so "view body" would fail for object-storage deployments;
@@ -420,6 +428,9 @@ fun Application.module() {
     // Before ContentNegotiation on purpose: both transform the received body and
     // the first to run wins, so the cap has to see the raw channel.
     installRequestBodyLimit(appConfig.maxRequestBodyBytes)
+    // The body of a public POST carrying an Idempotency-Key is read twice:
+    // for its fingerprint, then by its handler. See Idempotency.
+    dev.tracedown.gateway.util.Idempotency.installBodyCache(this)
 
     install(ContentNegotiation) {
         json(Json {
