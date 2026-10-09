@@ -203,7 +203,12 @@ fun Application.module() {
 
     dev.tracedown.gateway.util.ScheduleNudge.init { redisA }
     // Remembers the key-authenticated API's idempotent POSTs, shared by every replica.
-    dev.tracedown.gateway.util.Idempotency.init({ redisA }, appConfig.maxRequestBodyBytes)
+    dev.tracedown.gateway.util.Idempotency.init(
+        { redisA },
+        appConfig.maxRequestBodyBytes,
+        environment.config.propertyOrNull("idempotency.orgBudgetBytes")?.getString()?.toLongOrNull()?.takeIf { it > 0 }
+            ?: dev.tracedown.gateway.util.Idempotency.DEFAULT_ORG_BUDGET_BYTES,
+    )
     dev.tracedown.common.realtime.RealtimePublisher.init { redisA }
 
     // Redis C (resource hierarchy cache) — optional, disabled if not configured.
@@ -419,7 +424,7 @@ fun Application.module() {
     installRequestBodyLimit(appConfig.maxRequestBodyBytes)
     // The body of a public POST carrying an Idempotency-Key is read twice:
     // for its fingerprint, then by its handler. See Idempotency.
-    dev.tracedown.gateway.util.Idempotency.installBodyCache(this)
+    dev.tracedown.gateway.util.RequestBodyCache.install(this, appConfig.maxRequestBodyBytes)
 
     install(ContentNegotiation) {
         json(Json {

@@ -7,11 +7,7 @@ import io.ktor.http.HttpMethod
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.content.OutgoingContent
 import io.ktor.http.parseQueryString
-import io.ktor.server.application.Application
 import io.ktor.server.application.ApplicationCall
-import io.ktor.server.application.install
-import io.ktor.server.plugins.doublereceive.DoubleReceive
-import io.ktor.server.request.contentLength
 import io.ktor.server.request.httpMethod
 import io.ktor.server.request.receiveChannel
 import io.ktor.server.response.header
@@ -21,6 +17,7 @@ import io.ktor.utils.io.readRemaining
 import io.lettuce.core.ScriptOutputType
 import io.lettuce.core.SetArgs
 import io.lettuce.core.api.sync.RedisCommands
+import kotlinx.coroutines.Job
 import kotlinx.io.readByteArray
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
@@ -29,6 +26,7 @@ import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
+import org.jetbrains.exposed.v1.jdbc.transactions.transaction
 import org.slf4j.LoggerFactory
 import java.security.MessageDigest
 import java.util.Base64
@@ -37,69 +35,65 @@ import java.util.UUID
 /**
  * `Idempotency-Key` on the key-authenticated API's POSTs: a request that may
  * be sent twice — a retry after a timeout, a pipeline step run again — and
- * must take effect once.
+ * must never take effect twice.
  *
- * The first request with a key is remembered, per API key, for [TTL_SECONDS]:
- * what was asked (the method, the path, its query parameters in a fixed order,
- * the body's content type and a hash of the body — the *fingerprint*) and,
- * once it is answered, the answer (status, type, body). After that, the same
- * key:
+ * The first request with a key holds it, per API key, under its
+ * *fingerprint* (method, path, query parameters in a fixed order, content
+ * type, a hash of the body). What happens to a repeat depends on how the
+ * first one ended:
  *
- *  - with the same fingerprint is answered with the remembered answer, and
- *    `Idempotent-Replayed: true`, without the handler running again — a
- *    refusal (4xx) as much as a success: a new attempt after changing
- *    anything needs a new key;
- *  - with a different fingerprint is 422 `idempotency_key_reused`: the key
- *    names another request, and guessing which was meant is not this layer's
- *    to do;
- *  - while the first is still being answered, 409 `idempotency_in_progress`,
- *    with `Retry-After`.
+ *  - **succeeded (2xx), answer kept** — the answer is replayed for
+ *    [TTL_SECONDS], with `Idempotent-Replayed: true`, and nothing runs again.
+ *    The replay is the stored status, type and body; headers the handler set
+ *    are not kept. The caller's membership is checked again first.
+ *  - **refused or failed (4xx, 5xx)** — nothing is kept: a refusal did
+ *    nothing, and a repeat runs again (and may succeed).
+ *  - **outcome unknown** — 409 `idempotency_outcome_unknown` for
+ *    [TTL_SECONDS]. Either the call was cut off after its handler started (the
+ *    client went away), so whatever it did may have been done; or it
+ *    succeeded with an answer too large to keep ([MAX_STORED_BODY_BYTES]),
+ *    in which case that answer said so with `Idempotency-Status: not-kept`.
+ *    It never runs a second time.
+ *  - **still being answered** — 409 `idempotency_in_progress`, with
+ *    `Retry-After`.
  *
- * **Once means once.** The answer is written down when it is ready to be sent
- * ([capture], before the engine writes a byte), so a repeat that arrives the
- * moment the first answer does is replayed, and an answer the engine then
- * fails to deliver is still remembered. A call that got as far as its handler
- * and never produced an answer — the client went away mid-call — keeps its key
- * held for [IN_FLIGHT_TTL_SECONDS]: whatever it did may have been done, and a
- * retry is told to wait (409) rather than allowed to do it again.
+ * The same key with a different fingerprint is 422 `idempotency_key_reused`.
  *
- * **Not remembered**: a server error (5xx) — the next request with its key
- * runs; an answer larger than [MAX_STORED_BODY_BYTES] or one that is streamed —
- * the key is let go, and a repeat runs again. And nothing past
- * [MAX_RECORDS_PER_KEY] new keys per API key in 24 hours: past that, requests
- * are answered normally and not remembered.
+ * Kept answers count against a byte budget per organization per
+ * [TTL_SECONDS] ([orgBudgetBytes]); once it is spent, a request carrying a
+ * new key is refused before it runs — 429 `idempotency_limit_reached`, with
+ * `Retry-After` — rather than run without the promise. A request carrying no
+ * key is never affected.
  *
- * Kept in Redis A, which every gateway replica shares. When it does not
- * answer, a request carrying a key is refused, 503 `idempotency_unavailable`,
- * rather than run without the promise the key asked for; a request carrying
- * none is not affected.
+ * Kept in Redis A, shared by every gateway replica. When it does not answer,
+ * a request carrying a key is refused, 503 `idempotency_unavailable` with
+ * `Retry-After`, and its key is let go if it had been taken. If it stops
+ * answering after a handler has run, nothing can be written down: the key
+ * stays held until its in-flight bound ([IN_FLIGHT_TTL_SECONDS]) and is then
+ * free.
  */
 object Idempotency {
 
     const val HEADER = "Idempotency-Key"
     const val REPLAYED_HEADER = "Idempotent-Replayed"
+    const val STATUS_HEADER = "Idempotency-Status"
 
-    /** How long an answered request is remembered. */
+    /** How long a kept answer, or an unknown outcome, is remembered. */
     const val TTL_SECONDS = 24 * 3600L
 
-    /** How long a request being answered holds its key, should its answer never come. */
+    /** How long a request being answered holds its key before it is decided. */
     const val IN_FLIGHT_TTL_SECONDS = 300L
 
     /** The longest key accepted. */
     const val MAX_KEY_LENGTH = 128
 
     /** The largest answer body kept for a replay. */
-    const val MAX_STORED_BODY_BYTES = 64 * 1024
+    const val MAX_STORED_BODY_BYTES = 256 * 1024
 
-    /** New keys remembered per API key in [TTL_SECONDS]. */
-    const val MAX_RECORDS_PER_KEY = 1000
+    /** The default per-organization byte budget for kept answers, per [TTL_SECONDS]. */
+    const val DEFAULT_ORG_BUDGET_BYTES = 64L * 1024 * 1024
 
-    /** [MAX_RECORDS_PER_KEY], settable so tests need not make a thousand requests. */
-    internal var recordsPerKey = MAX_RECORDS_PER_KEY
-
-    /** Seconds a request told the key is in flight waits before asking again. */
     private const val IN_PROGRESS_RETRY_SECONDS = 1
-
     private const val UNAVAILABLE_RETRY_SECONDS = 5
 
     private val log = LoggerFactory.getLogger(Idempotency::class.java)
@@ -107,48 +101,36 @@ object Idempotency {
     private var redisProvider: (() -> RedisCommands<String, String>)? = null
     private var maxBodyBytes: Long = AppConfig.DEFAULT_MAX_REQUEST_BODY_BYTES
 
-    /** Sets the store, and the request-body cap the fingerprint's read holds to. Call once at startup. */
-    fun init(redis: (() -> RedisCommands<String, String>)?, maxBodyBytes: Long) {
+    /** Bytes of kept answers an organization may have per [TTL_SECONDS]. */
+    @Volatile
+    internal var orgBudgetBytes: Long = DEFAULT_ORG_BUDGET_BYTES
+
+    /** Sets the store, the request-body cap the fingerprint's read holds to, and the budget. Call once at startup. */
+    fun init(redis: (() -> RedisCommands<String, String>)?, maxBodyBytes: Long, orgBudgetBytes: Long = DEFAULT_ORG_BUDGET_BYTES) {
         this.redisProvider = redis
         this.maxBodyBytes = maxBodyBytes
+        this.orgBudgetBytes = orgBudgetBytes
     }
 
-    /**
-     * Lets the body of an idempotent request be read twice — once for its
-     * fingerprint, once by its handler — with Ktor's DoubleReceive, which
-     * keeps the raw body in memory for those requests and no other. The
-     * request-body cap still bounds it: the cap's transformation runs on every
-     * read of the kept body, and a body declared larger than the cap is
-     * refused before anything reads it. A body sent without a length is kept
-     * as far as the cap's read takes it (DoubleReceive's own `maxSize` would
-     * refuse to keep it at all, and the handler's read would then fail).
-     */
-    fun installBodyCache(application: Application) {
-        application.install(DoubleReceive) {
-            excludeFromCache { call, _ -> !carriesKey(call) }
-        }
-    }
-
-    /** A POST into the key-authenticated API carrying an `Idempotency-Key`, of a size the API accepts. */
-    private fun carriesKey(call: ApplicationCall): Boolean =
+    /** A POST into the key-authenticated API carrying an `Idempotency-Key`: its body is kept ([RequestBodyCache]). */
+    internal fun carriesKey(call: ApplicationCall): Boolean =
         call.request.httpMethod == HttpMethod.Post &&
             call.request.headers[HEADER] != null &&
-            ApiNamespace.isPublicUri(call.request.local.uri) &&
-            (call.request.contentLength() ?: 0L) <= maxBodyBytes
+            ApiNamespace.isPublicUri(call.request.local.uri)
 
-    /** A request being answered under a key: where it is kept, and the token that says it is this one. */
-    private class InFlight(val storeKey: String, val fingerprint: String, val token: String)
+    /** A request being answered under a key. */
+    private class InFlight(val storeKey: String, val fingerprint: String, val token: String, val orgId: UUID)
 
     private val inFlightKey = AttributeKey<InFlight>("IdempotencyInFlight")
 
     /**
      * Starts an idempotent request, before its handler: does nothing when
-     * [call] carries no key; answers [call] itself with the remembered answer
-     * when there is one (the caller then stops); otherwise holds the key for
-     * this call until its answer is captured ([capture]). Throws the
-     * refusals: 400 for a malformed key, 409, 422, 503.
+     * [call] carries no key; answers [call] itself with the kept answer when
+     * there is one (the caller then stops); otherwise takes the key for this
+     * call until it is decided ([capture], [cancelled]). Throws the refusals:
+     * 400 for a malformed key, 409, 422, 429, 503.
      */
-    internal suspend fun begin(call: ApplicationCall, apiKeyId: UUID, canonicalPath: String) {
+    internal suspend fun begin(call: ApplicationCall, apiKeyId: UUID, orgId: UUID, userId: UUID, canonicalPath: String) {
         val key = call.request.headers[HEADER] ?: return
         if (key.isEmpty() || key.length > MAX_KEY_LENGTH || key.any { it !in ' '..'~' }) {
             throw fieldError(HEADER) { put("max", MAX_KEY_LENGTH) }
@@ -157,103 +139,162 @@ object Idempotency {
         val fingerprint = fingerprint(call, canonicalPath)
         val storeKey = "idempotency:$apiKeyId:${sha256(key.toByteArray())}"
         val token = UUID.randomUUID().toString()
-        val marker = buildJsonObject {
-            put("state", "pending")
-            put("fp", fingerprint)
-            put("token", token)
-        }.toString()
+        val marker = record("pending", fingerprint, token)
 
-        // Twice at most: a remembered request that lapses between the two
-        // calls below leaves the key free, and the second try takes it.
+        // Twice at most: a record that lapses between the two calls below
+        // leaves the key free, and the second try takes it.
         repeat(2) {
+            val commands = try {
+                redis()
+            } catch (e: Exception) {
+                throw unavailable(call)
+            }
             val existing = try {
-                val commands = redis()
-                if (commands.set(storeKey, marker, SetArgs().nx().ex(IN_FLIGHT_TTL_SECONDS)) != null) {
-                    if (withinAllowance(commands, apiKeyId)) {
-                        call.attributes.put(inFlightKey, InFlight(storeKey, fingerprint, token))
-                    } else {
-                        release(commands, storeKey, token)
-                    }
-                    return
-                }
                 commands.get(storeKey)
             } catch (e: Exception) {
                 log.warn("idempotency store unavailable: {}", e.message)
                 throw unavailable(call)
-            } ?: return@repeat
-            val record = runCatching { Json.parseToJsonElement(existing) as JsonObject }.getOrNull() ?: return@repeat
-            if (record["fp"]?.jsonPrimitive?.contentOrNull != fingerprint) {
+            }
+            if (existing == null) {
+                // A new key: refused before anything runs once the
+                // organization's budget for kept answers is spent.
+                budgetRetryAfter(commands, orgId)?.let { seconds ->
+                    call.response.header(HttpHeaders.RetryAfter, seconds.toString())
+                    throw ApiException(HttpStatusCode.TooManyRequests, ErrorCodes.IDEMPOTENCY_LIMIT_REACHED)
+                }
+                val taken = try {
+                    commands.set(storeKey, marker, SetArgs().nx().ex(IN_FLIGHT_TTL_SECONDS)) != null
+                } catch (e: Exception) {
+                    log.warn("idempotency store unavailable: {}", e.message)
+                    // It may have been taken before the error: let it go.
+                    runCatching { release(commands, storeKey, token) }
+                    throw unavailable(call)
+                }
+                if (taken) {
+                    call.attributes.put(inFlightKey, InFlight(storeKey, fingerprint, token, orgId))
+                    return
+                }
+                return@repeat
+            }
+            val held = runCatching { Json.parseToJsonElement(existing) as JsonObject }.getOrNull() ?: return@repeat
+            if (held["fp"]?.jsonPrimitive?.contentOrNull != fingerprint) {
                 throw ApiException(HttpStatusCode.UnprocessableEntity, ErrorCodes.IDEMPOTENCY_KEY_REUSED)
             }
-            if (record["state"]?.jsonPrimitive?.contentOrNull != "done") throw inProgress(call)
-            replay(call, record)
-            return
+            when (held["state"]?.jsonPrimitive?.contentOrNull) {
+                "done" -> {
+                    // The caller may have lost the right to see what it was
+                    // given: asked again, as the handler would ask.
+                    transaction { requireCachedPermissions(orgId, userId) }
+                    replay(call, held)
+                    return
+                }
+                "unknown" -> throw ConflictException(ErrorCodes.IDEMPOTENCY_OUTCOME_UNKNOWN)
+                else -> throw inProgress(call)
+            }
         }
         throw inProgress(call)
     }
 
     /**
-     * Whether [apiKeyId] may have one more key remembered today. Counted per
-     * API key in a window of [TTL_SECONDS] from its first; past the allowance
-     * a request is answered as if it carried no key, and the first one past it
-     * is logged.
-     */
-    private fun withinAllowance(commands: RedisCommands<String, String>, apiKeyId: UUID): Boolean {
-        val countKey = "idempotency_count:$apiKeyId"
-        val count = commands.incr(countKey)
-        if (count == 1L) commands.expire(countKey, TTL_SECONDS)
-        if (count == recordsPerKey + 1L) {
-            log.warn("API key {} passed {} remembered Idempotency-Keys in a day; further ones are not remembered", apiKeyId, recordsPerKey)
-        }
-        return count <= recordsPerKey
-    }
-
-    /**
-     * Writes down [content], the answer [call] is about to send, if [call] is
-     * an idempotent request being answered — before the engine sends it, and
-     * whether or not the engine then manages to. An answer that is not to be
-     * remembered (a server error, a streamed body, one over
-     * [MAX_STORED_BODY_BYTES]) lets the key go instead. Never throws: the
-     * answer goes out either way.
+     * Decides the key of [call], an idempotent request being answered with
+     * [content] — before the engine sends a byte of it, so a repeat that
+     * arrives the moment the answer does is replayed, and an answer the engine
+     * then fails to deliver is still the answer. A success is kept (or, too
+     * large to keep, marked [STATUS_HEADER] `not-kept` and remembered as an
+     * unknown outcome); a refusal or failure lets the key go — except the
+     * error page of a call cut off under its handler, which is an unknown
+     * outcome. Never throws: the answer goes out either way.
      */
     internal fun capture(call: ApplicationCall, content: OutgoingContent) {
         val inFlight = call.attributes.getOrNull(inFlightKey) ?: return
         call.attributes.remove(inFlightKey)
         val redis = redisProvider ?: return
         val status = content.status ?: call.response.status() ?: HttpStatusCode.OK
-        val body = when (content) {
-            is OutgoingContent.ByteArrayContent -> content.bytes()
-            is OutgoingContent.NoContent -> ByteArray(0)
-            else -> null
-        }
-        // A call cancelled under its handler — its client went away — that
-        // the error pages still try to answer is not an answer: what the
-        // handler did may have been done, so the key stays held.
-        if (call.coroutineContext[kotlinx.coroutines.Job]?.isCancelled == true) return
+        val cutOff = call.coroutineContext[Job]?.isCancelled == true
         try {
             val commands = redis()
-            if (body == null || status.value >= 500 || body.size > MAX_STORED_BODY_BYTES) {
-                release(commands, inFlight.storeKey, inFlight.token)
-                return
+            when {
+                status.value in 200..299 -> {
+                    val body = when (content) {
+                        is OutgoingContent.ByteArrayContent -> content.bytes()
+                        is OutgoingContent.NoContent -> ByteArray(0)
+                        else -> null
+                    }
+                    if (body == null || body.size > MAX_STORED_BODY_BYTES) {
+                        call.response.header(STATUS_HEADER, "not-kept")
+                        decide(commands, inFlight, record("unknown", inFlight.fingerprint, null))
+                        return
+                    }
+                    val answer = buildJsonObject {
+                        put("state", "done")
+                        put("fp", inFlight.fingerprint)
+                        put("status", status.value)
+                        content.contentType?.let { put("type", it.toString()) }
+                        put("body", Base64.getEncoder().encodeToString(body))
+                    }
+                    decide(commands, inFlight, answer.toString())
+                    spend(commands, inFlight.orgId, body.size.toLong())
+                }
+                // The error page of a call whose handler was cut off: what it
+                // did may have been done.
+                cutOff -> decide(commands, inFlight, record("unknown", inFlight.fingerprint, null))
+                else -> release(commands, inFlight.storeKey, inFlight.token)
             }
-            val answer = buildJsonObject {
-                put("state", "done")
-                put("fp", inFlight.fingerprint)
-                put("status", status.value)
-                content.contentType?.let { put("type", it.toString()) }
-                put("body", Base64.getEncoder().encodeToString(body))
-            }
-            commands.set(inFlight.storeKey, answer.toString(), SetArgs().ex(TTL_SECONDS))
         } catch (e: Exception) {
-            // The key stays held until its in-flight bound: a retry waits
-            // rather than repeats.
-            log.warn("could not record the answer under idempotency key {}: {}", inFlight.storeKey, e.message)
+            log.warn("could not decide idempotency key {}: {}", inFlight.storeKey, e.message)
         }
+    }
+
+    /**
+     * [call] was cut off with no answer at all — its client went away while
+     * its handler ran. What the handler did may have been done: remembered as
+     * an unknown outcome, never run again.
+     */
+    internal fun cancelled(call: ApplicationCall) {
+        val inFlight = call.attributes.getOrNull(inFlightKey) ?: return
+        call.attributes.remove(inFlightKey)
+        val redis = redisProvider ?: return
+        try {
+            decide(redis(), inFlight, record("unknown", inFlight.fingerprint, null))
+        } catch (e: Exception) {
+            log.warn("could not decide idempotency key {}: {}", inFlight.storeKey, e.message)
+        }
+    }
+
+    private fun record(state: String, fingerprint: String, token: String?): String = buildJsonObject {
+        put("state", state)
+        put("fp", fingerprint)
+        token?.let { put("token", it) }
+    }.toString()
+
+    /** Replaces this request's own marker with [value], for [TTL_SECONDS] — never another request's. */
+    private fun decide(commands: RedisCommands<String, String>, inFlight: InFlight, value: String) {
+        commands.eval<Long>(
+            DECIDE_SCRIPT, ScriptOutputType.INTEGER, arrayOf(inFlight.storeKey), inFlight.token, value, TTL_SECONDS.toString(),
+        )
     }
 
     /** Lets the key go — only while it is still this request's marker. */
     private fun release(commands: RedisCommands<String, String>, storeKey: String, token: String) {
         commands.eval<Long>(RELEASE_SCRIPT, ScriptOutputType.INTEGER, arrayOf(storeKey), token)
+    }
+
+    private fun budgetKey(orgId: UUID) = "idempotency_bytes:$orgId"
+
+    /** Counts [bytes] of kept answer against [orgId]'s budget; the window starts with the first. */
+    private fun spend(commands: RedisCommands<String, String>, orgId: UUID, bytes: Long) {
+        commands.eval<Long>(SPEND_SCRIPT, ScriptOutputType.INTEGER, arrayOf(budgetKey(orgId)), bytes.toString(), TTL_SECONDS.toString())
+    }
+
+    /** Seconds until [orgId]'s budget comes back, when it is spent; null while there is some left. */
+    private fun budgetRetryAfter(commands: RedisCommands<String, String>, orgId: UUID): Long? {
+        val spent = try {
+            commands.get(budgetKey(orgId))?.toLongOrNull() ?: return null
+        } catch (e: Exception) {
+            return null
+        }
+        if (spent < orgBudgetBytes) return null
+        return runCatching { commands.ttl(budgetKey(orgId)) }.getOrNull()?.takeIf { it > 0 } ?: TTL_SECONDS
     }
 
     private suspend fun replay(call: ApplicationCall, record: JsonObject) {
@@ -268,7 +309,7 @@ object Idempotency {
      * The request's fingerprint: method, path, query parameters (decoded and
      * sorted, so their order does not matter), the body's content type, and a
      * hash of the body. The body is read through the request-body cap, and
-     * kept for the handler's own read ([installBodyCache]).
+     * kept for the handler's own read ([RequestBodyCache]).
      */
     private suspend fun fingerprint(call: ApplicationCall, canonicalPath: String): String {
         val bytes = call.receiveChannel().readRemaining(maxBodyBytes + 1).readByteArray()
@@ -299,5 +340,24 @@ object Idempotency {
             return redis.call('del', KEYS[1])
         end
         return 0
+    """.trimIndent()
+
+    /** KEYS[1] = the key, ARGV = token, the new value, its TTL: replace only this request's own marker. */
+    private val DECIDE_SCRIPT = """
+        local v = redis.call('get', KEYS[1])
+        if v and string.find(v, ARGV[1], 1, true) then
+            redis.call('set', KEYS[1], ARGV[2], 'EX', ARGV[3])
+            return 1
+        end
+        return 0
+    """.trimIndent()
+
+    /** KEYS[1] = the budget counter, ARGV = bytes, window: add, and start the window with the first. */
+    private val SPEND_SCRIPT = """
+        local n = redis.call('incrby', KEYS[1], ARGV[1])
+        if redis.call('ttl', KEYS[1]) < 0 then
+            redis.call('expire', KEYS[1], ARGV[2])
+        end
+        return n
     """.trimIndent()
 }

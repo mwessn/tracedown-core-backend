@@ -32,7 +32,7 @@ import java.util.UUID
  *
  * A run somebody asked for under an id rides on the pending flag: its id is
  * kept beside it (``probe_pending_run:{serviceId}``) and handed back with the
- * pending run ([takePendingRun]), so the run that follows is filed under it.
+ * pending run ([releaseWithPending]), so the run that follows is filed under it.
  */
 class QueuePolicyManager(private val redis: RedisCommands<String, String>) {
 
@@ -60,53 +60,29 @@ class QueuePolicyManager(private val redis: RedisCommands<String, String>) {
      * @return [Acquisition] with ACQUIRED + a token, or SKIPPED/ENQUEUED
      */
     fun tryAcquire(serviceId: UUID, queuePolicy: String, timeoutMs: Int, runId: UUID? = null): Acquisition {
-        val activeKey = "probe_active:$serviceId"
         val ttlSeconds = lockTtlSeconds(timeoutMs)
         val token = UUID.randomUUID().toString()
-
-        val acquired = redis.set(activeKey, token, SetArgs().nx().ex(ttlSeconds))
-        if (acquired != null) return Acquisition(AcquireResult.ACQUIRED, token)
-
-        // Lock already held
-        if (queuePolicy == "enqueue_once") {
-            val pendingKey = "probe_pending:$serviceId"
-            if (runId != null) {
-                // The id and the flag together, in one step: a flag without
-                // the id would run under a fresh id and the request would
-                // never see its result; an id without the flag would never run.
-                val attached = redis.eval<Long>(
-                    ATTACH_PENDING_RUN_SCRIPT,
-                    ScriptOutputType.INTEGER,
-                    arrayOf(pendingRunKey(serviceId), pendingKey),
-                    runId.toString(), ttlSeconds.toString(),
-                ) == 1L
-                return Acquisition(if (attached) AcquireResult.ENQUEUED else AcquireResult.SKIPPED, null)
-            }
-            val alreadyPending = redis.exists(pendingKey) > 0
-            if (!alreadyPending) {
-                redis.set(pendingKey, "1", SetArgs().ex(ttlSeconds))
-                return Acquisition(AcquireResult.ENQUEUED, null)
-            }
-        }
-
-        return Acquisition(AcquireResult.SKIPPED, null)
-    }
-
-    /**
-     * The id of the run waiting to follow the current one, when somebody asked
-     * for it under one — taken, so it is handed to one dispatch only. Called by
-     * the lock's owner once [release] reported a pending run.
-     */
-    fun takePendingRun(serviceId: UUID): UUID? {
-        val raw = redis.getdel(pendingRunKey(serviceId)) ?: return null
-        return try {
-            UUID.fromString(raw)
-        } catch (_: IllegalArgumentException) {
-            null
+        // One step: take the lock, or else — under `enqueue_once` — leave a
+        // pending run behind it (with this run's id, when it has one). Done as
+        // two calls, the holder could release between them and the pending
+        // run would wait for a release that already happened.
+        val result = redis.eval<Long>(
+            ACQUIRE_SCRIPT,
+            ScriptOutputType.INTEGER,
+            arrayOf("probe_active:$serviceId", "probe_pending:$serviceId", pendingRunKey(serviceId)),
+            token, ttlSeconds.toString(), queuePolicy, runId?.toString() ?: "",
+        )
+        return when (result) {
+            1L -> Acquisition(AcquireResult.ACQUIRED, token)
+            2L -> Acquisition(AcquireResult.ENQUEUED, null)
+            else -> Acquisition(AcquireResult.SKIPPED, null)
         }
     }
 
     private fun pendingRunKey(serviceId: UUID) = "probe_pending_run:$serviceId"
+
+    /** What a release found: whether a run is waiting to follow, and the id it was asked under, if any. */
+    data class Released(val hasPending: Boolean, val pendingRunId: UUID?)
 
     /**
      * Releases the execution lock IF this replica still owns it (its [token]
@@ -120,22 +96,29 @@ class QueuePolicyManager(private val redis: RedisCommands<String, String>) {
      * @return true if we owned the lock and a pending run was found (caller
      *   should re-dispatch)
      */
-    fun release(serviceId: UUID, token: String): Boolean {
-        val activeKey = "probe_active:$serviceId"
-        val pendingKey = "probe_pending:$serviceId"
+    fun release(serviceId: UUID, token: String): Boolean = releaseWithPending(serviceId, token).hasPending
 
+    /**
+     * [release], also handing over the id of the pending run when it was
+     * asked for under one — taken in the same step, so it goes to this
+     * release's re-dispatch and to no other, and no stale id stays behind.
+     */
+    fun releaseWithPending(serviceId: UUID, token: String): Released {
         // Atomic compare-and-delete of the lock we own, plus clearing (and
-        // reporting) the pending flag in the same step. Returns:
-        //   1  -> we owned the lock and a pending run was cleared
-        //   0  -> we owned the lock, no pending run
-        //  -1  -> we no longer own the lock (do not re-dispatch)
-        val result = redis.eval<Long>(
+        // reporting) the pending flag and its run id in the same step.
+        // Returns "-1" when we no longer own the lock, "0" when there is no
+        // pending run, "1" for one without an id, or the id.
+        val result = redis.eval<String>(
             RELEASE_SCRIPT,
-            ScriptOutputType.INTEGER,
-            arrayOf(activeKey, pendingKey),
+            ScriptOutputType.VALUE,
+            arrayOf("probe_active:$serviceId", "probe_pending:$serviceId", pendingRunKey(serviceId)),
             token,
         )
-        return result == 1L
+        return when (result) {
+            null, "-1", "0" -> Released(false, null)
+            "1" -> Released(true, null)
+            else -> Released(true, runCatching { UUID.fromString(result) }.getOrNull())
+        }
     }
 
     /**
@@ -209,33 +192,52 @@ class QueuePolicyManager(private val redis: RedisCommands<String, String>) {
         fun lockTtlSeconds(timeoutMs: Int): Long = RunBounds.lockTtlSeconds(timeoutMs)
 
         /**
-         * KEYS[1]=pending run id, KEYS[2]=pending flag, ARGV[1]=run id,
-         * ARGV[2]=TTL in seconds. Attaches the run to the pending run unless
-         * another run's id is already there; sets the flag with it.
+         * KEYS[1]=active, KEYS[2]=pending flag, KEYS[3]=pending run id;
+         * ARGV[1]=token, ARGV[2]=TTL, ARGV[3]=queue policy, ARGV[4]=run id or ''.
+         * 1 acquired; 2 left pending (with the run id, if any); 0 skipped —
+         * under `skip`, or when a run is already waiting (another run's id
+         * already there, or, for a run with no id, any pending run).
          */
-        private val ATTACH_PENDING_RUN_SCRIPT = """
+        private val ACQUIRE_SCRIPT = """
             if redis.call('set', KEYS[1], ARGV[1], 'NX', 'EX', ARGV[2]) then
-                redis.call('set', KEYS[2], '1', 'EX', ARGV[2])
                 return 1
+            end
+            if ARGV[3] ~= 'enqueue_once' then
+                return 0
+            end
+            if ARGV[4] ~= '' then
+                if redis.call('set', KEYS[3], ARGV[4], 'NX', 'EX', ARGV[2]) then
+                    redis.call('set', KEYS[2], '1', 'EX', ARGV[2])
+                    return 2
+                end
+                return 0
+            end
+            if redis.call('exists', KEYS[2]) == 0 then
+                redis.call('set', KEYS[2], '1', 'EX', ARGV[2])
+                return 2
             end
             return 0
         """.trimIndent()
 
         /**
-         * KEYS[1]=active, KEYS[2]=pending, ARGV[1]=token.
-         * Delete the lock only if we still own it; clear+report pending only then.
+         * KEYS[1]=active, KEYS[2]=pending, KEYS[3]=pending run id, ARGV[1]=token.
+         * Delete the lock only if we still own it; then clear and report the
+         * pending flag and its run id.
          */
         private val RELEASE_SCRIPT = """
             if redis.call('get', KEYS[1]) == ARGV[1] then
                 redis.call('del', KEYS[1])
+                local run = redis.call('get', KEYS[3])
+                redis.call('del', KEYS[3])
                 if redis.call('del', KEYS[2]) == 1 then
-                    return 1
-                else
-                    return 0
+                    if run then
+                        return run
+                    end
+                    return '1'
                 end
-            else
-                return -1
+                return '0'
             end
+            return '-1'
         """.trimIndent()
     }
 }

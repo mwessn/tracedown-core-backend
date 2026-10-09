@@ -9,17 +9,15 @@
 -- found", and what a run whose trigger was lost is judged "expired" from.
 --
 -- `state` is pending until the result-ingestor records the run, which sets it
--- to done or skipped and `result_id` beside it in the same transaction as the
--- last of its results (`expected_results` of them: more than one when the
+-- to done or skipped in the same transaction as the last of its results (`expected_results` of them: more than one when the
 -- service runs on several agents at once). The gateway settles it as skipped
 -- itself, with `reason`, when no scheduler heard the request at all.
 -- `expired` is never stored: it is a pending row older than the gateway's
 -- bound, and a result that arrives after that still settles it.
 --
 -- `api_key_id` is deliberately not a foreign key, as on org_audit_log: the
--- record of which key asked has to outlive the key. `result_id` is not one
--- either: the result is written by another service, after this row, and goes
--- with the result retention window on its own schedule.
+-- record of which key asked has to outlive the key. The results themselves
+-- are found by the request's id (`probe_results.id`, `probe_results.run_id`).
 --
 -- `purge_after` is when the row may go: the request time plus the
 -- organization's result retention window, set by the gateway; NULL while
@@ -39,7 +37,6 @@ CREATE TABLE run_requests (
     api_key_id       UUID,
     requested_at     TIMESTAMP   NOT NULL,
     state            VARCHAR(8)  NOT NULL DEFAULT 'pending',
-    result_id        UUID,
     expected_results SMALLINT,
     reason           VARCHAR(64),
     purge_after      TIMESTAMP

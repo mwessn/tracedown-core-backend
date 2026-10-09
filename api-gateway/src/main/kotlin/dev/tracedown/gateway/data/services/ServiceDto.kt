@@ -140,10 +140,11 @@ data class ValidateScriptRequest(
 }
 
 /**
- * What a save of a script would make of it.
+ * What a save of a script would make of it, as far as its caller can judge.
  *
- * [valid] is true exactly when a save would accept it. [errors] lists every
- * reason it would not: the Lace validator's findings (`code`, `callIndex`,
+ * [valid] is true when nothing this caller can judge refuses it — exactly a
+ * save's verdict when [complete] is true too. [errors] lists every reason it
+ * would not: the Lace validator's findings (`code`, `callIndex`,
  * `field`, `detail`), then the platform's — `blocked_probe_target` for each
  * call whose target this installation does not probe, and the
  * unverified-domain rules (`unverified_domain_includes`,
@@ -158,10 +159,15 @@ data class ScriptValidation(
     val limits: ScriptLimits,
     @JsonSchema.Description(
         "Whether the verified-domain rules were judged: false when the installation does not ask for verified " +
-            "domains, or — without `serviceId` — when the caller may not read the organization's domains. When " +
+            "domains, or when the caller may not read the organization's domains. When " +
             "false, `targets.unverified` is empty and `limits` carries no domain limits.",
     )
     val domainsChecked: Boolean = false,
+    @JsonSchema.Description(
+        "Whether everything a save would judge was judged: false when a call's host is in `targets.unresolved`, or " +
+            "when the verified-domain rules apply and were not checked. `valid` with `complete` is a save's verdict.",
+    )
+    val complete: Boolean = false,
 )
 
 /**

@@ -42,18 +42,20 @@ object ScheduleNudge {
      * bare id on [RunTrigger.TRIGGER_CHANNEL], which every scheduler reads.
      * Never both to a scheduler that heard the first: that would be two runs.
      *
-     * Returns how many schedulers heard the request (0 when Redis is away or
-     * nothing is subscribed: the request is lost, and its handle expires).
+     * Returns how many schedulers heard the request: 0 is Redis saying that
+     * nothing is subscribed to either channel — the request is lost for
+     * certain. Null when that is not known (no publisher, or Redis did not
+     * answer): it may have been heard, and the handle waits out its bound.
      */
-    fun trigger(serviceId: UUID, runId: UUID): Long {
-        val redis = redisProvider ?: return 0
+    fun trigger(serviceId: UUID, runId: UUID): Long? {
+        val redis = redisProvider ?: return null
         return try {
             val commands = redis()
-            val heard = commands.publish(RunTrigger.RUN_CHANNEL, RunTrigger.encodeRun(serviceId, runId)) ?: 0L
-            if (heard > 0) heard else commands.publish(RunTrigger.TRIGGER_CHANNEL, serviceId.toString()) ?: 0L
+            val heard = commands.publish(RunTrigger.RUN_CHANNEL, RunTrigger.encodeRun(serviceId, runId)) ?: return null
+            if (heard > 0) heard else commands.publish(RunTrigger.TRIGGER_CHANNEL, serviceId.toString())
         } catch (e: Exception) {
             log.warn("failed to publish run {} of {}: {}", runId, serviceId, e.message)
-            0
+            null
         }
     }
 

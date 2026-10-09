@@ -286,17 +286,23 @@ object PublicApi {
                 // answered is answered again from the record, and its handler
                 // does not run.
                 // Only a POST a route takes: a path nothing answers has
-                // nothing to remember. Its answer is written down as it goes
-                // out (Responses, below); a call that never answers keeps its
-                // key held until the key's in-flight bound.
+                // nothing to remember. Its key is decided as its answer goes
+                // out (Responses, below), or as it is cut off with none.
                 val path = PathCanonicalizer.canonicalize(uri)
                 if (call.request.local.method == HttpMethod.Post && path != null && path !in READ_ONLY_POSTS &&
                     isMountedPath(uri, HttpMethod.Post)
                 ) {
-                    Idempotency.begin(call, caller.keyId, path)
+                    Idempotency.begin(call, caller.keyId, caller.orgId, caller.userId, path)
                     if (call.response.isCommitted) return@withContext
                 }
-                proceed()
+                try {
+                    proceed()
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    // Cut off under its handler with no answer: decided as an
+                    // unknown outcome (a no-op for a call without a key).
+                    Idempotency.cancelled(call)
+                    throw e
+                }
             }
         }
     }

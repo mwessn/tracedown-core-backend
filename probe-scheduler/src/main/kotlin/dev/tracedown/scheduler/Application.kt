@@ -224,9 +224,11 @@ fun Application.module() {
 
     // Shutdown hooks
     monitor.subscribe(io.ktor.server.application.ApplicationStopped) {
+        // Stop hearing run requests first: one that arrived after the queue
+        // closed would be claimed here and then dropped.
+        syncService.stop()
         dispatchQueue.close()
         executionBackend.close()
-        syncService.stop()
         quartzManager.shutdown()
         // Closes every per-agent client the factory built (shared by dispatch
         // and health challenges).

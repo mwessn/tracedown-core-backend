@@ -60,7 +60,10 @@ data class RunStatus(
     @JsonSchema.Description("Why a skipped run was not made (the skipped result's reason); null otherwise.")
     val reason: String? = null,
     @JsonSchema.Enum("success", "failure", "timeout", "skipped", "error")
-    @JsonSchema.Description("The worst status among `results` — failure, then timeout, error, success, skipped; null while none is in.")
+    @JsonSchema.Description(
+        "The worst status among `results` — failure, then timeout, error, skipped (an agent that did not run it), " +
+            "success; null while none is in.",
+    )
     val status: String? = null,
     @JsonSchema.Description("Every result of the run: one per agent it ran on. Empty while none is in.")
     val results: List<ProbeResultSummary> = emptyList(),

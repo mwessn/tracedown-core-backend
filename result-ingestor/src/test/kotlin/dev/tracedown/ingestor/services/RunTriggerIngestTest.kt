@@ -117,18 +117,18 @@ class RunTriggerIngestTest {
     fun `a manual run filed under a request's id settles it, done or skipped`() {
         val done = request()
         persist(id = done, trigger = RunTrigger.MANUAL)
-        assertEquals(RunState.DONE to done, stateOf(done))
+        assertEquals(RunState.DONE, stateOf(done))
 
         val skipped = request()
         persist(id = skipped, trigger = RunTrigger.MANUAL, outcome = "skipped", reason = RunTrigger.SKIP_ALREADY_RUNNING)
-        assertEquals(RunState.SKIPPED to skipped, stateOf(skipped))
+        assertEquals(RunState.SKIPPED, stateOf(skipped))
     }
 
     @Test
     fun `a scheduled run under a request's id does not settle it, and a redelivery changes nothing`() {
         val request = request()
         persist(id = request, trigger = RunTrigger.SCHEDULE)
-        assertEquals(RunState.PENDING to null, stateOf(request))
+        assertEquals(RunState.PENDING, stateOf(request))
 
         val settled = request()
         persist(id = settled, trigger = RunTrigger.MANUAL)
@@ -136,7 +136,7 @@ class RunTriggerIngestTest {
             ResultPersistenceService.PersistOutcome.ALREADY_PERSISTED,
             ResultPersistenceService.persist(envelope(settled, RunTrigger.MANUAL, "skipped", RunTrigger.SKIP_ALREADY_RUNNING)),
         )
-        assertEquals(RunState.DONE to settled, stateOf(settled))
+        assertEquals(RunState.DONE, stateOf(settled))
     }
 
     @Test
@@ -144,25 +144,32 @@ class RunTriggerIngestTest {
         val run = request()
         val startedAt = NOW.plusMillis(123)
         persist(id = run, trigger = RunTrigger.MANUAL, run = run, runSize = 2, startedAt = startedAt)
-        assertEquals(RunState.PENDING to null, stateOf(run), "one of two results is not the run")
+        assertEquals(RunState.PENDING, stateOf(run), "one of two results is not the run")
         persist(trigger = RunTrigger.MANUAL, outcome = "failure", run = run, runSize = 2, startedAt = startedAt)
-        assertEquals(RunState.DONE to run, stateOf(run))
+        assertEquals(RunState.DONE, stateOf(run))
     }
 
     @Test
     fun `a real result replaces the skip its run was first answered with`() {
         val run = request()
         persist(id = run, trigger = RunTrigger.MANUAL, outcome = "skipped", reason = RunTrigger.SKIP_ALREADY_QUEUED)
-        assertEquals(RunState.SKIPPED to run, stateOf(run))
+        assertEquals(RunState.SKIPPED, stateOf(run))
         persist(id = run, trigger = RunTrigger.MANUAL)
-        assertEquals(RunState.DONE to run, stateOf(run))
+        assertEquals(RunState.DONE, stateOf(run))
         assertEquals("success", transaction { ProbeResults.selectAll().where { ProbeResults.id eq run }.single()[ProbeResults.status] })
-        // Any other skip stands: it is not the scheduler's word about a request.
+        // Any skip: a result filed under the id is what happened.
         val shed = request()
         persist(id = shed, trigger = RunTrigger.MANUAL, outcome = "skipped", reason = "dispatch_queue_full")
+        persist(id = shed, trigger = RunTrigger.MANUAL)
+        assertEquals(RunState.DONE, stateOf(shed))
+        // A skip never replaces a result, and a result never replaces a result.
         assertEquals(
             ResultPersistenceService.PersistOutcome.ALREADY_PERSISTED,
-            ResultPersistenceService.persist(envelope(shed, RunTrigger.MANUAL, "success", null)),
+            ResultPersistenceService.persist(envelope(shed, RunTrigger.MANUAL, "skipped", RunTrigger.SKIP_ALREADY_RUNNING)),
+        )
+        assertEquals(
+            ResultPersistenceService.PersistOutcome.ALREADY_PERSISTED,
+            ResultPersistenceService.persist(envelope(shed, RunTrigger.MANUAL, "failure", null)),
         )
     }
 
@@ -179,7 +186,7 @@ class RunTriggerIngestTest {
             }
         }
         persist(trigger = RunTrigger.MANUAL, run = run, service = other)
-        assertEquals(RunState.PENDING to null, stateOf(run))
+        assertEquals(RunState.PENDING, stateOf(run))
     }
 
     @Test
@@ -229,9 +236,8 @@ class RunTriggerIngestTest {
         ProbeResults.selectAll().where { ProbeResults.id eq id }.single()[ProbeResults.trigger]
     }
 
-    private fun stateOf(id: UUID): Pair<String, UUID?> = transaction {
-        val row = RunRequests.selectAll().where { RunRequests.id eq id }.single()
-        row[RunRequests.state] to row[RunRequests.resultId]
+    private fun stateOf(id: UUID): String = transaction {
+        RunRequests.selectAll().where { RunRequests.id eq id }.single()[RunRequests.state]
     }
 
     private fun envelope(

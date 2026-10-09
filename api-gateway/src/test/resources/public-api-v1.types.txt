@@ -635,6 +635,7 @@ dev.tracedown.gateway.data.services.ScriptValidation
   targets: dev.tracedown.gateway.data.services.ScriptTargets
   limits: dev.tracedown.gateway.data.services.ScriptLimits
   domainsChecked: kotlin.Boolean optional
+  complete: kotlin.Boolean optional
 
 dev.tracedown.gateway.data.services.ScriptValidationError
   code: kotlin.String

@@ -27,6 +27,7 @@ import org.jetbrains.exposed.v1.core.eq
 import org.jetbrains.exposed.v1.core.greaterEq
 import org.jetbrains.exposed.v1.core.lessEq
 import org.jetbrains.exposed.v1.core.neq
+import org.jetbrains.exposed.v1.core.vendors.ForUpdateOption
 import org.jetbrains.exposed.v1.jdbc.deleteWhere
 import org.jetbrains.exposed.v1.jdbc.insert
 import org.jetbrains.exposed.v1.jdbc.select
@@ -97,6 +98,19 @@ object ResultPersistenceService {
      */
     fun triggerOf(envelope: JsonObject): String =
         envelope["trigger"]?.jsonPrimitive?.contentOrNull?.takeIf { it in RunTrigger.TRIGGERS } ?: RunTrigger.SCHEDULE
+
+    /** The status of the result already filed as [resultId] for [serviceId], if any — locked when [lock]. */
+    private fun existingStatus(resultId: UUID, serviceId: UUID, lock: Boolean): String? {
+        val query = ProbeResults.select(ProbeResults.status)
+            .where { (ProbeResults.id eq resultId) and (ProbeResults.serviceId eq serviceId) }
+        return (if (lock) query.forUpdate() else query).firstOrNull()?.get(ProbeResults.status)
+    }
+
+    /** Whether a result of [status] takes the place of one already filed as [held]: only a real one over a skip. */
+    private fun replacesSkip(held: String, status: String): Boolean = held == "skipped" && status != "skipped"
+
+    /** Thrown inside the persistence transaction when the row turns out to be there already. */
+    private class AlreadyPersisted : RuntimeException("already persisted")
 
     /** The run somebody asked for that this result belongs to, when the envelope names one. */
     fun runIdOf(envelope: JsonObject): UUID? =
@@ -466,22 +480,16 @@ object ResultPersistenceService {
         val status = normalizeStatus(outcome)
         val trigger = triggerOf(envelope)
 
-        val existing = transaction {
-            ProbeResults.select(ProbeResults.status, ProbeResults.rawResult)
-                .where { ProbeResults.id eq resultId }.limit(1).firstOrNull()
-        }
-        // One exception: a run somebody asked for that was answered with a
-        // `run_*` skip under its id, and then made after all. The skip was the
-        // scheduler's word that it would not run; the result is what happened,
-        // and it is never thrown away behind the skip.
-        val replacesSkip = existing != null && status != "skipped" &&
-            existing[ProbeResults.status] == "skipped" &&
-            existing[ProbeResults.rawResult]["reason"]?.jsonPrimitive?.contentOrNull?.startsWith(RunTrigger.SKIP_PREFIX) == true
-        if (existing != null && !replacesSkip) {
+        // One exception: a result filed under a run's id where a skip already
+        // is — the run was answered with a skip, and then made after all. The
+        // result is what happened, and it is never thrown away behind the
+        // skip. Checked here to spare the body work, and again, locked, in the
+        // transaction below.
+        val existing = transaction { existingStatus(resultId, serviceId, lock = false) }
+        if (existing != null && !replacesSkip(existing, status)) {
             log.info("result {} for service {} was already persisted — redelivery ignored", resultId, serviceId)
             return PersistOutcome.ALREADY_PERSISTED
         }
-        if (replacesSkip) log.info("result {} for service {} replaces the skip it was first answered with", resultId, serviceId)
 
         // `error` covers everything that is not a ProbeResult the executor
         // could produce: a script that failed to run, an executor that raised,
@@ -570,8 +578,13 @@ object ResultPersistenceService {
 
             // 1. Insert probe_results — in place of the skip it replaces, if any
             // (a skip has no steps).
-            if (replacesSkip) {
-                ProbeResults.deleteWhere { (ProbeResults.id eq resultId) and (ProbeResults.status eq "skipped") }
+            // Locked, so a delivery racing this one re-evaluates after it.
+            existingStatus(resultId, serviceId, lock = true)?.let { held ->
+                if (!replacesSkip(held, status)) throw AlreadyPersisted()
+                log.info("result {} for service {} replaces the skip it was first answered with", resultId, serviceId)
+                ProbeResults.deleteWhere {
+                    (ProbeResults.id eq resultId) and (ProbeResults.serviceId eq serviceId) and (ProbeResults.status eq "skipped")
+                }
             }
             ProbeResults.insert {
                 it[id] = resultId
@@ -604,6 +617,14 @@ object ResultPersistenceService {
             val runId = runIdOf(envelope)
             if (trigger == RunTrigger.MANUAL && runId != null) {
                 val runSize = runSizeOf(envelope)
+                val match = (RunRequests.id eq runId) and (RunRequests.serviceId eq serviceId) and
+                    (RunRequests.organizationId eq organizationId)
+                // The request row first, locked: the results of one run are
+                // ingested side by side, and each counts the others — in turn,
+                // not past each other. FOR NO KEY UPDATE: a plain row lock that
+                // does not conflict with the key-share locks foreign keys take.
+                RunRequests.select(RunRequests.id).where { match }
+                    .forUpdate(ForUpdateOption.PostgreSQL.ForNoKeyUpdate).firstOrNull()
                 // Every result of the run carries its id and the instant the
                 // run started; read within a second of it, on the service's
                 // own index (start times are kept to the second).
@@ -615,13 +636,10 @@ object ResultPersistenceService {
                             (ProbeResults.runId eq runId)
                     }
                     .map { it[ProbeResults.status] }
-                val match = (RunRequests.id eq runId) and (RunRequests.serviceId eq serviceId) and
-                    (RunRequests.organizationId eq organizationId) and (RunRequests.state neq RunState.DONE)
-                RunRequests.update({ match }) {
+                RunRequests.update({ match and (RunRequests.state neq RunState.DONE) }) {
                     it[expectedResults] = runSize.toShort()
                     if (siblings.size >= runSize) {
                         it[state] = if (siblings.all { s -> s == "skipped" }) RunState.SKIPPED else RunState.DONE
-                        it[RunRequests.resultId] = runId
                     }
                 }
             }
@@ -813,7 +831,7 @@ object ResultPersistenceService {
         }
         committed = true
         } catch (e: Exception) {
-            if (isDuplicateResult(e)) {
+            if (e is AlreadyPersisted || isDuplicateResult(e)) {
                 log.info("result {} for service {} was persisted concurrently — redelivery ignored", resultId, serviceId)
                 // The other delivery persisted its own copies; these are ours and
                 // nothing names them.

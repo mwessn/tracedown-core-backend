@@ -96,8 +96,19 @@ object RunRequestController {
         }
     }
 
-    /** How bad each status is, worst first — the run's own status is its worst result's. */
-    private val SEVERITY = listOf("failure", "timeout", "error", "success", "skipped")
+    /**
+     * How bad each status is, worst first — the run's own status is its worst
+     * result's. A skipped result (an agent that did not run it) is worse than
+     * a success: the run did not happen everywhere it was meant to.
+     */
+    private val SEVERITY = listOf("failure", "timeout", "error", "skipped", "success")
+
+    /** The worst of [statuses] by [SEVERITY] — a status it does not know counts as the worst; null for none. */
+    internal fun worstOf(statuses: List<String>): String? =
+        statuses.minByOrNull { SEVERITY.indexOf(it).let { i -> if (i < 0) -1 else i } }
+
+    /** How far before its request a run's results are looked for when the one under its id is missing (clock skew). */
+    private const val SIBLING_LOOKBACK_SECONDS = 60L
 
     /**
      * Where the run [runId] of [serviceId] stands, for [userId]: read access
@@ -117,19 +128,29 @@ object RunRequestController {
         // An ingestor that predates run requests files them without settling
         // the request, so the results, not the stored state, decide.
         val expected = request[RunRequests.expectedResults]?.toInt() ?: 1
-        val first = resultRow(orgId, serviceId) { ProbeResults.id eq runId }
-        val results = if (first == null || expected <= 1) listOfNotNull(first) else {
+        val requestedAt = request[RunRequests.requestedAt]
+        val filed = resultRow(orgId, serviceId) { ProbeResults.id eq runId }
+        val results = when {
+            filed != null && expected <= 1 -> listOf(filed)
             // Siblings carry the run's id, and were started with it: read
             // within a second of its start, on the service's own index.
-            val startedAt = first[ProbeResults.startedAt]
-            listOf(first) + resultRows(orgId, serviceId) {
-                (ProbeResults.startedAt greaterEq startedAt.minusSeconds(1)) and
-                    (ProbeResults.startedAt lessEq startedAt.plusSeconds(1)) and
-                    (ProbeResults.runId eq runId) and (ProbeResults.id neq runId)
+            filed != null -> {
+                val startedAt = filed[ProbeResults.startedAt]
+                listOf(filed) + resultRows(orgId, serviceId) {
+                    (ProbeResults.startedAt greaterEq startedAt.minusSeconds(1)) and
+                        (ProbeResults.startedAt lessEq startedAt.plusSeconds(1)) and
+                        (ProbeResults.runId eq runId) and (ProbeResults.id neq runId)
+                }
+            }
+            // The row under the id itself is missing (it could not be
+            // ingested): its siblings still say how the run went. Read from
+            // the request on, on the same index.
+            else -> resultRows(orgId, serviceId) {
+                (ProbeResults.startedAt greaterEq requestedAt.minusSeconds(SIBLING_LOOKBACK_SECONDS)) and (ProbeResults.runId eq runId)
             }
         }
+        val first = filed ?: results.firstOrNull()
 
-        val requestedAt = request[RunRequests.requestedAt]
         val stored = request[RunRequests.state]
         val late = Duration.between(requestedAt, now) > expiry
         val statuses = results.map { it[ProbeResults.status] }
@@ -147,7 +168,7 @@ object RunRequestController {
         val reason = when {
             state != RunState.SKIPPED -> null
             results.isEmpty() -> request[RunRequests.reason]
-            else -> first!![ProbeResults.rawResult]["reason"]?.jsonPrimitive?.contentOrNull
+            else -> first?.get(ProbeResults.rawResult)?.get("reason")?.jsonPrimitive?.contentOrNull
         }
         RunStatus(
             runId = runId.toString(),
@@ -155,7 +176,7 @@ object RunRequestController {
             requestedAt = requestedAt.toString(),
             result = first?.let(ProbeResultController::summaryOf),
             reason = reason,
-            status = statuses.minByOrNull { SEVERITY.indexOf(it).let { i -> if (i < 0) 0 else i } },
+            status = worstOf(statuses),
             results = results.map(ProbeResultController::summaryOf),
         )
     }

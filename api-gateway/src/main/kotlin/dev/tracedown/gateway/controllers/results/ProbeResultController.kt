@@ -48,7 +48,11 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.time.Duration.Companion.seconds
+import io.ktor.http.content.OutgoingContent
+import io.ktor.utils.io.ByteWriteChannel
+import io.ktor.utils.io.writeFully
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.withContext
@@ -103,6 +107,12 @@ object ProbeResultController {
      * yields. No index of their own — `probe_results` is big, and a filter on
      * a handful of values inside one service's range does not need one.
      */
+    /** The values `probe_results.status` takes: what the results list's `status` filter accepts. */
+    val STATUSES = listOf("success", "failure", "timeout", "error", "skipped")
+
+    /** What the results list's `order` accepts; the first is the default. */
+    val ORDERS = listOf("desc", "asc")
+
     data class ResultFilter(
         val since: Instant? = null,
         val until: Instant? = null,
@@ -393,10 +403,25 @@ object ProbeResultController {
      * read gate ([readStepBody]). Taking the call is the point: the answer
      * cannot be sent from anywhere but inside the gate.
      */
-    suspend fun respondStepBody(call: ApplicationCall, orgId: UUID, serviceId: UUID, resultId: UUID, stepId: UUID, userId: UUID) {
+    suspend fun respondStepBody(
+        call: ApplicationCall,
+        orgId: UUID,
+        serviceId: UUID,
+        resultId: UUID,
+        stepId: UUID,
+        userId: UUID,
+        headOnly: Boolean = false,
+    ) {
         readStepBody(orgId, serviceId, resultId, stepId, userId) { body ->
             insideGateProbe?.invoke()
-            if (body == null) call.respond(HttpStatusCode.NoContent, "") else writeBounded { call.respond(body) }
+            if (body == null) {
+                call.respond(HttpStatusCode.NoContent, "")
+            } else {
+                // Encoded here and streamed, so the answer is written under
+                // the gate's bytes rather than handed whole to the engine.
+                val encoded = publicJson.encodeToString(StepBodyContent.serializer(), body).toByteArray()
+                respondStreamed(call, encoded, ContentType.Application.Json, headOnly)
+            }
         }
     }
 
@@ -406,6 +431,55 @@ object ProbeResultController {
      * body in that time is cut off as one that went away: its call is
      * cancelled and the bytes go back to the gate.
      */
+    /**
+     * Answers [call] with [bytes] streamed to the client in chunks, each
+     * waiting until the connection takes it — so a body read under the gate
+     * is still under it (its byte units held by the caller's [GateHold])
+     * until the client has it, rather than sitting whole in the engine's
+     * buffers. Returns once the last chunk is written; bounded by
+     * [bodyWriteTimeout] ([writeBounded]).
+     */
+    private suspend fun respondStreamed(call: ApplicationCall, bytes: ByteArray, type: ContentType, headOnly: Boolean = false) {
+        val written = CompletableDeferred<Unit>()
+        writeBounded {
+            call.respond(StreamedBody(bytes, type, written))
+            // A HEAD sends the headers alone: nothing is written to wait for.
+            if (!headOnly) written.await()
+        }
+    }
+
+    /** [bytes] as an answer that is written chunk by chunk, flushed each time, and says when it is done. */
+    private class StreamedBody(
+        private val bytes: ByteArray,
+        override val contentType: ContentType,
+        private val written: CompletableDeferred<Unit>,
+    ) : OutgoingContent.WriteChannelContent() {
+        override val contentLength: Long get() = bytes.size.toLong()
+        override val status: HttpStatusCode get() = HttpStatusCode.OK
+
+        override suspend fun writeTo(channel: ByteWriteChannel) {
+            try {
+                var offset = 0
+                while (offset < bytes.size) {
+                    val end = minOf(offset + STREAM_CHUNK_BYTES, bytes.size)
+                    channel.writeFully(bytes, offset, end)
+                    channel.flush()
+                    offset = end
+                }
+                written.complete(Unit)
+            } catch (e: Throwable) {
+                written.completeExceptionally(e)
+                throw e
+            }
+        }
+    }
+
+    /** How much of a body is handed to the connection at a time. */
+    private const val STREAM_CHUNK_BYTES = 64 * 1024
+
+    /** The API's own encoding of a body answer, as content negotiation would write it. */
+    private val publicJson = kotlinx.serialization.json.Json { encodeDefaults = true }
+
     internal suspend fun writeBounded(write: suspend () -> Unit) {
         withTimeoutOrNull(bodyWriteTimeout) { write() } ?: throw CancellationException("the client did not read the body in time")
             .apply { initCause(io.ktor.utils.io.ConnectionClosedException("body write timed out")) }
@@ -413,6 +487,14 @@ object ProbeResultController {
 
     /** How long the answer of a body read may take to be written to its client. */
     val BODY_WRITE_TIMEOUT = 60.seconds
+
+    /**
+     * The engine's per-write timeout the gateway runs with (`system.conf`
+     * `ktor.deployment.responseWriteTimeoutSeconds`): above
+     * [BODY_WRITE_TIMEOUT], so the gateway's bound, not the engine's, is the
+     * one a slow client meets.
+     */
+    const val ENGINE_WRITE_TIMEOUT_SECONDS = 75
 
     /** [BODY_WRITE_TIMEOUT], settable so tests need not wait the real time. */
     internal var bodyWriteTimeout = BODY_WRITE_TIMEOUT
@@ -476,7 +558,7 @@ object ProbeResultController {
                     insideGateProbe?.invoke()
                     attachmentHeaders(call, stepId)
                     val type = safeContentType(read.contentType)?.let(ContentType::parse) ?: ContentType.Application.OctetStream
-                    writeBounded { call.respondBytes(read.bytes, type, HttpStatusCode.OK) }
+                    respondStreamed(call, read.bytes, type)
                 }
                 BodyStorageClient.StoredBody.Missing -> throw GoneException(ErrorCodes.BODY_GONE)
                 is BodyStorageClient.StoredBody.TooLarge -> throw ApiException(

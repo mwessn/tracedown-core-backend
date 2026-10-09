@@ -621,13 +621,43 @@ class DispatchQueue(
             // own; every one says which run it belongs to and how many there
             // are, so the run reads complete only once all of them are in.
             var runId = item.runId
-            val runSize = executions.count { it.result != null }
+            // A run asked for under an id counts every agent it went to: one
+            // that produced nothing is a skipped result of the run, naming
+            // why, so the missing agent shows and the run's verdict counts it.
+            val runSize = executions.size
             for (execution in executions) {
                 // No result: the backend exhausted every agent it was allowed
-                // to re-run on. Handled after the loop — in `simultaneous` mode
-                // a sibling execution may still have produced one, and one
-                // agent failing is not the same as the tick observing nothing.
-                val result = execution.result ?: continue
+                // to re-run on. Without a run id this is handled after the loop
+                // — in `simultaneous` mode a sibling execution may still have
+                // produced one, and one agent failing is not the same as the
+                // tick observing nothing.
+                val result = execution.result
+                if (result == null) {
+                    if (item.runId == null) continue
+                    resultPublisher.publish(
+                        jobId = jobId,
+                        serviceId = serviceId,
+                        agentId = execution.agentId,
+                        projectId = ctx.projectId,
+                        workspaceId = ctx.workspaceId,
+                        organizationId = ctx.orgId,
+                        rawResult = buildJsonObject {
+                            put("outcome", "skipped")
+                            put("reason", execution.failureReason ?: "agent_unreachable")
+                            put("elapsedMs", 0)
+                        },
+                        startedAt = startedAt,
+                        agentEgressBytes = execution.egressBytes,
+                        resultId = runId ?: UUID.randomUUID(),
+                        trigger = item.trigger,
+                        runId = item.runId,
+                        runSize = runSize,
+                    )
+                    runId = null
+                    published++
+                    accounted.set(true)
+                    continue
+                }
                 // Strip any secret plaintext the executor echoed back (e.g. a
                 // secret placed in a request URL/header) before it is persisted.
                 val redacted = ResultRedactor.redact(result, secretValues)
@@ -674,21 +704,16 @@ class DispatchQueue(
             // A lock release that fails must not be mistaken for a tick that
             // produced nothing — by this point the results are already on the
             // queue.
-            val hasPending = try {
-                queuePolicy.release(serviceId, lockToken)
+            val released = try {
+                queuePolicy.releaseWithPending(serviceId, lockToken)
             } catch (e: Exception) {
                 log.warn("failed to release lock for service {}: {}", serviceId, e.message)
-                false
+                QueuePolicyManager.Released(false, null)
             }
-            if (hasPending) {
+            if (released.hasPending) {
                 log.debug("service {} has pending run — re-enqueueing", serviceId)
                 // A pending run somebody asked for under an id runs under it.
-                val pendingRun = try {
-                    queuePolicy.takePendingRun(serviceId)
-                } catch (e: Exception) {
-                    log.warn("failed to read the pending run of service {}: {}", serviceId, e.message)
-                    null
-                }
+                val pendingRun = released.pendingRunId
                 enqueue(if (pendingRun != null) DispatchItem(serviceId, manual = true, runId = pendingRun) else DispatchItem.scheduled(serviceId))
             }
         }

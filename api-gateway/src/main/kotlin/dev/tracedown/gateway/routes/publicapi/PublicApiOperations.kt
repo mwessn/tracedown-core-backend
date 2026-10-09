@@ -1,6 +1,8 @@
 package dev.tracedown.gateway.routes.publicapi
 
 import dev.tracedown.common.pfs.Page
+import dev.tracedown.common.runs.RunTrigger
+import dev.tracedown.gateway.controllers.results.ProbeResultController
 import dev.tracedown.gateway.data.CreateVariableRequest
 import dev.tracedown.gateway.data.UpdateVariableRequest
 import dev.tracedown.gateway.data.VariableHierarchyResponse
@@ -56,6 +58,8 @@ data class QueryParameter(
     val type: KType,
     val description: String,
     val required: Boolean = false,
+    /** The values it takes, when it is held to a set — from the constant the handler checks against. */
+    val values: List<String>? = null,
 )
 
 /**
@@ -144,14 +148,15 @@ object PublicApiOperations {
 
     /** Every reason a run asked for can be skipped with, by what to do about it. */
     private const val RUN_SKIP_REASONS =
-        "Skip reasons, by remedy — ask again later: `run_already_running`, `run_already_queued` (a run of the " +
+        "Skip reasons, by what to do. Ask again later: `run_already_running`, `run_already_queued` (a run of the " +
             "service was already under way or waiting; its result is under another id, in `/services/{id}/results`), " +
-            "`run_in_service_window`, `run_held`, `dispatch_queue_full`; fix " +
-            "the service or its configuration: `run_service_inactive`, `run_script_missing`, `variable_unreadable`, " +
-            "`target_*` (an address this installation does not probe, or a target that asked not to be), " +
-            "`unverified_*` (the verified-domain limits); the platform: `run_not_delivered` (no scheduler was " +
-            "listening — nothing will run it), `no_eligible_agent`, `agent_unreachable`, `agent_rejected`, " +
-            "`dispatch_error`."
+            "`run_in_service_window`, `dispatch_queue_full`; wait at least 5 minutes or verify the domain: " +
+            "`unverified_throttle`. Fix the service or its configuration: `run_service_inactive`, `run_script_missing`, " +
+            "`target_*` (an address this installation does not probe, or a target that asked not to be), the other " +
+            "`unverified_*` (the verified-domain limits). The platform, for its operator: `run_held` (held until an " +
+            "operator clears it — waiting does not), `variable_unreadable`, `run_not_delivered` (no scheduler was " +
+            "listening; nothing will run it), `no_eligible_agent`, `agent_unreachable`, `agent_rejected`, " +
+            "`dispatch_error`. New reasons can appear: treat an unknown one as a platform problem."
 
     private val OK = typeOf<Map<String, Boolean>>()
 
@@ -281,8 +286,8 @@ object PublicApiOperations {
                 "(twice the scheduler's run lock and a margin: 10 minutes unless the probe timeout or the operator set " +
                 "another). An expired run may still settle: a result that arrives later is filed under the id and the " +
                 "state follows it. A service that runs on several agents at once makes one result per agent: " +
-                "`results` lists them all, `status` is the worst of them (failure, then timeout, error, success, " +
-                "skipped), and the run is `done` once every one is in, or once the bound has passed. Poll every few " +
+                "`results` lists them all (an agent that did not run it as a skipped result), `status` is the worst of them " +
+                "(failure, then timeout, error, skipped, success), and the run is `done` once every one is in, or once the bound has passed. Poll every few " +
                 "seconds. 404 for an id that is not a run of this service. " + RUN_SKIP_REASONS,
             response = typeOf<RunStatus>()),
         PublicOperation(get, "/services/{id}/agents", "listServiceAgents", "Services", "Lists the agents a service may run on",
@@ -311,11 +316,13 @@ object PublicApiOperations {
                 QueryParameter("since", typeOf<String>(), "An ISO-8601 instant: only runs started at or after it (to the second)."),
                 QueryParameter("until", typeOf<String>(), "An ISO-8601 instant: only runs started at or before it (to the second). Not before `since`."),
                 QueryParameter("status", typeOf<List<String>>(),
-                    "Only runs with one of these statuses — `success`, `failure`, `timeout`, `error`, `skipped`. Repeat " +
-                        "the parameter (`status=failure&status=timeout`), or give them comma-separated in one " +
-                        "(`status=failure,timeout`)."),
-                QueryParameter("trigger", typeOf<String>(), "Only runs started by `schedule`, or asked for (`manual`)."),
-                QueryParameter("order", typeOf<String>(), "`desc` (default, most recent first) or `asc`."),
+                    "Only runs with one of these statuses. Repeat the parameter (`status=failure&status=timeout`), or " +
+                        "give them comma-separated in one (`status=failure,timeout`).",
+                    values = ProbeResultController.STATUSES),
+                QueryParameter("trigger", typeOf<String>(), "Only runs started by `schedule`, or asked for (`manual`).",
+                    values = RunTrigger.TRIGGERS.toList()),
+                QueryParameter("order", typeOf<String>(), "`desc` (default, most recent first) or `asc`.",
+                    values = ProbeResultController.ORDERS),
             ) + PAGING,
             response = typeOf<Page<ProbeResultSummary>>()),
         PublicOperation(get, "/services/{id}/results/{resultId}", "getServiceResult", "Results", "Returns a run with all of its steps",
@@ -346,7 +353,7 @@ object PublicApiOperations {
 
         // Scripts
         PublicOperation(post, "/scripts/validate", "validateScript", "Scripts", "Judges a script as a save would",
-            "Without saving anything: `valid` is true exactly when a script save would accept it. `errors` lists " +
+            "Without saving anything: `valid` is true when nothing this caller can judge would refuse a save of it (see `complete`). `errors` lists " +
                 "every reason it would not — the Lace validator's (`code`, `callIndex`, `field`, `detail`), then " +
                 "`blocked_probe_target` per call whose target this installation does not probe, and the " +
                 "unverified-domain rules where they apply. With `serviceId`, judged with that service's variables " +
@@ -354,9 +361,10 @@ object PublicApiOperations {
                 "with what the caller may know: values that are stored encrypted are used only for a caller with " +
                 "write on the service, and for anyone else a call whose host needs one is listed in " +
                 "`targets.unresolved` and judged by neither policy. Without `serviceId` there are no variables (calls " +
-                "whose host comes from one are unresolved), and verified-domain coverage is judged only for a caller " +
-                "who may read the organization's domains — `domainsChecked` says whether it was. Targets are always " +
-                "named as the script writes them. It changes nothing, so a read-only key may call it, and it takes no " +
+                "whose host comes from one are unresolved). Verified-domain coverage is judged only for a caller who " +
+                "may read the organization's domains — `domainsChecked` says whether it was — and only over calls whose " +
+                "host is known. So `valid` means nothing this caller can judge refuses the script; with `complete` " +
+                "true as well it is a save's verdict. Targets are always named as the script writes them. It changes nothing, so a read-only key may call it, and it takes no " +
                 "`Idempotency-Key`.",
             request = typeOf<ValidateScriptRequest>(), response = typeOf<ScriptValidation>(), idempotent = false,
             errors = listOf(HttpStatusCode.NotFound)),

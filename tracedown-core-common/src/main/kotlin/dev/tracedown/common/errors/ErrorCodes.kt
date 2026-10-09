@@ -156,6 +156,10 @@ object ErrorCodes {
     const val IDEMPOTENCY_IN_PROGRESS = "idempotency_in_progress"
     /** The store that remembers `Idempotency-Key`s is not answering, so the request cannot be made safely. */
     const val IDEMPOTENCY_UNAVAILABLE = "idempotency_unavailable"
+    /** The request with that `Idempotency-Key` may or may not have taken effect, so it is not made again. */
+    const val IDEMPOTENCY_OUTCOME_UNKNOWN = "idempotency_outcome_unknown"
+    /** The organization's budget for remembered answers is spent for now; a request with a new key would not be remembered. */
+    const val IDEMPOTENCY_LIMIT_REACHED = "idempotency_limit_reached"
 
     // ── Webhook bindings ──
     /** The webhook is already bound to that resource. */
