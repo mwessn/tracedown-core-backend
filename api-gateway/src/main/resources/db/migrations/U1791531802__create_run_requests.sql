@@ -5,4 +5,6 @@
 -- Back to runs without a handle. The results the handles named stay in
 -- probe_results under the same ids; only the requests themselves go, and the
 -- handle route goes with the release that is rolled back to.
+SET LOCAL lock_timeout = '5s';
+
 DROP TABLE run_requests;

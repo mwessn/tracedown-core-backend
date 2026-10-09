@@ -68,6 +68,14 @@ import dev.tracedown.gateway.data.services.UpdateServiceRequest
 import dev.tracedown.gateway.routes.publicapi.PublicApi
 import dev.tracedown.gateway.util.ApiRateLimit
 import dev.tracedown.gateway.util.Idempotency
+import dev.tracedown.gateway.controllers.runs.RunRequestController
+import io.ktor.client.request.post
+import io.ktor.client.request.setBody
+import io.ktor.client.statement.bodyAsText
+import io.ktor.server.request.receiveText
+import io.ktor.server.response.respondText
+import io.ktor.server.routing.routing
+import org.jetbrains.exposed.v1.jdbc.select
 import io.ktor.http.HttpMethod
 import io.ktor.server.application.pluginOrNull
 import io.ktor.server.config.HoconApplicationConfig
@@ -249,7 +257,7 @@ class ApiKeyResourcesTest {
                 // Answers more than an idempotent answer may keep.
                 post("/test/big") {
                     val n = bigCalls.incrementAndGet()
-                    call.respond(mapOf("n" to n.toString(), "padding" to "x".repeat(70 * 1024)))
+                    call.respond(mapOf("n" to n.toString(), "padding" to "x".repeat(300 * 1024)))
                 }
                 // Answers once told to, so a second call can arrive while it waits.
                 post("/test/slow") {
@@ -300,6 +308,8 @@ class ApiKeyResourcesTest {
             // so nothing else can take it between choosing and binding.
             server = embeddedServer(Netty, env, configure = {
                 connector { port = 0 }
+                // As the gateway runs (system.conf).
+                responseWriteTimeoutSeconds = ProbeResultController.ENGINE_WRITE_TIMEOUT_SECONDS
             })
             server.start(wait = false)
             serverPort = runBlocking { server.engine.resolvedConnectors().first().port }
@@ -1946,7 +1956,7 @@ class ApiKeyResourcesTest {
             return listOf("$at: $actual where the schema allows $types")
         }
         val errors = mutableListOf<String>()
-        s["enum"]?.jsonArray?.let { allowed -> if (value !is JsonNull && value !in allowed) errors += "$at: $value not in $allowed" }
+        s["enum"]?.jsonArray?.let { allowed -> if (value !in allowed) errors += "$at: $value not in $allowed" }
         if (value is JsonObject) {
             s["required"]?.jsonArray?.forEach { r -> if (r.jsonPrimitive.content !in value) errors += "$at: missing ${r.jsonPrimitive.content}" }
             val properties = s["properties"]?.jsonObject ?: JsonObject(emptyMap())
@@ -3615,156 +3625,9 @@ class ApiKeyResourcesTest {
         return client.newCall(request).execute().use { Triple(it.code, it.body.string(), it.header("Idempotent-Replayed")) }
     }
 
-    @Test
-    fun `a POST repeated under its Idempotency-Key is made once, and the key cannot name another request`() {
-        val address = nextAddress()
-        val fx = fixtures(address)
-        val name = "Idempotent ${UUID.randomUUID().toString().take(6)}"
-        val path = "${PublicApi.V1}/workspaces"
-
-        val first = postIdempotent(address, path, fx.writeKey, """{"name":"$name"}""", "ws-1")
-        assertEquals(200, first.first, first.second)
-        assertNull(first.third)
-        // The body reached the handler after it was read for the fingerprint.
-        assertEquals(name, obj(first.second).str("name"))
-        val again = postIdempotent(address, path, fx.writeKey, """{"name":"$name"}""", "ws-1")
-        assertEquals(200, again.first, again.second)
-        assertEquals("true", again.third)
-        assertEquals(first.second, again.second)
-        assertEquals(1L, transaction {
-            dev.tracedown.common.models.Workspaces.selectAll().where { dev.tracedown.common.models.Workspaces.name eq name }.count()
-        })
-
-        // The same key with a different request — body, or path.
-        val other = postIdempotent(address, path, fx.writeKey, """{"name":"$name 2"}""", "ws-1")
-        assertEquals(422, other.first, other.second)
-        assertEquals("idempotency_key_reused", errorOf(other.second))
-        assertEquals(422, postIdempotent(address, "${PublicApi.V1}/silences", fx.writeKey, """{"name":"$name"}""", "ws-1").first)
-
-        // Keys are the API key's own: another key may use the same one.
-        val secondKey = mintKey(fx.ownerSession, "write", address)
-        val elsewhere = postIdempotent(address, path, secondKey, """{"name":"$name b"}""", "ws-1")
-        assertEquals(200, elsewhere.first, elsewhere.second)
-        assertNull(elsewhere.third)
-
-        // A run asked for twice under one key is one run, with one handle.
-        val runPath = "${PublicApi.V1}/services/${fx.service}/run"
-        val runs = transaction { RunRequests.selectAll().where { RunRequests.serviceId eq fx.service }.count() }
-        val run1 = postIdempotent(address, runPath, fx.writeKey, "{}", "run-1")
-        val run2 = postIdempotent(address, runPath, fx.writeKey, "{}", "run-1")
-        assertEquals(202, run1.first, run1.second)
-        assertEquals(202, run2.first, run2.second)
-        assertEquals("true", run2.third)
-        assertEquals(obj(run1.second).str("runId"), obj(run2.second).str("runId"))
-        assertEquals(runs + 1, transaction { RunRequests.selectAll().where { RunRequests.serviceId eq fx.service }.count() })
-
-        // A refusal is an answer like any other, and is replayed.
-        val refused = postIdempotent(address, path, fx.writeKey, """{"name":""}""", "empty-name")
-        val refusedAgain = postIdempotent(address, path, fx.writeKey, """{"name":""}""", "empty-name")
-        assertEquals(400, refused.first, refused.second)
-        assertEquals(refused.second, refusedAgain.second)
-        assertEquals("true", refusedAgain.third)
-
-        // Validation changes nothing and takes no key: never replayed.
-        val validate = "${PublicApi.V1}/scripts/validate"
-        repeat(2) {
-            val answer = postIdempotent(address, validate, fx.readKey, validateBody(SCRIPT), "v-1")
-            assertEquals(200, answer.first, answer.second)
-            assertNull(answer.third)
-        }
-
-        // A malformed key is refused, naming the header.
-        for (bad in listOf("", "x".repeat(129), "tab\there")) {
-            val (status, raw, _) = postIdempotent(address, path, fx.writeKey, """{"name":"$name bad"}""", bad)
-            assertEquals(400, status, "'$bad': $raw")
-            assertEquals("Idempotency-Key", obj(raw)["details"]!!.jsonObject.str("field"))
-        }
-        assertEquals(200, postIdempotent(address, path, fx.writeKey, """{"name":"$name max"}""", "k".repeat(128)).first)
-    }
-
-    @Test
-    fun `a request that failed with a server error is not remembered, and one in flight holds its key`() {
-        val address = nextAddress()
-        val fx = fixtures(address)
-        flakyCalls.set(0)
-        val flaky = "${PublicApi.V1}/test/flaky"
-        assertEquals(500, postIdempotent(address, flaky, fx.writeKey, "{}", "flaky-1").first)
-        val second = postIdempotent(address, flaky, fx.writeKey, "{}", "flaky-1")
-        assertEquals(200, second.first, second.second)
-        assertNull(second.third, "a 5xx is not an answer to replay: the request runs again")
-        val third = postIdempotent(address, flaky, fx.writeKey, "{}", "flaky-1")
-        assertEquals("true", third.third)
-        assertEquals(second.second, third.second)
-        assertEquals(2, flakyCalls.get())
-
-        slowEntered = CompletableDeferred()
-        slowRelease = CompletableDeferred()
-        val slow = "${PublicApi.V1}/test/slow"
-        val inFlight = java.util.concurrent.CompletableFuture.supplyAsync { postIdempotent(address, slow, fx.writeKey, "{}", "slow-1") }
-        try {
-            runBlocking { kotlinx.coroutines.withTimeout(10_000) { slowEntered.await() } }
-            val (status, raw, _) = postIdempotent(address, slow, fx.writeKey, "{}", "slow-1")
-            assertEquals(409, status, raw)
-            assertEquals("idempotency_in_progress", errorOf(raw))
-        } finally {
-            slowRelease.complete(Unit)
-        }
-        assertEquals(200, inFlight.get(10, java.util.concurrent.TimeUnit.SECONDS).first)
-        assertEquals("true", postIdempotent(address, slow, fx.writeKey, "{}", "slow-1").third)
-    }
-
     // ── Agent health ──
 
-    @Test
-    fun `agents say how they are doing, as the dashboard's roster does`() {
-        val address = nextAddress()
-        val fx = fixtures(address)
-        val tag = UUID.randomUUID().toString().take(6)
-        val checkedAt = Instant.now().truncatedTo(java.time.temporal.ChronoUnit.SECONDS)
-        val agents = mapOf("ok-$tag" to "success", "down-$tag" to "failure", "late-$tag" to "timeout")
-        transaction {
-            for ((slug, status) in agents) {
-                ProbeAgents.insert {
-                    it[ProbeAgents.slug] = slug
-                    it[label] = slug
-                    it[agentUri] = "https://$slug.example.com:8443"
-                    it[publicKey] = "unused"
-                    it[isActive] = true
-                    it[lastPing] = checkedAt
-                    it[lastStatus] = status
-                    it[lastPingDelayMs] = 0
-                    it[lastPongDeltaMs] = 0
-                    it[createdAt] = Instant.now()
-                }
-            }
-        }
-        try {
-            val listed = Json.parseToJsonElement(send(address, "GET", "${PublicApi.V1}/agents", fx.readKey).second).jsonArray
-                .map { it.jsonObject }.associateBy { it.str("slug") }
-            assertEquals("healthy", listed.getValue("ok-$tag").str("status"))
-            assertEquals("down", listed.getValue("down-$tag").str("status"))
-            assertEquals("down", listed.getValue("late-$tag").str("status"))
-            assertEquals(checkedAt, Instant.parse(listed.getValue("ok-$tag").str("lastCheckAt")))
-            // The dashboard's roster, for the same agents: the same verdicts.
-            val roster = obj(send(address, "GET", "/api/v1/agents/health", fx.ownerSession).second)["statuses"]!!.jsonArray
-                .map { it.jsonObject }.filter { it.str("agentSlug").endsWith(tag) }
-            assertEquals(3, roster.size)
-            for (entry in roster) {
-                val degraded = entry.str("degraded").toBoolean()
-                assertEquals(
-                    dev.tracedown.gateway.controllers.agents.AgentDirectory.health(entry.str("status"), degraded),
-                    listed.getValue(entry.str("agentSlug")).str("status"),
-                )
-            }
-        } finally {
-            transaction { ProbeAgents.deleteWhere { ProbeAgents.slug inList agents.keys } }
-        }
-        assertEquals("degraded", dev.tracedown.gateway.controllers.agents.AgentDirectory.health("success", true))
-        assertEquals("down", dev.tracedown.gateway.controllers.agents.AgentDirectory.health("timeout", false))
-        assertEquals("unknown", dev.tracedown.gateway.controllers.agents.AgentDirectory.health(null, false))
-    }
-
-    // ── Round two: run handles ──
+    // ── Runs on several agents, and undelivered runs ──
 
     @Test
     fun `a run on several agents is done once all of its results are in, and says the worst of them`() {
@@ -3788,24 +3651,7 @@ class ApiKeyResourcesTest {
         assertEquals(runId.toString(), done["result"]!!.jsonObject.str("id"))
     }
 
-    @Test
-    fun `a run no scheduler heard is settled at once as not delivered`() {
-        val address = nextAddress()
-        val fx = fixtures(address)
-        stopListeningForRuns()
-        try {
-            val (status, raw) = send(address, "POST", "${PublicApi.V1}/services/${fx.service}/run", fx.writeKey)
-            assertEquals(202, status, raw)
-            val run = obj(send(address, "GET", "${PublicApi.V1}/services/${fx.service}/runs/${obj(raw).str("runId")}", fx.readKey).second)
-            assertEquals("skipped", run.str("state"), run.toString())
-            assertEquals("run_not_delivered", run.str("reason"))
-            assertTrue(run["result"] is JsonNull, run.toString())
-        } finally {
-            listenForRuns()
-        }
-    }
-
-    // ── Round two: the raw download and the read gate ──
+    // ── The raw download and the read gate ──
 
     @Test
     fun `HEAD on a download answers from a size lookup, without reading the body`() {
@@ -3834,39 +3680,109 @@ class ApiKeyResourcesTest {
         }
     }
 
+    /** A 24 MiB body in the default store, as a step of [fx]'s result: more than any socket buffers. */
+    private fun bigStep(fx: Fx): String {
+        val dir = Files.createDirectories(storageRoot.resolve(fx.owner.orgId.toString()))
+        val big = dir.resolve("big-${UUID.randomUUID()}.bin")
+        java.io.RandomAccessFile(big.toFile(), "rw").use { it.setLength(BIG_BODY) }
+        return "${bodyPath(fx, stepAt(fx, "file://$big"))}/raw"
+    }
+
+    private val BIG_BODY = 24L * 1024 * 1024
+
+    /** Sends a GET for [path] on a socket of its own and reads nothing back. */
+    private fun silentGet(socket: java.net.Socket, address: String, path: String, key: String) {
+        socket.getOutputStream().write(
+            ("GET $path HTTP/1.1\r\nHost: localhost\r\nX-Forwarded-For: $address\r\n" +
+                "Authorization: Bearer $key\r\n\r\n").toByteArray(),
+        )
+        socket.getOutputStream().flush()
+    }
+
+    /** Polls [condition] for up to [seconds]; true once it holds. */
+    private fun eventually(seconds: Long, condition: () -> Boolean): Boolean {
+        val deadline = System.nanoTime() + Duration.ofSeconds(seconds).toNanos()
+        while (System.nanoTime() < deadline) {
+            if (condition()) return true
+            Thread.sleep(20)
+        }
+        return condition()
+    }
+
     @Test
-    fun `a slow reader holds nothing in the gate, and a write that does not finish is cut off`() {
+    fun `a download holds its bytes in the gate until its client has them, and a steady client gets them all`() {
         val address = nextAddress()
         val fx = fixtures(address)
-        val dir = Files.createDirectories(storageRoot.resolve(fx.owner.orgId.toString()))
-        val big = dir.resolve("slow-${UUID.randomUUID()}.bin")
-        java.io.RandomAccessFile(big.toFile(), "rw").use { it.setLength(24L * 1024 * 1024) }
-        val path = "${bodyPath(fx, stepAt(fx, "file://$big"))}/raw"
+        val org = fx.owner.orgId
+        val path = bigStep(fx)
         java.net.Socket("localhost", serverPort).use { socket ->
-            // Asks, then reads nothing for now.
-            socket.getOutputStream().write(
-                ("GET $path HTTP/1.1\r\nHost: localhost\r\nX-Forwarded-For: $address\r\n" +
-                    "Authorization: Bearer ${fx.readKey}\r\n\r\n").toByteArray(),
-            )
-            socket.getOutputStream().flush()
-            // The read is done and its answer handed to the engine: the gate
-            // is whole again while the client has not read a byte.
-            Thread.sleep(500)
-            val deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos()
-            while (ProbeResultController.gateState(fx.owner.orgId) != ProbeResultController.idleGate && System.nanoTime() < deadline) {
-                Thread.sleep(20)
+            socket.soTimeout = 30_000
+            silentGet(socket, address, path, fx.readKey)
+            // Read, and handed back its places — but the client has taken
+            // nothing, so the bytes stay counted against the budget.
+            assertTrue(eventually(10) {
+                val state = ProbeResultController.gateState(org)
+                state.byteUnits < ProbeResultController.idleGate.byteUnits && state.orgReads == ProbeResultController.idleGate.orgReads
+            }, "the read never got to its write: ${ProbeResultController.gateState(org)}")
+            repeat(20) {
+                Thread.sleep(100)
+                val state = ProbeResultController.gateState(org)
+                assertTrue(state.byteUnits < ProbeResultController.idleGate.byteUnits, "the bytes left the gate before the client had them: $state")
+                assertEquals(ProbeResultController.idleGate.orgReads, state.orgReads, "a waiting write holds a place: $state")
             }
-            assertEquals(ProbeResultController.idleGate, ProbeResultController.gateState(fx.owner.orgId))
-            socket.soTimeout = 5000
-            assertTrue(socket.getInputStream().readNBytes(15).toString(Charsets.ISO_8859_1).startsWith("HTTP/1.1 200"))
+            // A client that reads steadily, if slowly, gets every byte.
+            val input = socket.getInputStream().buffered()
+            val head = StringBuilder()
+            while (!head.endsWith("\r\n\r\n")) head.append(input.read().toChar())
+            assertTrue(head.startsWith("HTTP/1.1 200"), head.toString())
+            val length = Regex("(?i)content-length: (\\d+)").find(head)!!.groupValues[1].toLong()
+            assertEquals(BIG_BODY, length)
+            var received = 0L
+            val buffer = ByteArray(256 * 1024)
+            while (received < length) {
+                val n = input.read(buffer)
+                if (n < 0) break
+                received += n
+                Thread.sleep(2)
+            }
+            assertEquals(length, received, "the body was cut short")
+        }
+        assertTrue(eventually(5) { ProbeResultController.gateState(org) == ProbeResultController.idleGate })
+    }
+
+    @Test
+    fun `a download its client never takes is cut off at the bound, and its bytes come back`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val org = fx.owner.orgId
+        val path = bigStep(fx)
+        ProbeResultController.bodyWriteTimeout = 2.seconds
+        try {
+            java.net.Socket("localhost", serverPort).use { socket ->
+                silentGet(socket, address, path, fx.readKey)
+                assertTrue(eventually(10) { ProbeResultController.gateState(org).byteUnits < ProbeResultController.idleGate.byteUnits })
+                val held = System.nanoTime()
+                assertTrue(eventually(15) { ProbeResultController.gateState(org) == ProbeResultController.idleGate }, "the bytes never came back")
+                assertTrue(Duration.ofNanos(System.nanoTime() - held) >= Duration.ofMillis(1500), "released before the bound")
+                // The connection was closed under the client: it cannot read the whole body.
+                socket.soTimeout = 10_000
+                val got = runCatching { socket.getInputStream().readAllBytes().size.toLong() }.getOrDefault(0L)
+                assertTrue(got < BIG_BODY, "the whole body arrived after the bound: $got")
+            }
+        } finally {
+            ProbeResultController.bodyWriteTimeout = ProbeResultController.BODY_WRITE_TIMEOUT
         }
 
-        // An engine that keeps the write waiting is not waited on for ever:
-        // past the bound the call ends as one whose client went away.
+        // The bound itself, without a socket: a write that never ends is
+        // ended as one whose client went away.
         ProbeResultController.bodyWriteTimeout = 200.milliseconds
         try {
             val e = assertThrows<kotlinx.coroutines.CancellationException> {
-                runBlocking { ProbeResultController.writeBounded { CompletableDeferred<Unit>().await() } }
+                runBlocking {
+                    kotlinx.coroutines.withTimeout(10_000) {
+                        ProbeResultController.writeBounded { CompletableDeferred<Unit>().await() }
+                    }
+                }
             }
             assertTrue(dev.tracedown.gateway.util.isClientDisconnect(e), "a timed-out write reads as a client gone: $e")
         } finally {
@@ -3874,7 +3790,7 @@ class ApiKeyResourcesTest {
         }
     }
 
-    // ── Round two: validation is no oracle ──
+    // ── Validation judges only what its caller may know ──
 
     @Test
     fun `validation judges with no value its caller could not read`() {
@@ -3922,32 +3838,7 @@ class ApiKeyResourcesTest {
         }
     }
 
-    // ── Round two: idempotency holds when a call does not end cleanly ──
-
-    @Test
-    fun `a client that hangs up after the work leaves its key held`() {
-        val address = nextAddress()
-        val fx = fixtures(address)
-        hangupCalls.set(0)
-        hangupRelease = CompletableDeferred()
-        val impatient = client.newBuilder().callTimeout(Duration.ofMillis(800)).build()
-        val request = Request.Builder().url("http://localhost:$serverPort${PublicApi.V1}/test/hangup")
-            .post("{}".toRequestBody(jsonType))
-            .header("X-Forwarded-For", address).header("Authorization", "Bearer ${fx.writeKey}")
-            .header("Idempotency-Key", "hangup-1").build()
-        val hungUp = runCatching { impatient.newCall(request).execute().close() }
-        assertTrue(hungUp.isFailure, "the client was meant to give up")
-        val deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos()
-        while (hangupCalls.get() == 0 && System.nanoTime() < deadline) Thread.sleep(20)
-        assertEquals(1, hangupCalls.get())
-        // Whatever it did may have been done: the retry waits, it does not repeat.
-        Thread.sleep(300)
-        val (status, raw, _) = postIdempotent(address, "${PublicApi.V1}/test/hangup", fx.writeKey, "{}", "hangup-1")
-        assertEquals(409, status, raw)
-        assertEquals("idempotency_in_progress", errorOf(raw))
-        assertEquals(1, hangupCalls.get())
-        hangupRelease.complete(Unit)
-    }
+    // ── Idempotency when a call does not end cleanly ──
 
     @Test
     fun `an answer the engine fails to write is still the answer to a retry`() {
@@ -3964,50 +3855,463 @@ class ApiKeyResourcesTest {
         assertEquals(1, brokenWriteCalls.get(), "the work was not done twice")
     }
 
+    // ── What an idempotent request remembers ──
+
+    /** The Redis key an `Idempotency-Key` is held under for [apiKey]. */
+    private fun idempotencyStoreKey(address: String, apiKey: String, idempotencyKey: String): String {
+        val keyId = obj(send(address, "GET", "${PublicApi.V1}/key", apiKey).second).str("id")
+        val digest = java.security.MessageDigest.getInstance("SHA-256").digest(idempotencyKey.toByteArray())
+            .joinToString("") { "%02x".format(it) }
+        return "idempotency:$keyId:$digest"
+    }
+
+    private val redisCommands by lazy { dev.tracedown.common.redis.RedisFactory.createConnection(TestRedis.url).sync() }
+
     @Test
-    fun `what an idempotent request remembers is bounded`() {
+    fun `a success is replayed, a refusal is not remembered, and the key cannot name another request`() {
         val address = nextAddress()
         val fx = fixtures(address)
+        val name = "Idempotent ${UUID.randomUUID().toString().take(6)}"
+        val path = "${PublicApi.V1}/workspaces"
 
-        // A path no route takes is not remembered: the key is still free.
-        val (missing, missingRaw, _) = postIdempotent(address, "${PublicApi.V1}/no-such-thing", fx.writeKey, "{}", "bound-1")
-        assertEquals(404, missing, missingRaw)
-        val ws = postIdempotent(address, "${PublicApi.V1}/workspaces", fx.writeKey, """{"name":"Bound WS"}""", "bound-1")
-        assertEquals(200, ws.first, ws.second)
-        assertNull(ws.third)
+        val first = postIdempotent(address, path, fx.writeKey, """{"name":"$name"}""", "ws-1")
+        assertEquals(200, first.first, first.second)
+        assertNull(first.third)
+        // The body reached the handler after it was read for the fingerprint.
+        assertEquals(name, obj(first.second).str("name"))
+        val again = postIdempotent(address, path, fx.writeKey, """{"name":"$name"}""", "ws-1")
+        assertEquals(200, again.first, again.second)
+        assertEquals("true", again.third)
+        assertEquals(first.second, again.second)
+        assertEquals(1L, transaction {
+            dev.tracedown.common.models.Workspaces.selectAll().where { dev.tracedown.common.models.Workspaces.name eq name }.count()
+        })
+        // Kept a day.
+        val ttl = redisCommands.ttl(idempotencyStoreKey(address, fx.writeKey, "ws-1"))
+        assertTrue(ttl in (Idempotency.TTL_SECONDS - 60)..Idempotency.TTL_SECONDS, "ttl $ttl")
 
-        // An answer over 64 KiB is not kept: a repeat runs again.
-        bigCalls.set(0)
-        repeat(2) { postIdempotent(address, "${PublicApi.V1}/test/big", fx.writeKey, "{}", "big-1") }
-        assertEquals(2, bigCalls.get())
+        // The same key with a different request — body, or path.
+        val other = postIdempotent(address, path, fx.writeKey, """{"name":"$name 2"}""", "ws-1")
+        assertEquals(422, other.first, other.second)
+        assertEquals("idempotency_key_reused", errorOf(other.second))
+        assertEquals(422, postIdempotent(address, "${PublicApi.V1}/silences", fx.writeKey, """{"name":"$name"}""", "ws-1").first)
+
+        // Keys are the API key's own: another key may use the same one.
+        val secondKey = mintKey(fx.ownerSession, "write", address)
+        val elsewhere = postIdempotent(address, path, secondKey, """{"name":"$name b"}""", "ws-1")
+        assertEquals(200, elsewhere.first, elsewhere.second)
+        assertNull(elsewhere.third)
+
+        // A run asked for twice under one key is one run, with one handle.
+        val runPath = "${PublicApi.V1}/services/${fx.service}/run"
+        val runs = transaction { RunRequests.selectAll().where { RunRequests.serviceId eq fx.service }.count() }
+        val run1 = postIdempotent(address, runPath, fx.writeKey, "{}", "run-1")
+        val run2 = postIdempotent(address, runPath, fx.writeKey, "{}", "run-1")
+        assertEquals(202, run1.first, run1.second)
+        assertEquals("true", run2.third)
+        assertEquals(obj(run1.second).str("runId"), obj(run2.second).str("runId"))
+        assertEquals(runs + 1, transaction { RunRequests.selectAll().where { RunRequests.serviceId eq fx.service }.count() })
+
+        // A refusal did nothing: it is not remembered, and a repeat runs again.
+        val refused = postIdempotent(address, path, fx.writeKey, """{"name":""}""", "empty-name")
+        assertEquals(400, refused.first, refused.second)
+        val refusedAgain = postIdempotent(address, path, fx.writeKey, """{"name":""}""", "empty-name")
+        assertEquals(400, refusedAgain.first)
+        assertNull(refusedAgain.third)
+        assertNull(redisCommands.get(idempotencyStoreKey(address, fx.writeKey, "empty-name")))
+        // Neither is a method a path does not take.
+        val (wrongMethod, wrongRaw, _) = postIdempotent(address, "${PublicApi.V1}/services/${fx.service}/agents", fx.writeKey, "{}", "wrong-1")
+        assertEquals(405, wrongMethod, wrongRaw)
+        assertNull(redisCommands.get(idempotencyStoreKey(address, fx.writeKey, "wrong-1")))
+        // Nor a path no route takes.
+        assertEquals(404, postIdempotent(address, "${PublicApi.V1}/no-such-thing", fx.writeKey, "{}", "missing-1").first)
+        assertNull(redisCommands.get(idempotencyStoreKey(address, fx.writeKey, "missing-1")))
+
+        // Validation changes nothing and takes no key: never replayed.
+        repeat(2) {
+            val answer = postIdempotent(address, "${PublicApi.V1}/scripts/validate", fx.readKey, validateBody(SCRIPT), "v-1")
+            assertEquals(200, answer.first, answer.second)
+            assertNull(answer.third)
+        }
+
+        // A malformed key is refused, naming the header.
+        for (bad in listOf("", "x".repeat(129), "tab\there")) {
+            val (status, raw, _) = postIdempotent(address, path, fx.writeKey, """{"name":"$name bad"}""", bad)
+            assertEquals(400, status, "'$bad': $raw")
+            assertEquals("Idempotency-Key", obj(raw)["details"]!!.jsonObject.str("field"))
+        }
+        assertEquals(200, postIdempotent(address, path, fx.writeKey, """{"name":"$name max"}""", "k".repeat(128)).first)
 
         // Query order does not matter; the content type does.
         val bindings = "${PublicApi.V1}/webhooks/bindings"
         val body = """{"webhookId":"${fx.spareWebhook}"}"""
-        val first = postIdempotent(address, "$bindings?resourceType=service&resourceId=${fx.service}", fx.writeKey, body, "order-1")
+        val bound = postIdempotent(address, "$bindings?resourceType=service&resourceId=${fx.service}", fx.writeKey, body, "order-1")
         val reordered = postIdempotent(address, "$bindings?resourceId=${fx.service}&resourceType=service", fx.writeKey, body, "order-1")
-        assertEquals(first.first, reordered.first, reordered.second)
+        assertEquals(bound.first, reordered.first, reordered.second)
         assertEquals("true", reordered.third)
         val asText = Request.Builder().url("http://localhost:$serverPort$bindings?resourceType=service&resourceId=${fx.service}")
             .post(body.toRequestBody("text/plain".toMediaType()))
             .header("X-Forwarded-For", address).header("Authorization", "Bearer ${fx.writeKey}")
             .header("Idempotency-Key", "order-1").build()
         client.newCall(asText).execute().use { assertEquals(422, it.code) }
+    }
 
-        // An API key's allowance of remembered keys.
-        Idempotency.recordsPerKey = 2
+    @Test
+    fun `a server error is not remembered, and one in flight holds its key`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        flakyCalls.set(0)
+        val flaky = "${PublicApi.V1}/test/flaky"
+        assertEquals(500, postIdempotent(address, flaky, fx.writeKey, "{}", "flaky-1").first)
+        val second = postIdempotent(address, flaky, fx.writeKey, "{}", "flaky-1")
+        assertEquals(200, second.first, second.second)
+        assertNull(second.third, "a 5xx is not an answer to replay: the request runs again")
+        val third = postIdempotent(address, flaky, fx.writeKey, "{}", "flaky-1")
+        assertEquals("true", third.third)
+        assertEquals(second.second, third.second)
+        assertEquals(2, flakyCalls.get())
+
+        slowEntered = CompletableDeferred()
+        slowRelease = CompletableDeferred()
+        val slow = "${PublicApi.V1}/test/slow"
+        val inFlight = java.util.concurrent.CompletableFuture.supplyAsync { postIdempotent(address, slow, fx.writeKey, "{}", "slow-1") }
         try {
-            val key = mintKey(fx.ownerSession, "write", address)
-            postIdempotent(address, "${PublicApi.V1}/workspaces", key, """{"name":"Allowance 1"}""", "a-1")
-            postIdempotent(address, "${PublicApi.V1}/workspaces", key, """{"name":"Allowance 2"}""", "a-2")
-            val third = postIdempotent(address, "${PublicApi.V1}/workspaces", key, """{"name":"Allowance 3"}""", "a-3")
-            assertEquals(200, third.first, third.second)
-            val again = postIdempotent(address, "${PublicApi.V1}/workspaces", key, """{"name":"Allowance 3"}""", "a-3")
-            assertNull(again.third, "past the allowance a key is not remembered")
-            assertEquals("true", postIdempotent(address, "${PublicApi.V1}/workspaces", key, """{"name":"Allowance 1"}""", "a-1").third)
+            runBlocking { kotlinx.coroutines.withTimeout(10_000) { slowEntered.await() } }
+            val ttl = redisCommands.ttl(idempotencyStoreKey(address, fx.writeKey, "slow-1"))
+            assertTrue(ttl in 1..Idempotency.IN_FLIGHT_TTL_SECONDS, "in flight for at most its bound: $ttl")
+            val request = Request.Builder().url("http://localhost:$serverPort$slow").post("{}".toRequestBody(jsonType))
+                .header("X-Forwarded-For", address).header("Authorization", "Bearer ${fx.writeKey}")
+                .header("Idempotency-Key", "slow-1").build()
+            client.newCall(request).execute().use {
+                assertEquals(409, it.code)
+                assertEquals("idempotency_in_progress", errorOf(it.body.string()))
+                assertEquals("1", it.header("Retry-After"))
+            }
         } finally {
-            Idempotency.recordsPerKey = Idempotency.MAX_RECORDS_PER_KEY
+            slowRelease.complete(Unit)
         }
+        assertEquals(200, inFlight.get(10, java.util.concurrent.TimeUnit.SECONDS).first)
+        assertEquals("true", postIdempotent(address, slow, fx.writeKey, "{}", "slow-1").third)
+    }
+
+    @Test
+    fun `a client that hangs up after the work leaves an unknown outcome, never a second run`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        hangupCalls.set(0)
+        hangupRelease = CompletableDeferred()
+        val impatient = client.newBuilder().callTimeout(Duration.ofMillis(800)).build()
+        val request = Request.Builder().url("http://localhost:$serverPort${PublicApi.V1}/test/hangup")
+            .post("{}".toRequestBody(jsonType))
+            .header("X-Forwarded-For", address).header("Authorization", "Bearer ${fx.writeKey}")
+            .header("Idempotency-Key", "hangup-1").build()
+        assertTrue(runCatching { impatient.newCall(request).execute().close() }.isFailure, "the client was meant to give up")
+        assertTrue(eventually(5) { hangupCalls.get() == 1 })
+        val storeKey = idempotencyStoreKey(address, fx.writeKey, "hangup-1")
+        // Decided once the call is cut off: an unknown outcome, kept a day.
+        assertTrue(eventually(10) { redisCommands.get(storeKey)?.contains("\"unknown\"") == true }, "${redisCommands.get(storeKey)}")
+        assertTrue(redisCommands.ttl(storeKey) > Idempotency.IN_FLIGHT_TTL_SECONDS, "held past the in-flight bound")
+        val (status, raw, _) = postIdempotent(address, "${PublicApi.V1}/test/hangup", fx.writeKey, "{}", "hangup-1")
+        assertEquals(409, status, raw)
+        assertEquals("idempotency_outcome_unknown", errorOf(raw))
+        assertEquals(1, hangupCalls.get())
+        hangupRelease.complete(Unit)
+    }
+
+    @Test
+    fun `an answer too large to keep says so, and a repeat is not made`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        bigCalls.set(0)
+        val path = "${PublicApi.V1}/test/big"
+        val request = Request.Builder().url("http://localhost:$serverPort$path").post("{}".toRequestBody(jsonType))
+            .header("X-Forwarded-For", address).header("Authorization", "Bearer ${fx.writeKey}")
+            .header("Idempotency-Key", "big-1").build()
+        client.newCall(request).execute().use {
+            assertEquals(200, it.code)
+            assertEquals("not-kept", it.header("Idempotency-Status"))
+        }
+        val (status, raw, _) = postIdempotent(address, path, fx.writeKey, "{}", "big-1")
+        assertEquals(409, status, raw)
+        assertEquals("idempotency_outcome_unknown", errorOf(raw))
+        assertEquals(1, bigCalls.get())
+    }
+
+    @Test
+    fun `past the organization's budget a new key is refused before anything runs`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val path = "${PublicApi.V1}/workspaces"
+        Idempotency.orgBudgetBytes = 1
+        try {
+            val first = postIdempotent(address, path, fx.writeKey, """{"name":"Budget 1"}""", "b-1")
+            assertEquals(200, first.first, first.second)
+            val request = Request.Builder().url("http://localhost:$serverPort$path").post("""{"name":"Budget 2"}""".toRequestBody(jsonType))
+                .header("X-Forwarded-For", address).header("Authorization", "Bearer ${fx.writeKey}")
+                .header("Idempotency-Key", "b-2").build()
+            client.newCall(request).execute().use {
+                assertEquals(429, it.code)
+                assertEquals("idempotency_limit_reached", errorOf(it.body.string()))
+                assertTrue((it.header("Retry-After")?.toLong() ?: 0) > 0)
+            }
+            assertEquals(0L, transaction {
+                dev.tracedown.common.models.Workspaces.selectAll().where { dev.tracedown.common.models.Workspaces.name eq "Budget 2" }.count()
+            }, "refused before it ran")
+            // What was kept is still answered; a request with no key is not affected.
+            assertEquals("true", postIdempotent(address, path, fx.writeKey, """{"name":"Budget 1"}""", "b-1").third)
+            assertEquals(200, send(address, "POST", path, fx.writeKey, """{"name":"Budget 3"}""").first)
+        } finally {
+            Idempotency.orgBudgetBytes = Idempotency.DEFAULT_ORG_BUDGET_BYTES
+        }
+    }
+
+    @Test
+    fun `when the store does not answer, a request with a key is refused and does not run`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val name = "Unavailable ${UUID.randomUUID().toString().take(6)}"
+        Idempotency.init({ throw io.lettuce.core.RedisConnectionException("down") }, 1024 * 1024)
+        try {
+            val request = Request.Builder().url("http://localhost:$serverPort${PublicApi.V1}/workspaces")
+                .post("""{"name":"$name"}""".toRequestBody(jsonType))
+                .header("X-Forwarded-For", address).header("Authorization", "Bearer ${fx.writeKey}")
+                .header("Idempotency-Key", "down-1").build()
+            client.newCall(request).execute().use {
+                assertEquals(503, it.code)
+                assertEquals("idempotency_unavailable", errorOf(it.body.string()))
+                assertEquals("5", it.header("Retry-After"))
+            }
+            assertEquals(0L, transaction {
+                dev.tracedown.common.models.Workspaces.selectAll().where { dev.tracedown.common.models.Workspaces.name eq name }.count()
+            })
+        } finally {
+            Idempotency.init({ redisCommands }, 1024 * 1024)
+        }
+    }
+
+    @Test
+    fun `a body cache predicate a host registers makes another body readable twice`() = io.ktor.server.testing.testApplication {
+        dev.tracedown.gateway.util.RequestBodyCache.cacheAlso { it.request.local.uri == "/host/twice" }
+        try {
+            application {
+                dev.tracedown.gateway.util.RequestBodyCache.install(this, 1024)
+                routing {
+                    post("/host/twice") {
+                        val a = call.receiveText()
+                        val b = call.receiveText()
+                        call.respondText("$a|$b")
+                    }
+                    post("/host/once") {
+                        val a = call.receiveText()
+                        val b = runCatching { call.receiveText() }.getOrElse { "refused" }
+                        call.respondText("$a|$b")
+                    }
+                }
+            }
+            assertEquals("x|x", client.post("/host/twice") { setBody("x") }.bodyAsText())
+            assertEquals("x|refused", client.post("/host/once") { setBody("x") }.bodyAsText())
+        } finally {
+            dev.tracedown.gateway.util.RequestBodyCache.clearAll()
+        }
+    }
+
+    // ── Agent health ──
+
+    @Test
+    fun `agents say how they are doing, as the dashboard's roster does, and an unchecked one says unknown`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val tag = UUID.randomUUID().toString().take(6)
+        val checkedAt = Instant.now().truncatedTo(java.time.temporal.ChronoUnit.SECONDS)
+        val agents = mapOf("ok-$tag" to "success", "down-$tag" to "failure", "late-$tag" to "timeout", "new-$tag" to "success")
+        transaction {
+            for ((slug, status) in agents) {
+                val id = ProbeAgents.insert {
+                    it[ProbeAgents.slug] = slug
+                    it[label] = slug
+                    it[agentUri] = "https://$slug.example.com:8443"
+                    it[publicKey] = "unused"
+                    it[isActive] = true
+                    it[lastPing] = checkedAt
+                    it[lastStatus] = status
+                    it[lastPingDelayMs] = 0
+                    it[lastPongDeltaMs] = 0
+                    it[createdAt] = Instant.now()
+                }[ProbeAgents.id]
+                // Every one but the new one has had a health round.
+                if (!slug.startsWith("new-")) {
+                    dev.tracedown.common.models.AgentHealthChecks.insert {
+                        it[dev.tracedown.common.models.AgentHealthChecks.id] = UUID.randomUUID()
+                        it[probeAgentId] = id
+                        it[challengeId] = UUID.randomUUID().toString()
+                        it[challengedAt] = checkedAt
+                        it[result] = if (status == "success") "pass" else "fail"
+                        it[dev.tracedown.common.models.AgentHealthChecks.createdAt] = checkedAt
+                    }
+                }
+            }
+        }
+        try {
+            val listed = Json.parseToJsonElement(send(address, "GET", "${PublicApi.V1}/agents", fx.readKey).second).jsonArray
+                .map { it.jsonObject }.associateBy { it.str("slug") }
+            assertEquals("healthy", listed.getValue("ok-$tag").str("status"))
+            assertEquals("down", listed.getValue("down-$tag").str("status"))
+            assertEquals("down", listed.getValue("late-$tag").str("status"))
+            assertEquals(checkedAt, Instant.parse(listed.getValue("ok-$tag").str("lastCheckAt")))
+            // Registered, never checked: its last ping is its registration.
+            assertEquals("unknown", listed.getValue("new-$tag").str("status"))
+            assertTrue(listed.getValue("new-$tag")["lastCheckAt"] is JsonNull)
+            // The dashboard's roster, for the checked agents: the same verdicts.
+            val roster = obj(send(address, "GET", "/api/v1/agents/health", fx.ownerSession).second)["statuses"]!!.jsonArray
+                .map { it.jsonObject }.filter { it.str("agentSlug").endsWith(tag) && !it.str("agentSlug").startsWith("new-") }
+            assertEquals(3, roster.size)
+            for (entry in roster) {
+                assertEquals(
+                    dev.tracedown.gateway.controllers.agents.AgentDirectory.health(entry.str("status"), entry.str("degraded").toBoolean()),
+                    listed.getValue(entry.str("agentSlug")).str("status"),
+                )
+            }
+        } finally {
+            transaction {
+                val ids = ProbeAgents.select(ProbeAgents.id).where { ProbeAgents.slug inList agents.keys }.map { it[ProbeAgents.id] }
+                dev.tracedown.common.models.AgentHealthChecks.deleteWhere { probeAgentId inList ids }
+                ProbeAgents.deleteWhere { ProbeAgents.slug inList agents.keys }
+            }
+        }
+        assertEquals("degraded", dev.tracedown.gateway.controllers.agents.AgentDirectory.health("success", true))
+        assertEquals("unknown", dev.tracedown.gateway.controllers.agents.AgentDirectory.health(null, false))
+    }
+
+    // ── Run handles: delivery, bounds, retention, siblings ──
+
+    @Test
+    fun `a run no scheduler heard is settled at once, and one whose publish failed is not`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        stopListeningForRuns()
+        try {
+            // Redis must have seen the subscriber go before it can say nobody listens.
+            assertTrue(eventually(5) {
+                redisCommands.pubsubNumsub(dev.tracedown.common.runs.RunTrigger.RUN_CHANNEL).values.sum() == 0L
+            })
+            val (status, raw) = send(address, "POST", "${PublicApi.V1}/services/${fx.service}/run", fx.writeKey)
+            assertEquals(202, status, raw)
+            val run = obj(send(address, "GET", "${PublicApi.V1}/services/${fx.service}/runs/${obj(raw).str("runId")}", fx.readKey).second)
+            assertEquals("skipped", run.str("state"), run.toString())
+            assertEquals("run_not_delivered", run.str("reason"))
+            assertTrue(run["result"] is JsonNull, run.toString())
+        } finally {
+            listenForRuns()
+        }
+        // Redis did not answer: whether anyone heard is not known, and the handle waits.
+        dev.tracedown.gateway.util.ScheduleNudge.init { throw io.lettuce.core.RedisConnectionException("down") }
+        try {
+            val runId = ServiceController.triggerRun(fx.owner.orgId, fx.service, fx.owner.userId).runId
+            assertEquals("pending", RunRequestController.status(fx.owner.orgId, fx.service, runId, fx.owner.userId).state)
+        } finally {
+            dev.tracedown.gateway.util.ScheduleNudge.init { redisCommands }
+        }
+    }
+
+    @Test
+    fun `a run is pending up to its bound and expired past it, and is kept as long as the result window`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val o = fx.owner
+        val runId = ServiceController.triggerRun(o.orgId, fx.service, o.userId).runId
+        val requestedAt = transaction { RunRequests.selectAll().where { RunRequests.id eq runId }.single()[RunRequests.requestedAt] }
+        val bound = Duration.ofSeconds(dev.tracedown.common.runs.RunBounds.runExpirySeconds(30_000))
+        assertEquals("pending", RunRequestController.status(o.orgId, fx.service, runId, o.userId, requestedAt.plus(bound)).state)
+        assertEquals("expired", RunRequestController.status(o.orgId, fx.service, runId, o.userId, requestedAt.plus(bound).plusSeconds(1)).state)
+
+        // Kept as long as the organization's result window — the global one here.
+        transaction {
+            assertEquals(
+                requestedAt.plus(90, java.time.temporal.ChronoUnit.DAYS),
+                RunRequests.selectAll().where { RunRequests.id eq runId }.single()[RunRequests.purgeAfter],
+            )
+        }
+        // An organization whose results are kept for ever keeps its handles for ever.
+        val previous = dev.tracedown.common.config.PlatformDefaults.retentionConfig
+        dev.tracedown.common.config.PlatformDefaults.retentionConfig = object : dev.tracedown.common.config.RetentionConfig by previous {
+            override fun resultRetentionDays(orgId: UUID): Int? = if (orgId == o.orgId) -1 else previous.resultRetentionDays(orgId)
+        }
+        try {
+            val forever = ServiceController.triggerRun(o.orgId, fx.service, o.userId).runId
+            transaction { assertNull(RunRequests.selectAll().where { RunRequests.id eq forever }.single()[RunRequests.purgeAfter]) }
+        } finally {
+            dev.tracedown.common.config.PlatformDefaults.retentionConfig = previous
+        }
+
+        // The worst result is the run's, over the whole order.
+        val order = listOf("failure", "timeout", "error", "skipped", "success")
+        for (i in order.indices) {
+            assertEquals(order[i], RunRequestController.worstOf(order.drop(i).shuffled()), "worst of ${order.drop(i)}")
+        }
+        assertEquals("brand-new", RunRequestController.worstOf(listOf("failure", "brand-new")), "an unknown status counts as the worst")
+        assertNull(RunRequestController.worstOf(emptyList()))
+    }
+
+    @Test
+    fun `a run whose own row is missing is told by its siblings`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val runId = ServiceController.triggerRun(fx.owner.orgId, fx.service, fx.owner.userId).runId
+        transaction { RunRequests.update({ RunRequests.id eq runId }) { it[expectedResults] = 2 } }
+        val sibling = insertResult(fx, UUID.randomUUID(), "success", trigger = "manual", runId = runId)
+        val run = obj(send(address, "GET", "${PublicApi.V1}/services/${fx.service}/runs/$runId", fx.readKey).second)
+        assertEquals(listOf(sibling.toString()), run["results"]!!.jsonArray.map { it.jsonObject.str("id") })
+        assertEquals(sibling.toString(), run["result"]!!.jsonObject.str("id"))
+    }
+
+    @Test
+    fun `a download is never kept on the way`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        for (method in listOf("GET", "HEAD")) {
+            val request = Request.Builder().url("http://localhost:$serverPort${bodyPath(fx, fx.step)}/raw")
+                .method(method, null).header("X-Forwarded-For", address).header("Authorization", "Bearer ${fx.readKey}").build()
+            client.newCall(request).execute().use {
+                assertEquals(200, it.code, method)
+                assertEquals("private, no-store", it.header("Cache-Control"), method)
+            }
+        }
+    }
+
+    // ── Validation and verified domains ──
+
+    @Test
+    fun `verified-domain coverage is judged only for those who may read the domains, and only over hosts known`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val o = fx.owner
+        val reader = newMember(o.orgId)
+        ResourceAccessController.upsert(o.orgId, "service", fx.service, UpsertAccessRequest("user", reader.userId.toString(), 1), o.userId)
+        val readerKey = mintKey(login(reader, address), "write", address)
+        ServiceController.createVariable(o.orgId, fx.service, CreateVariableRequest("BASE", "https://example.org", "secret"), o.userId)
+        val path = "${PublicApi.V1}/scripts/validate"
+        val concealed = (1..4).joinToString("\n") { "get(\"\$s.BASE/$it\").expect(status: 200)" }
+        ServiceController.init(trustedDomainMode = false)
+        try {
+            // A reader of the service, with no domains read: coverage not judged, so not complete.
+            val asReader = obj(send(address, "POST", path, readerKey, validateBody(SCRIPT, fx.service)).second)
+            assertEquals("false", asReader.str("domainsChecked"), asReader.toString())
+            assertEquals("false", asReader.str("complete"), asReader.toString())
+            // Hosts it cannot see are not held against the script: nothing made up.
+            val hidden = obj(send(address, "POST", path, readerKey, validateBody(concealed, fx.service)).second)
+            assertEquals("true", hidden.str("valid"), hidden.toString())
+            assertEquals("false", hidden.str("complete"))
+            assertFalse(hidden["errors"]!!.jsonArray.any { it.jsonObject.str("code").startsWith("unverified_domain") }, hidden.toString())
+            // The owner sees it all: judged, and complete.
+            val asOwner = obj(send(address, "POST", path, fx.writeKey, validateBody(SCRIPT, fx.service)).second)
+            assertEquals("true", asOwner.str("domainsChecked"))
+            assertEquals("true", asOwner.str("complete"))
+        } finally {
+            ServiceController.init(trustedDomainMode = true)
+        }
+        // With verified domains not asked for, there is nothing more to judge.
+        val trusted = obj(send(address, "POST", path, fx.writeKey, validateBody(SCRIPT, fx.service)).second)
+        assertEquals("true", trusted.str("complete"))
     }
 
     // ── The description ──

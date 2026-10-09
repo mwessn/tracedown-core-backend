@@ -199,8 +199,15 @@ class PublicApiContractTest {
                 // The earliest block's word stands for a field two of them
                 // name; a later block can add the field's values to it.
                 val earlier = shapes[key]?.fields ?: emptyMap()
+                // Values accumulate: a later block may pin a set the earlier did
+                // not, or widen one (append-only, as everything here).
                 val merged = fields + earlier.mapValues { (name, f) ->
-                    if (f.values == null && fields[name]?.values != null) f.copy(values = fields[name]!!.values) else f
+                    val later = fields[name]?.values
+                    when {
+                        later == null -> f
+                        f.values == null -> f.copy(values = later)
+                        else -> f.copy(values = (f.values + later).distinct())
+                    }
                 }
                 shapes[key] = Shape(key, merged)
             }
@@ -217,7 +224,10 @@ class PublicApiContractTest {
             val (method, path) = route.split(' ', limit = 2)
             val operation = PublicApiOperations.find(HttpMethod.parse(method), path.removePrefix(PublicApi.V1))
                 ?: return@map route
-            val query = operation.query.joinToString(" ", "[", "]") { if (it.required) "${it.name}!" else it.name }
+            // `name!` when required, `name(a|b)` when held to a set of values.
+            val query = operation.query.joinToString(" ", "[", "]") { q ->
+                (if (q.required) "${q.name}!" else q.name) + (q.values?.joinToString("|", "(", ")") ?: "")
+            }
             fun typeOf(type: KType?) = type?.toString()?.replace("dev.tracedown.", "") ?: "-"
             "$route ${operation.operationId} ${operation.status.value} $query -> ${typeOf(operation.request)} / ${typeOf(operation.response)}"
         }
@@ -267,20 +277,34 @@ class PublicApiContractTest {
         }
 
         /** A route line taken apart: everything but the query parameters, and the parameters by name. */
-        private data class RouteLine(val head: String, val tail: String, val parameters: Map<String, Boolean>) {
-            /** Whether this line keeps every promise of [was]. */
+        /** One query parameter of a route line: whether it is required, and the values it takes when pinned. */
+        private data class Param(val required: Boolean, val values: Set<String>?)
+
+        private data class RouteLine(val head: String, val tail: String, val parameters: Map<String, Param>) {
+            /**
+             * Whether this line keeps every promise of [was]: the same
+             * parameters, none newly required, and every value [was] pinned
+             * still taken (a parameter may take more).
+             */
             fun keeps(was: RouteLine): Boolean =
                 head == was.head && tail == was.tail &&
-                    was.parameters.all { (name, required) -> parameters[name] == required } &&
-                    parameters.filterKeys { it !in was.parameters }.values.none { it }
+                    was.parameters.all { (name, p) ->
+                        val now = parameters[name]
+                        now != null && now.required == p.required &&
+                            (p.values == null || (now.values != null && now.values.containsAll(p.values)))
+                    } &&
+                    parameters.filterKeys { it !in was.parameters }.values.none { it.required }
         }
 
         private fun parseRouteLine(line: String): RouteLine {
             val open = line.indexOf(" [")
             val close = line.indexOf("] ", open)
             if (open < 0 || close < 0) return RouteLine(line, "", emptyMap())
-            val parameters = line.substring(open + 2, close).split(' ').filter { it.isNotBlank() }
-                .associate { it.removeSuffix("!") to it.endsWith("!") }
+            val parameters = line.substring(open + 2, close).split(' ').filter { it.isNotBlank() }.associate { token ->
+                val values = token.substringAfter('(', "").takeIf { it.isNotEmpty() }?.removeSuffix(")")?.split('|')?.toSet()
+                val name = token.substringBefore('(')
+                name.removeSuffix("!") to Param(name.endsWith("!"), values)
+            }
             return RouteLine(line.substring(0, open), line.substring(close + 1), parameters)
         }
 
@@ -479,7 +503,11 @@ class PublicApiContractTest {
         val baseline = mapOf("A" to Shape("A", mapOf("s" to Shape.Field("kotlin.String", false, listOf("a", "b")))))
         assertEquals(emptyList<String>(), breaks(baseline, mapOf("A" to Shape("A", mapOf("s" to Shape.Field("kotlin.String", false, listOf("a", "b", "c"))))), emptySet()))
         assertTrue(breaks(baseline, mapOf("A" to Shape("A", mapOf("s" to Shape.Field("kotlin.String", false, listOf("a"))))), emptySet()).single().contains("lost values"))
-        val text = "# Entry points\nA = A\n\nA\n  s: kotlin.String\n\nA\n  s: kotlin.String enum [a, b]\n"
-        assertEquals(listOf("a", "b"), parseShapes(text).getValue("A").fields.getValue("s").values)
+        val text = "# Entry points\nA = A\n\nA\n  s: kotlin.String\n\nA\n  s: kotlin.String enum [a, b]\n\nA\n  s: kotlin.String enum [a, b, c]\n"
+        assertEquals(listOf("a", "b", "c"), parseShapes(text).getValue("A").fields.getValue("s").values, "a widened set is pinned whole")
+        // A query parameter's values: more is fine, fewer is a break.
+        val line = "GET /api/public/v1/things listThings 200 [kind(a|b) page] -> - / Page<Thing>"
+        assertEquals(emptyList<String>(), routeChanges(listOf(line), listOf(line.replace("kind(a|b)", "kind(a|b|c)"))))
+        assertEquals(listOf(line), routeChanges(listOf(line), listOf(line.replace("kind(a|b)", "kind(a)"))))
     }
 }

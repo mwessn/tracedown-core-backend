@@ -19,8 +19,6 @@ object RunRequests : Table("run_requests") {
     val requestedAt = timestamp("requested_at")
     /** `pending`, `done` or `skipped` — see [RunState]. `expired` is never stored. */
     val state = varchar("state", 8).default(RunState.PENDING)
-    /** The result that settled the request; the same id as the request. */
-    val resultId = javaUUID("result_id").nullable()
     /** How many results the run publishes (more than one on several agents at once); null until the first is in. */
     val expectedResults = short("expected_results").nullable()
     /** Why a request settled without a result (`run_not_delivered`); null otherwise. */
@@ -47,10 +45,14 @@ object RunState {
      */
     const val SETTLED_EVENT = "run_request.settled"
 
-    /** How bad each result status is, worst first: a run's status is its worst result's. */
-    val SEVERITY = listOf("failure", "timeout", "error", "success", "skipped")
+    /**
+     * How bad each result status is, worst first: a run's status is its worst
+     * result's. A skipped result (an agent that did not run it) is worse than
+     * a success — the run did not happen everywhere it was meant to.
+     */
+    val SEVERITY = listOf("failure", "timeout", "error", "skipped", "success")
 
-    /** The worst of [statuses], by [SEVERITY]. */
+    /** The worst of [statuses] by [SEVERITY] — a status it does not know counts as the worst; null for none. */
     fun worst(statuses: Collection<String>): String? =
-        statuses.minByOrNull { SEVERITY.indexOf(it).let { i -> if (i < 0) 0 else i } }
+        statuses.minByOrNull { SEVERITY.indexOf(it).let { i -> if (i < 0) -1 else i } }
 }

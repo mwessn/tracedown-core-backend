@@ -51,7 +51,7 @@ object RunTrigger {
     const val MANUAL = "manual"
 
     /** Every value `probe_results.trigger` takes. */
-    val TRIGGERS = setOf(SCHEDULE, MANUAL)
+    val TRIGGERS: Set<String> = linkedSetOf(SCHEDULE, MANUAL)
 
     /**
      * Skip reasons that only a run somebody asked for is recorded with: the

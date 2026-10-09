@@ -115,6 +115,9 @@ data class SystemLimitsConfig(
     companion object {
         const val DEFAULT_MAX_API_KEYS_PER_USER = 20
         const val DEFAULT_PROBE_TIMEOUT_MS = 30_000
+
+        /** A configured number that counts only when above 0: unset, empty, 0 and negatives all read as unset. */
+        fun positive(raw: String?): Long? = raw?.trim()?.toLongOrNull()?.takeIf { it > 0 }
     }
 }
 
@@ -214,10 +217,11 @@ data class AppConfig(
                         ?: VariableLimits.DEFAULT_MAX_PER_RESOURCE,
                     maxApiKeysPerUser = config.propertyOrNull("systemLimits.maxApiKeysPerUser")?.getString()?.toInt()
                         ?: SystemLimitsConfig.DEFAULT_MAX_API_KEYS_PER_USER,
-                    runRequestExpirySeconds = config.propertyOrNull("systemLimits.runRequestExpirySeconds")
-                        ?.getString()?.toLongOrNull()?.takeIf { it > 0 },
-                    probeDefaultTimeoutMs = config.propertyOrNull("probe.defaultTimeoutMs")
-                        ?.getString()?.toIntOrNull()?.takeIf { it > 0 }
+                    runRequestExpirySeconds = SystemLimitsConfig.positive(
+                        config.propertyOrNull("systemLimits.runRequestExpirySeconds")?.getString(),
+                    ),
+                    probeDefaultTimeoutMs = SystemLimitsConfig.positive(config.propertyOrNull("probe.defaultTimeoutMs")?.getString())
+                        ?.coerceAtMost(Int.MAX_VALUE.toLong())?.toInt()
                         ?: SystemLimitsConfig.DEFAULT_PROBE_TIMEOUT_MS,
                 ),
                 maxRequestBodyBytes = config.propertyOrNull("requestBody.maxBytes")

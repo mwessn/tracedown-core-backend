@@ -25,6 +25,11 @@ import java.util.UUID
  */
 object SystemAlertController {
 
+    /** The public list's `state`: the banners' alerts, or every episode. */
+    const val ACTIVE = "active"
+    const val ALL = "all"
+    val STATES = listOf(ACTIVE, ALL)
+
     /**
      * Banner alerts: latest undismissed episode PER TYPE. Concurrent
      * conditions of one kind (e.g. two degraded agents) collapse into the

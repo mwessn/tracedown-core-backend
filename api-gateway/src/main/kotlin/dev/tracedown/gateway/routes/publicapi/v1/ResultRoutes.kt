@@ -34,9 +34,9 @@ fun Route.resultRoutes() {
         val filter = ProbeResultController.ResultFilter(
             since = since,
             until = until,
-            statuses = call.valuesQuery("status", RESULT_STATUSES),
+            statuses = call.valuesQuery("status", ProbeResultController.STATUSES.toSet()),
             trigger = call.choiceQuery("trigger", RunTrigger.TRIGGERS),
-            ascending = call.choiceQuery("order", ORDERS) == "asc",
+            ascending = call.choiceQuery("order", ProbeResultController.ORDERS.toSet()) == "asc",
         )
         call.respond(ProbeResultController.list(caller.orgId, serviceId, caller.userId, publicPaging(call), filter))
     }
@@ -79,7 +79,9 @@ fun Route.resultRoutes() {
         val stepId = call.pathUuid("stepId")
         // Answered from inside the read: the body is held, encoded and sent
         // under the same bound on memory (see readStepBody).
-        ProbeResultController.respondStepBody(call, caller.orgId, serviceId, resultId, stepId, caller.userId)
+        ProbeResultController.respondStepBody(
+            call, caller.orgId, serviceId, resultId, stepId, caller.userId, headOnly = PublicApi.isHead(call),
+        )
     }
 
     /**
@@ -100,8 +102,3 @@ fun Route.resultRoutes() {
         )
     }
 }
-
-/** The values `probe_results.status` takes. */
-private val RESULT_STATUSES = setOf("success", "failure", "timeout", "error", "skipped")
-
-private val ORDERS = setOf("asc", "desc")

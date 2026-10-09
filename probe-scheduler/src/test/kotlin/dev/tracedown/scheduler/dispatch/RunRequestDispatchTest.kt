@@ -78,17 +78,26 @@ class RunRequestDispatchTest {
     }
 
     /** Answers every request with one result per agent in [agents]; [hold] keeps it waiting first. */
-    private class Backend(private val agents: Int = 1, val hold: CompletableDeferred<Unit>? = null) : ProbeExecutionBackend {
+    private class Backend(
+        private val agents: Int = 1,
+        val hold: CompletableDeferred<Unit>? = null,
+        /** Executions (by index) that produce no result: the agent did not answer. */
+        private val failing: Set<Int> = emptySet(),
+    ) : ProbeExecutionBackend {
         val requests = CopyOnWriteArrayList<ProbeExecutionBackend.Request>()
 
         override suspend fun execute(request: ProbeExecutionBackend.Request): List<ProbeExecutionBackend.Execution> {
             requests.add(request)
             hold?.await()
-            return (1..agents).map {
-                ProbeExecutionBackend.Execution(
-                    agentId = null,
-                    result = buildJsonObject { put("outcome", "success"); put("elapsedMs", 5) },
-                )
+            return (0 until agents).map { i ->
+                if (i in failing) {
+                    ProbeExecutionBackend.Execution(agentId = null, result = null, failureReason = "agent_unreachable")
+                } else {
+                    ProbeExecutionBackend.Execution(
+                        agentId = null,
+                        result = buildJsonObject { put("outcome", "success"); put("elapsedMs", 5) },
+                    )
+                }
             }
         }
     }
@@ -246,6 +255,18 @@ class RunRequestDispatchTest {
     }
 
     @Test
+    fun `an agent of a run that produced nothing is a skipped result of the run`() {
+        val serviceId = seedService(probeMode = "simultaneous")
+        val runId = UUID.randomUUID()
+        val queued = run(Backend(agents = 3, failing = setOf(1)), 3, DispatchItem(serviceId, manual = true, runId = runId))
+        assertEquals(3, queued.size)
+        assertTrue(queued.all { it.str(RunTrigger.ENVELOPE_RUN_ID) == runId.toString() && it.str(RunTrigger.ENVELOPE_RUN_SIZE) == "3" })
+        val skipped = queued.single { it["rawResult"]!!.jsonObject.str("outcome") == "skipped" }
+        assertEquals("agent_unreachable", skipped["rawResult"]!!.jsonObject.str("reason"))
+        assertEquals(1, queued.count { it.str("resultId") == runId.toString() })
+    }
+
+    @Test
     fun `a run that is not made is answered under its id, where a scheduled tick leaves nothing`() {
         val inactive = seedService(active = false)
         val runId = UUID.randomUUID()
@@ -301,7 +322,7 @@ class RunRequestDispatchTest {
     @Test
     fun `a run that has to wait for the running one is filed under its id when it runs`() {
         val serviceId = seedService(queuePolicy = "enqueue_once")
-        redisSync.set("probe_active:$serviceId", "someone-else")
+        redisSync.set("probe_active:$serviceId", "holder")
         val runId = UUID.randomUUID()
         val other = UUID.randomUUID()
         try {
@@ -309,9 +330,16 @@ class RunRequestDispatchTest {
             assertEquals(QueuePolicyManager.AcquireResult.ENQUEUED, acquired.result)
             // A second run cannot also be the one that follows.
             assertEquals(QueuePolicyManager.AcquireResult.SKIPPED, queuePolicy.tryAcquire(serviceId, "enqueue_once", 30_000, other).result)
-            // The holder takes the pending run's id with it.
-            assertEquals(runId, queuePolicy.takePendingRun(serviceId))
-            assertEquals(null, queuePolicy.takePendingRun(serviceId), "handed to one dispatch only")
+            // The holder's release hands the pending run's id over, in the same step.
+            assertEquals(QueuePolicyManager.Released(true, runId), queuePolicy.releaseWithPending(serviceId, "holder"))
+            assertEquals(null, redisSync.get("probe_pending_run:$serviceId"), "no id left behind")
+            // A pending run with no id is reported as one.
+            redisSync.set("probe_active:$serviceId", "holder")
+            assertEquals(QueuePolicyManager.AcquireResult.ENQUEUED, queuePolicy.tryAcquire(serviceId, "enqueue_once", 30_000).result)
+            assertEquals(QueuePolicyManager.Released(true, null), queuePolicy.releaseWithPending(serviceId, "holder"))
+            // Somebody else's lock is not released, and hands nothing over.
+            redisSync.set("probe_active:$serviceId", "holder")
+            assertEquals(QueuePolicyManager.Released(false, null), queuePolicy.releaseWithPending(serviceId, "not-the-holder"))
         } finally {
             redisSync.del("probe_active:$serviceId", "probe_pending:$serviceId", "probe_pending_run:$serviceId")
         }

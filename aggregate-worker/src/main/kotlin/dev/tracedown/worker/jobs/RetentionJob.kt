@@ -124,8 +124,15 @@ class RetentionJob(
         // (`purge_after`, stamped by the gateway from the window that applied
         // when it was made), so it goes on that date whatever the job thinks
         // of the windows now.
-        val runRequests = purgeRunRequests(clock())
-        if (runRequests > 0) log.info("Retention: deleted {} run requests past their purge date", runRequests)
+        // On its own: a failure here must not cost the tick its result pass.
+        try {
+            val runRequests = purgeRunRequests(clock())
+            if (runRequests > 0) log.info("Retention: deleted {} run requests past their purge date", runRequests)
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            log.warn("Retention: the run request pass failed, carrying on with results: {}", e.message)
+        }
 
         if (defaultRetentionDays < 0 && defaultBodyRetentionDays < 0) {
             log.debug(

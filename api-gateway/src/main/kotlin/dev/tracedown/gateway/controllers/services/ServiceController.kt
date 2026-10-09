@@ -175,8 +175,9 @@ object ServiceController {
             RunRequestController.record(runId, serviceId, orgId, userId, requestedAt)
             AuditService.log(orgId, userId, "run.service", "service", serviceId.toString(), entityDisplayName = svcRow[Services.name])
         }
-        // No scheduler heard it — none is running, or Redis is away: nothing
-        // will ever run it, so its handle says so now instead of in ten minutes.
+        // Redis says no scheduler heard it: nothing will ever run it, so its
+        // handle says so now. Not knowing (Redis did not answer) is not that —
+        // the handle waits out its bound.
         if (ScheduleNudge.trigger(serviceId, runId) == 0L) RunRequestController.settleUndelivered(runId)
         return RunTicket(runId, requestedAt)
     }
@@ -1096,7 +1097,7 @@ object ServiceController {
      * What a save of [script] would make of it, without saving it: the Lace
      * validator's findings, then every refusal the save-time policies would
      * make — through the functions a save uses ([blockedTargets],
-     * [domainEvaluation], [domainRefusals]) and, with [serviceId], the very
+     * [DomainPolicy], [domainRefusals]) and, with [serviceId], the very
      * variables a save and a dispatch resolve ([resolveScopedVarsForPolicy]),
      * so this cannot pass what a save refuses or refuse what it accepts. Read
      * access to the service is all it takes, and it writes nothing.
@@ -1108,10 +1109,11 @@ object ServiceController {
      * for a caller with write on the service (who may save the script, and so
      * learn the same from the save); for a reader, a call whose host needs one
      * is listed as unresolved and judged by neither policy. Without
-     * [serviceId] there are no variables at all, and verified-domain coverage
-     * is judged only for a caller who may read the organization's domains
-     * (`domainsChecked` says whether it was). Every target is named as the
-     * script writes it.
+     * [serviceId] there are no variables at all. Verified-domain coverage is
+     * judged only for a caller who may read the organization's domains
+     * (`domainsChecked` says whether it was), and only over the calls whose
+     * hosts are known. `complete` says whether the verdict is a save's.
+     * Every target is named as the script writes it.
      */
     fun validate(orgId: UUID, userId: UUID, script: String, serviceId: UUID?): ScriptValidation {
         // Parsing is pure and can be slow — off the transaction, as on a save.
@@ -1133,19 +1135,17 @@ object ServiceController {
                 val resolved = resolveScopedVarsForPolicy(script, serviceId)
                 allValues = canWriteResource(cached, "service", ctx.serviceId, listOf("project::${ctx.projectId}", "workspace::${ctx.workspaceId}"))
                 vars = if (allValues) resolved else PolicyVars(resolved.values - resolved.concealed, emptySet())
-                // The service's own coverage is shown to its readers already
-                // (its detail lists the hosts no verified domain covers).
-                judgeDomains = true
             } else {
                 // 403 not_org_member when the membership is gone.
                 requireCachedPermissions(orgId, userId)
                 schedule = null
                 vars = PolicyVars(emptyMap(), emptySet())
                 allValues = false
-                // Which hosts the organization has proven it owns is the
-                // domains section's to show.
-                judgeDomains = dev.tracedown.common.auth.resolveOrgPermissions(orgId, userId)?.domains?.canRead() == true
             }
+            // Which hosts the organization has proven it owns is the domains
+            // section's to show — with a service or without one: judging a
+            // host against them would answer the question for anyone.
+            judgeDomains = dev.tracedown.common.auth.resolveOrgPermissions(orgId, userId)?.domains?.canRead() == true
 
             val urls = dev.tracedown.common.net.ProbeTargetPolicy.targetUrls(script)
             // A host still assembled from a variable after substitution: one
@@ -1155,7 +1155,11 @@ object ServiceController {
                 '$' in url && dev.tracedown.common.net.ProbeTargetPolicy.hostOf(url) == null
             }.distinct()
             val blocked = blockedTargets(script, vars).filter { allValues || it.source !in unresolved }
-            val domain = if (judgeDomains) domainEvaluation(script, vars, orgId) else null
+            // Judged over the calls whose hosts are known here: a host that is
+            // not cannot be found unverified, and would only make a refusal up.
+            val domain = if (judgeDomains && !trustedDomainMode) {
+                DomainPolicy.evaluateCalls(urls.filter { it !in unresolved }, DomainPolicy.usesIncludes(script), vars.values, orgId, vars.concealed)
+            } else null
             val tooShort = schedule != null && intervalTooShort(schedule)
             val limited = domain != null && !domain.covered
 
@@ -1169,6 +1173,8 @@ object ServiceController {
                 valid = errors.isEmpty(),
                 errors = errors,
                 domainsChecked = domain != null,
+                // Everything a save would judge was judged here.
+                complete = unresolved.isEmpty() && (domain != null || trustedDomainMode),
                 targets = ScriptTargets(
                     blocked = blocked.map { BlockedTarget(source = it.source ?: "", reason = it.reason ?: "") },
                     unverified = domain?.unverifiedHosts ?: emptyList(),

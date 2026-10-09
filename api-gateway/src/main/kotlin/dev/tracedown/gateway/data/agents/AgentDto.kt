@@ -125,6 +125,6 @@ data class PublicAgentSummary(
     @JsonSchema.Enum("healthy", "degraded", "down", "unknown")
     @JsonSchema.Description("`healthy`, `degraded` (answering, but slower than its own usual), `down` (failing its health checks), or `unknown`.")
     val status: String = "unknown",
-    @JsonSchema.Description("When the agent's health was last checked.")
+    @JsonSchema.Description("When the agent's health was last checked; null until it has been (`status` is then `unknown`).")
     val lastCheckAt: String? = null,
 )

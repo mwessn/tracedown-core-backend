@@ -2,6 +2,7 @@ package dev.tracedown.gateway.routes.publicapi
 
 import dev.tracedown.gateway.controllers.events.EventFeedController
 import dev.tracedown.gateway.controllers.events.EventTypes
+import dev.tracedown.gateway.controllers.alerts.SystemAlertController
 import dev.tracedown.gateway.data.publicapi.PublicApiError
 import dev.tracedown.gateway.util.EventPollSlots
 import dev.tracedown.gateway.util.Idempotency
@@ -30,6 +31,8 @@ import kotlinx.serialization.descriptors.elementDescriptors
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonArray
@@ -60,17 +63,22 @@ private val API_SUMMARY = """
     nothing. HEAD is answered on every GET path.
 
     **Idempotent requests.** Every POST (but `/scripts/validate`) takes an `Idempotency-Key` header: 1–128
-    printable ASCII characters of the caller's choosing, unique per request. The first request with a key is
-    remembered for 24 hours, per API key, with its answer; the same key with the same request (method, path, query
-    parameters, content type and body) is answered with that answer again and `Idempotent-Replayed: true`, and
-    nothing is done twice. That includes a refusal: a 4xx is replayed for 24 hours like a success, so a new attempt
-    after changing anything needs a new key. The same key with a different request is 422 `idempotency_key_reused`;
-    while the first is still being answered, 409 `idempotency_in_progress` with `Retry-After` — and a request whose
-    client went away before its answer holds its key that way for up to 5 minutes, since what it did may have been
-    done. Not remembered, so a repeat runs again: an answer with a 5xx, and an answer over 64 KiB. An API key's
-    first 1000 keys a day are remembered; past that, requests are answered without being remembered. When the store
-    that remembers keys does not answer, a request carrying one is refused, 503 `idempotency_unavailable`, rather
-    than made without the promise.
+    printable ASCII characters of the caller's choosing, unique per request. A repeat with the same key and the same
+    request (method, path, query parameters, content type and body) is never made a second time:
+    - after a success (2xx), it is answered with the first answer for 24 hours, marked `Idempotent-Replayed: true`
+      (status, type and body; headers the first answer carried are not kept);
+    - after a refusal or failure (4xx, 5xx), nothing was remembered — it runs again;
+    - while the first is still being answered, 409 `idempotency_in_progress` with `Retry-After`;
+    - when the first was cut off while it ran (its client went away), or succeeded with an answer over 256 KiB (that
+      answer carried `Idempotency-Status: not-kept`), 409 `idempotency_outcome_unknown` for 24 hours: it may have
+      taken effect, so it is not made again — check, then use a new key.
+    The same key with a different request is 422 `idempotency_key_reused`. Remembered answers count against a budget
+    per organization (64 MiB a day unless the operator set another); once it is spent, a request with a new key is
+    refused before it runs, 429 `idempotency_limit_reached` with `Retry-After`. When the store that remembers keys
+    does not answer, a request carrying one is refused, 503 `idempotency_unavailable` with `Retry-After`.
+
+    **Unknown values.** New values can appear in `state`, `status`, `trigger` and `reason` fields; treat one you do
+    not know as you would the nearest one you do, never as an error.
 
     **Base URL.** The server below is relative, so that a gateway published under a path prefix still gives the
     right addresses; code generators emit it literally — set your client's base URL to the gateway's origin (and
@@ -100,16 +108,14 @@ private val API_SUMMARY = """
 /** Each error status, with the codes it is answered with across the API. */
 private val STATUS_CODES: Map<HttpStatusCode, String> = mapOf(
     HttpStatusCode.BadRequest to "A refused request: `field_invalid`, `field_required`, `invalid_uuid`, " +
-        "`invalid_request_body`, `invalid_path`, `no_org_selected`, and the code a validation names. A malformed " +
-        "`Idempotency-Key` is `field_invalid` with `details.field` `Idempotency-Key`.",
+        "`invalid_request_body`, `invalid_path`, `no_org_selected`, and the code a validation names.",
     HttpStatusCode.Unauthorized to "No usable key: `missing_auth_header`, `invalid_api_key`, `api_key_expired`, " +
         "`api_key_revoked`, `api_key_owner_inactive`.",
     HttpStatusCode.Forbidden to "Not allowed: `insufficient_permissions`, `api_key_read_only`, " +
         "`totp_enrollment_required`, `not_org_member`.",
     HttpStatusCode.NotFound to "`not_found` — no such resource, or one the caller may not see.",
     HttpStatusCode.MethodNotAllowed to "`method_not_allowed`.",
-    HttpStatusCode.Conflict to "`already_exists`, `version_conflict`, `binding_exists`, `script_missing`, `service_inactive`, " +
-        "`idempotency_in_progress` (a request with the same `Idempotency-Key` is still being answered).",
+    HttpStatusCode.Conflict to "`already_exists`, `version_conflict`, `binding_exists`, `script_missing`, `service_inactive`.",
     HttpStatusCode.UnprocessableEntity to "`idempotency_key_reused` — the `Idempotency-Key` was used with a different request.",
     HttpStatusCode.Gone to "`body_gone` — the step recorded a body that is no longer there; `cursor_expired` — the " +
         "event cursor is older than the events kept (`details.oldest` is where to start again).",
@@ -118,8 +124,17 @@ private val STATUS_CODES: Map<HttpStatusCode, String> = mapOf(
     HttpStatusCode.TooManyRequests to "`rate_limited` (the key's budget), `too_many_unknown_keys` (the address) or " +
         "`too_many_event_polls` (event reads open). " +
         "`Retry-After` says when to come back.",
-    HttpStatusCode.ServiceUnavailable to "`body_store_unavailable` or `idempotency_unavailable` — retry with backoff " +
-        "after `Retry-After`.",
+    HttpStatusCode.ServiceUnavailable to "`body_store_unavailable` — retry with backoff after `Retry-After`.",
+)
+
+/** What an operation taking an `Idempotency-Key` adds to the shared texts. */
+private val IDEMPOTENCY_CODES: Map<HttpStatusCode, String> = mapOf(
+    HttpStatusCode.BadRequest to " A malformed `Idempotency-Key` is `field_invalid` with `details.field` `Idempotency-Key`.",
+    HttpStatusCode.Conflict to " `idempotency_in_progress` (the request with this `Idempotency-Key` is still being answered; " +
+        "`Retry-After`), `idempotency_outcome_unknown` (it may have taken effect; use a new key).",
+    HttpStatusCode.TooManyRequests to " `idempotency_limit_reached` — the organization's budget for remembered answers is " +
+        "spent; `Retry-After` says when it comes back.",
+    HttpStatusCode.ServiceUnavailable to " `idempotency_unavailable` — retry after `Retry-After`.",
 )
 
 /**
@@ -187,7 +202,8 @@ internal fun Operation.Builder.describe(operation: PublicOperation) {
         }
         for (status in operation.errorStatuses) {
             status {
-                description = STATUS_CODES[status] ?: status.description
+                description = (STATUS_CODES[status] ?: status.description) +
+                    (if (operation.idempotent) IDEMPOTENCY_CODES[status].orEmpty() else "")
                 schema = buildSchema(typeOf<PublicApiError>())
             }
         }
@@ -227,6 +243,13 @@ private val FIELD_ENUMS: Map<String, Map<String, List<String>>> = mapOf(
     "PublicSystemAlert" to mapOf("severity" to listOf("warning", "error")),
     "RulePresetSummary" to mapOf("scope" to listOf("org", "workspace")),
 )
+
+/** The query parameters held to a set of values, and the values: the operations' own. */
+private val PARAMETER_VALUES: Map<String, List<String>> = PublicApiOperations.all
+    .flatMap { it.query }.mapNotNull { q -> q.values?.let { q.name to it } }.toMap()
+
+/** The defaults of the query parameters held to a set of values. */
+private val PARAMETER_DEFAULTS = mapOf("order" to "desc", "state" to SystemAlertController.ACTIVE)
 
 /** String fields that hold an instant, beyond those named `…At`. */
 private val INSTANT_FIELDS = setOf("since", "until", "coveredFrom", "coveredTo", "lastStatusSince", "lastCheck")
@@ -317,6 +340,10 @@ private fun refineProperty(name: String, property: JsonObject, element: SerialDe
             })
         }
     }
+    // A nullable property held to a set of values may also be null: the set says so.
+    if (element.isNullable && p["enum"] is JsonArray && JsonNull !in p["enum"]!!.jsonArray) {
+        p = JsonObject(p + ("enum" to JsonArray(p["enum"]!!.jsonArray + JsonNull)))
+    }
     if ("format" !in p && "anyOf" !in p) {
         val kind = element.kind
         val format = when {
@@ -385,6 +412,7 @@ private fun refineOperation(operation: JsonObject): JsonObject {
     val id = (operation["operationId"] as? JsonPrimitive)?.content
     if (id in BINARY_OPERATIONS) out = binaryAnswer(out)
     if (id in IDEMPOTENT_OPERATIONS) out = replayHeader(out)
+    out = retryAfter(out, setOf("503"))
     operation["parameters"]?.let { parameters ->
         out = JsonObject(out + ("parameters" to JsonArray((parameters as JsonArray).map { refineParameter(it.jsonObject) })))
     }
@@ -402,6 +430,10 @@ private fun binaryAnswer(operation: JsonObject): JsonObject {
     val responses = operation["responses"]?.jsonObject ?: return operation
     val ok = responses["200"]?.jsonObject ?: return operation
     val refined = JsonObject(ok - "content" + mapOf(
+        "description" to JsonPrimitive(
+            "The stored bytes, under the type the store recorded when the gateway repeats it (an image, JSON, text…), " +
+                "`application/octet-stream` otherwise.",
+        ),
         "content" to buildJsonObject {
             put("application/octet-stream", buildJsonObject {
                 put("schema", buildJsonObject { put("type", "string"); put("format", "binary") })
@@ -414,6 +446,14 @@ private fun binaryAnswer(operation: JsonObject): JsonObject {
             })
             put("X-Content-Type-Options", buildJsonObject {
                 put("description", "`nosniff`.")
+                put("schema", buildJsonObject { put("type", "string") })
+            })
+            put("Content-Length", buildJsonObject {
+                put("description", "The body's size in bytes.")
+                put("schema", buildJsonObject { put("type", "integer"); put("format", "int64") })
+            })
+            put("Cache-Control", buildJsonObject {
+                put("description", "`private, no-store`: a body can carry whatever the probed endpoint answered.")
                 put("schema", buildJsonObject { put("type", "string") })
             })
         },
@@ -430,9 +470,26 @@ private fun replayHeader(operation: JsonObject): JsonObject {
         JsonObject(r + ("headers" to JsonObject(headers + ("Idempotent-Replayed" to buildJsonObject {
             put("description", "`true` when this is the remembered answer of an earlier request with the same `Idempotency-Key`.")
             put("schema", buildJsonObject { put("type", "string"); put("enum", buildJsonArray { add(JsonPrimitive("true")) }) })
+        }) + (Idempotency.STATUS_HEADER to buildJsonObject {
+            put("description", "`not-kept` when the answer was too large to remember: a repeat answers 409 `idempotency_outcome_unknown`.")
+            put("schema", buildJsonObject { put("type", "string"); put("enum", buildJsonArray { add(JsonPrimitive("not-kept")) }) })
         }))))
     }
-    return JsonObject(operation + ("responses" to JsonObject(responses + successes)))
+    return retryAfter(JsonObject(operation + ("responses" to JsonObject(responses + successes))), setOf("409"))
+}
+
+/** Declares `Retry-After` on the given error answers of an operation. */
+private fun retryAfter(operation: JsonObject, statuses: Set<String>): JsonObject {
+    val responses = operation["responses"]?.jsonObject ?: return operation
+    val retryable = responses.filterKeys { it in statuses }.mapValues { (_, response) ->
+        val r = response.jsonObject
+        val headers = r["headers"]?.jsonObject ?: JsonObject(emptyMap())
+        JsonObject(r + ("headers" to JsonObject(headers + ("Retry-After" to buildJsonObject {
+            put("description", "Seconds until the request is worth repeating, where the code says so.")
+            put("schema", buildJsonObject { put("type", "integer") })
+        }))))
+    }
+    return JsonObject(operation + ("responses" to JsonObject(responses + retryable)))
 }
 
 private fun refineParameter(parameter: JsonObject): JsonObject {
@@ -441,22 +498,17 @@ private fun refineParameter(parameter: JsonObject): JsonObject {
     val refined: JsonObject = when {
         name in ID_PARAMETERS -> JsonObject(schema + ("format" to JsonPrimitive("uuid")))
         name == "since" || name == "until" -> JsonObject(schema + ("format" to JsonPrimitive("date-time")))
-        name == "trigger" -> JsonObject(schema + ("enum" to JsonArray(listOf("schedule", "manual").map { JsonPrimitive(it) })))
-        name == "status" -> JsonObject(schema + ("items" to buildJsonObject {
-            put("type", "string")
-            put("enum", JsonArray(listOf("success", "failure", "timeout", "error", "skipped").map { JsonPrimitive(it) }))
-        }))
-        name == "order" -> JsonObject(schema + ("enum" to JsonArray(listOf("desc", "asc").map { JsonPrimitive(it) })) +
-            ("default" to JsonPrimitive("desc")))
+        // Held to a set: the values the handler checks against.
+        name in PARAMETER_VALUES && schema["type"]?.let { (it as? JsonPrimitive)?.content } == "array" ->
+            JsonObject(schema + ("items" to buildJsonObject {
+                put("type", "string")
+                put("enum", JsonArray(PARAMETER_VALUES.getValue(name).map { JsonPrimitive(it) }))
+            }))
+        name in PARAMETER_VALUES -> JsonObject(schema + ("enum" to JsonArray(PARAMETER_VALUES.getValue(name).map { JsonPrimitive(it) })) +
+            (PARAMETER_DEFAULTS[name]?.let { mapOf("default" to JsonPrimitive(it)) } ?: emptyMap()))
         name == "window" -> JsonObject(schema + ("enum" to JsonArray(listOf("24h", "7d", "30d", "90d").map { JsonPrimitive(it) })) +
             ("default" to JsonPrimitive("24h")))
         name == "resourceType" -> JsonObject(schema + ("enum" to JsonArray(listOf("workspace", "project", "service").map { JsonPrimitive(it) })))
-        name == "state" -> JsonObject(schema + ("enum" to JsonArray(listOf("active", "all").map { JsonPrimitive(it) })) +
-            ("default" to JsonPrimitive("active")))
-        name == "types" -> JsonObject(schema + ("items" to buildJsonObject {
-            put("type", "string")
-            put("enum", JsonArray(EventTypes.ALL.map { JsonPrimitive(it) }))
-        }))
         name in INTEGER_PARAMETERS -> {
             val (min, max, default) = INTEGER_PARAMETERS.getValue(name)
             JsonObject(schema + ("minimum" to JsonPrimitive(min)) + ("maximum" to JsonPrimitive(max)) + ("default" to JsonPrimitive(default)))

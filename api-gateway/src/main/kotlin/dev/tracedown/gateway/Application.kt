@@ -203,7 +203,12 @@ fun Application.module() {
 
     dev.tracedown.gateway.util.ScheduleNudge.init { redisA }
     // Remembers the key-authenticated API's idempotent POSTs, shared by every replica.
-    dev.tracedown.gateway.util.Idempotency.init({ redisA }, appConfig.maxRequestBodyBytes)
+    dev.tracedown.gateway.util.Idempotency.init(
+        { redisA },
+        appConfig.maxRequestBodyBytes,
+        environment.config.propertyOrNull("idempotency.orgBudgetBytes")?.getString()?.toLongOrNull()?.takeIf { it > 0 }
+            ?: dev.tracedown.gateway.util.Idempotency.DEFAULT_ORG_BUDGET_BYTES,
+    )
     // The event feed: tell waiting reads when this process has written to the
     // outbox, wake them on any process's nudge, and bound how many a key holds.
     dev.tracedown.common.models.OutboxEmit.onCommitted { orgId ->
@@ -430,7 +435,7 @@ fun Application.module() {
     installRequestBodyLimit(appConfig.maxRequestBodyBytes)
     // The body of a public POST carrying an Idempotency-Key is read twice:
     // for its fingerprint, then by its handler. See Idempotency.
-    dev.tracedown.gateway.util.Idempotency.installBodyCache(this)
+    dev.tracedown.gateway.util.RequestBodyCache.install(this, appConfig.maxRequestBodyBytes)
 
     install(ContentNegotiation) {
         json(Json {

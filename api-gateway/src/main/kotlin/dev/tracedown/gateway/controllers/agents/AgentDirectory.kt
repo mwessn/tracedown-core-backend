@@ -2,7 +2,9 @@ package dev.tracedown.gateway.controllers.agents
 
 import dev.tracedown.common.agents.AgentVisibility
 import dev.tracedown.common.agents.DegradationRule
+import dev.tracedown.common.models.AgentHealthChecks
 import dev.tracedown.common.models.ProbeAgents
+import org.jetbrains.exposed.v1.core.inList
 import dev.tracedown.gateway.data.agents.PublicAgentSummary
 import dev.tracedown.gateway.util.requireCachedPermissions
 import org.jetbrains.exposed.v1.core.and
@@ -33,13 +35,22 @@ object AgentDirectory {
         val shown = rows.filter { it[ProbeAgents.slug] in visible }
         // The verdict the dashboard's roster serialises, from the same rule
         // and the same rounds, in one statement.
-        val verdicts = DegradationRule.verdicts(shown.map { it[ProbeAgents.id] })
+        val ids = shown.map { it[ProbeAgents.id] }
+        val verdicts = DegradationRule.verdicts(ids)
+        // An agent's last ping starts as its registration time: until a
+        // health round has run, nothing has been checked.
+        val checked = if (ids.isEmpty()) emptySet() else AgentHealthChecks.select(AgentHealthChecks.probeAgentId)
+            .where { AgentHealthChecks.probeAgentId inList ids }
+            .withDistinct()
+            .map { it[AgentHealthChecks.probeAgentId] }
+            .toSet()
         shown.map {
+            val id = it[ProbeAgents.id]
             PublicAgentSummary(
                 slug = it[ProbeAgents.slug],
                 label = it[ProbeAgents.label],
-                status = health(it[ProbeAgents.lastStatus], verdicts[it[ProbeAgents.id]]?.degraded == true),
-                lastCheckAt = it[ProbeAgents.lastPing].toString(),
+                status = if (id in checked) health(it[ProbeAgents.lastStatus], verdicts[id]?.degraded == true) else "unknown",
+                lastCheckAt = if (id in checked) it[ProbeAgents.lastPing].toString() else null,
             )
         }
     }

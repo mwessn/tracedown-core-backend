@@ -21,9 +21,9 @@ fun Route.alertRoutes() {
      */
     get("/alerts") {
         val caller = call.apiCaller
-        val history = when (call.request.queryParameters["state"] ?: "active") {
-            "active" -> false
-            "all" -> true
+        val history = when (call.request.queryParameters["state"] ?: SystemAlertController.ACTIVE) {
+            SystemAlertController.ACTIVE -> false
+            SystemAlertController.ALL -> true
             else -> throw fieldError("state")
         }
         call.respond(SystemAlertController.listPublic(caller.orgId, caller.userId, history, publicPaging(call)))
