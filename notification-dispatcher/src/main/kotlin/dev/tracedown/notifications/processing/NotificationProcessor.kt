@@ -14,11 +14,15 @@ import dev.tracedown.notifications.recipients.RecipientResolver
 import dev.tracedown.notifications.templates.NotificationBuilder
 import dev.tracedown.notifications.templates.RenderedNotification
 import kotlinx.serialization.json.*
+import org.jetbrains.exposed.v1.core.SortOrder
 import org.jetbrains.exposed.v1.core.and
 import org.jetbrains.exposed.v1.core.eq
+import org.jetbrains.exposed.v1.core.inList
+import org.jetbrains.exposed.v1.core.less
 import org.jetbrains.exposed.v1.jdbc.select
 import org.jetbrains.exposed.v1.jdbc.selectAll
 import org.slf4j.LoggerFactory
+import java.time.Instant
 import java.util.UUID
 
 /**
@@ -27,8 +31,10 @@ import java.util.UUID
  * For each outbox event:
  * 1. Reads the probe result's rawResult.actions.notifications
  * 2. Groups and renders notifications via NotificationBuilder
- * 3. Resolves eligible recipients
- * 4. Delivers via email and webhooks
+ * 3. Holds back an unconfirmed timeout, and the recovery from one
+ *    (see [TimeoutConfirmation])
+ * 4. Resolves eligible recipients
+ * 5. Delivers via email and webhooks
  *
  * ## Failing one channel must not re-send the other
  *
@@ -98,6 +104,18 @@ class NotificationProcessor(
 
         if (rendered.isEmpty()) {
             log.debug("no rendered notifications for result {}", resultId)
+            return
+        }
+
+        // A lone timeout is not announced on any channel, nor is the recovery
+        // that closes it. Returning normally publishes the event: there is
+        // nothing to retry, the next run decides for itself.
+        val (previous, beforePrevious) = ioTransaction { precedingTicks(serviceId, context.startedAt) }
+        if (!TimeoutConfirmation.shouldAnnounce(rendered.map { it.trigger }, previous, beforePrevious)) {
+            log.info(
+                "holding {} for result {} of service {}: the timeout is unconfirmed by the run before it",
+                rendered.map { it.trigger }.distinct(), resultId, serviceId,
+            )
             return
         }
 
@@ -200,6 +218,30 @@ class NotificationProcessor(
             .map { it[NotificationLog.recipient] }
             .toSet()
 
+    /**
+     * The service's two ticks before [startedAt], most recent first. A tick
+     * is every verdict sharing one `started_at`, which is the scheduled
+     * moment and so is shared by the agents of a `simultaneous` run.
+     */
+    private fun precedingTicks(
+        serviceId: UUID,
+        startedAt: Instant,
+    ): Pair<TimeoutConfirmation.Tick?, TimeoutConfirmation.Tick?> {
+        val ticks = ProbeResults
+            .select(ProbeResults.startedAt, ProbeResults.status)
+            .where {
+                (ProbeResults.serviceId eq serviceId) and
+                    (ProbeResults.startedAt less startedAt) and
+                    (ProbeResults.status inList TimeoutConfirmation.VERDICTS)
+            }
+            .orderBy(ProbeResults.startedAt, SortOrder.DESC)
+            .limit(TICK_LOOKBACK_ROWS)
+            .groupBy({ it[ProbeResults.startedAt] }, { it[ProbeResults.status] })
+            .values
+            .map { TimeoutConfirmation.Tick(it) }
+        return ticks.getOrNull(0) to ticks.getOrNull(1)
+    }
+
     private fun buildRuntimeVars(
         notification: RenderedNotification,
         context: ProcessingContext,
@@ -242,6 +284,7 @@ class NotificationProcessor(
 
     private data class ProcessingContext(
         val rawResult: JsonObject,
+        val startedAt: Instant,
         val serviceName: String,
         val serviceSchedule: String,
         val projectName: String,
@@ -287,6 +330,7 @@ class NotificationProcessor(
 
         return ProcessingContext(
             rawResult = result[ProbeResults.rawResult],
+            startedAt = result[ProbeResults.startedAt],
             serviceName = service[Services.name],
             serviceSchedule = service[Services.schedule],
             projectName = project[Projects.name],
@@ -309,5 +353,12 @@ class NotificationProcessor(
          * [WebhookDeliveryService].
          */
         const val EMAIL_CHANNEL = "email"
+
+        /**
+         * Rows read to find two ticks. Enough for two `simultaneous` runs
+         * across a large fleet; a tick cut short by the limit can only lose
+         * rows of the older one.
+         */
+        const val TICK_LOOKBACK_ROWS = 64
     }
 }
